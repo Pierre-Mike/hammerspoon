@@ -20,7 +20,6 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 | `apps/brown_noise` | Menu-bar noise machine: play/stop, volume, and color (white/pink/brown/blue/violet). |
 | `apps/volume_tap` | Voice control for the Orchestrator via volume-key taps. |
 | `apps/noseguard` | Face-touch deterrent — a Python + MediaPipe daemon (`noseguard.py`) watches the camera and disrupts you when you touch your face. CPU delegate only (the Metal GPU delegate aborts on macOS). |
-| `apps/claude_done` | Floating panels for Claude Code Stop-hook events. |
 
 ## Assets not in git
 

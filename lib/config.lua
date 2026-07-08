@@ -23,16 +23,6 @@ return {
 
   DUCK_LEVEL          = 0.50,
 
-  CLAUDE_DONE = {
-    DASHBOARD_URL     = "http://localhost:5173",
-    LOG               = "/tmp/hs-claude-done.log",
-    AUTO_DISMISS_S    = 300,
-    ORCHESTRATOR      = "Orchestrator",
-    PANEL_W           = 380,
-    PANEL_H           = 110,
-    GAP               = 10,
-  },
-
   PREVIEW = {
     FONT_SIZE         = 28,
     PAD               = 24,
