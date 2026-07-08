@@ -1,0 +1,19 @@
+# Large binary assets — kept on disk, not versioned (see README to obtain)
+*.wav
+*.task
+
+# Python runtime
+.venv/
+__pycache__/
+*.pyc
+
+# Backups & editor cruft
+*.bak-*
+*.bak
+.DS_Store
+
+# Hammerspoon Spoons (installed separately)
+/Spoons/
+
+# Compiled Swift overlay binary (build from overlay.swift, see README)
+apps/noseguard/overlay/overlay
