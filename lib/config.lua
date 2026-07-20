@@ -27,9 +27,20 @@ return {
   POCKET_TTS_BASE     = "http://127.0.0.1:8791",
   POCKET_TTS_SERVER   = HOME .. "/.hammerspoon/pocket_tts_server.py",
   POCKET_TTS_PY       = HOME .. "/.hammerspoon/.venv-tts/bin/python",   -- venv with pocket-tts installed
-  TTS_VOICE           = "alba",                     -- pocket-tts predefined voice
+  TTS_VOICE           = "alba",                     -- default pocket-tts voice
   TTS_LANGUAGE        = "english",
   AFPLAY              = "/usr/bin/afplay",
+  -- Named voice profiles: map a "kind of work" to a voice so different callers
+  -- get different voices. A /speak request may pass a profile key OR any raw
+  -- pocket-tts voice name (26 built-ins e.g. alba, marius, vera, george, eve,
+  -- jane, michael, paul) OR a path/hf:// URL to clone. Edit freely.
+  TTS_PROFILES        = {
+    default = "alba",     -- general / fallback
+    alerts  = "marius",   -- notifications, warnings
+    code    = "george",   -- build/test/CI output narration
+    reading = "vera",     -- long-form reading
+    system  = "michael",  -- status / system messages
+  },
 
   DUCK_LEVEL          = 0.50,
 

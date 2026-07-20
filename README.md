@@ -54,11 +54,32 @@ downloads on first run. Then any app can talk:
 curl -sX POST localhost:8790/speak -d 'hello from any app'
 curl -s     localhost:8790/stop              # cancel + flush the queue (no body)
 curl -s     localhost:8790/status            # {"speaking":…,"queued":…,"voice":…}
+curl -s     localhost:8790/voices            # profile → voice map
 hs -c 'speak("or straight from a shell")'
 open 'hammerspoon://speak?text=or%20via%20url&voice=marius'
 ```
 
-Change the default voice/language in `lib/config.lua` (`TTS_VOICE`, `TTS_LANGUAGE`).
+### Different voices for different work
+
+Every entry point takes a **selector** — a profile key, a raw pocket-tts voice
+name (26 built-ins: `alba`, `marius`, `vera`, `george`, `michael`, `jane`,
+`eve`, `paul`, …), or a path / `hf://` URL to clone. The queue carries the voice
+per chunk, so each caller can sound different:
+
+```sh
+curl -sX POST 'localhost:8790/speak?profile=alerts' -d 'disk almost full'   # marius
+curl -sX POST 'localhost:8790/speak?voice=vera'     -d 'chapter one'         # raw name
+curl -sX POST  localhost:8790/speak -H 'X-Voice: george' -d 'build passed'   # header
+hs -c 'speak("tests are green", "code")'                                     # CLI, profile
+open 'hammerspoon://speak?text=done&profile=system'                          # URL
+```
+
+Profiles live in `lib/config.lua` (`TTS_PROFILES`) — map any "kind of work" to a
+voice (defaults: `default`=alba, `alerts`=marius, `code`=george, `reading`=vera,
+`system`=michael). Header `X-Profile` / `X-Voice` and query `?profile=` / `?voice=`
+both work; header wins. The menu-bar **Default voice** submenu switches the
+fallback voice used when no selector is given. First use of a voice downloads its
+prompt from HF (cached after). Set the language in `lib/config.lua` (`TTS_LANGUAGE`).
 Logs: `/tmp/hs-tts.log` (queue) and the server's stdout.
 
 ## Tests

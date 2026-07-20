@@ -107,4 +107,20 @@ describe("tts_core queue primitives", function()
     assert.same({}, q)
     assert.equals(0, tts.clear(q))
   end)
+
+  it("keeps table items (per-item voice) and returns them FIFO", function()
+    -- apps/tts.lua enqueues { text=<chunk>, voice=<voice> } tables.
+    local q = {}
+    tts.enqueue(q, {
+      { text = "one", voice = "alba" },
+      { text = "two", voice = "marius" },
+    })
+    assert.equals(2, #q)
+    local a = tts.dequeue(q)
+    assert.equals("one", a.text)
+    assert.equals("alba", a.voice)
+    local b = tts.dequeue(q)
+    assert.equals("marius", b.voice)
+    assert.is_nil(tts.dequeue(q))
+  end)
 end)

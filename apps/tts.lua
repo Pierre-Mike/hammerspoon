@@ -30,6 +30,15 @@ local M = {
   menu     = nil,
 }
 
+-- Resolve a caller's selector to a concrete pocket-tts voice.
+--   nil/""      -> the current default (M.voice)
+--   profile key -> its mapped voice (cfg.TTS_PROFILES)
+--   anything else -> used verbatim (a raw voice name or a path/hf:// URL to clone)
+function M.resolveVoice(sel)
+  if not sel or sel == "" then return M.voice end
+  return (cfg.TTS_PROFILES and cfg.TTS_PROFILES[sel]) or sel
+end
+
 -- forward declarations (drain/play reference each other and the menu)
 local drain, play, updateMenu
 
@@ -54,11 +63,11 @@ end
 function drain()
   if M.speaking or not M.enabled or #M.queue == 0 then return end
   M.speaking = true
-  local text  = core.dequeue(M.queue)
+  local item  = core.dequeue(M.queue)      -- { text = <chunk>, voice = <resolved voice> }
   local myGen = M.gen
   updateMenu()
-  hs.http.asyncPost(cfg.POCKET_TTS_BASE .. "/speak", text,
-    { ["X-Voice"] = M.voice, ["Content-Type"] = "text/plain; charset=utf-8" },
+  hs.http.asyncPost(cfg.POCKET_TTS_BASE .. "/speak", item.text,
+    { ["X-Voice"] = item.voice or M.voice, ["Content-Type"] = "text/plain; charset=utf-8" },
     function(status, body, _headers)
       if myGen ~= M.gen then M.speaking = false; return end   -- stopped mid-synth
       body = utils.trim(body)
@@ -72,13 +81,18 @@ function drain()
     end)
 end
 
--- Public: queue text for speech. Returns the new queue length (0 if nothing to say).
-function M.speak(text)
+-- Public: queue text for speech in a chosen voice. `sel` is a profile key, a raw
+-- voice name, a clone path/URL, or nil (default voice). Returns the new queue
+-- length (0 if nothing to say).
+function M.speak(text, sel)
   if not M.enabled then logf("[tts] disabled, dropping"); return 0 end
   local chunks = core.splitSentences(text)
   if #chunks == 0 then return 0 end
-  local n = core.enqueue(M.queue, chunks)
-  logf("[tts] +%d chunk(s), queue=%d", #chunks, n)
+  local voice = M.resolveVoice(sel)
+  local items = {}
+  for _, c in ipairs(chunks) do items[#items + 1] = { text = c, voice = voice } end
+  local n = core.enqueue(M.queue, items)
+  logf("[tts] +%d chunk(s) voice=%s, queue=%d", #chunks, voice, n)
   updateMenu()
   drain()
   return n
@@ -97,17 +111,38 @@ end
 -- ---- HTTP intake (the service other apps post to) -------------------------
 local intake = hs.httpserver.new()
 intake:setPort(cfg.TTS_PORT)
-intake:setCallback(function(method, path, _headers, body)
-  if method == "POST" and path == "/speak" then
-    local n = M.speak(body or "")
+intake:setCallback(function(method, headers, path, body)
+  -- hs.httpserver passes (method, path, headers, body) in some versions and
+  -- (method, headers, path, body) in others; detect which arg is the path.
+  if type(path) ~= "string" or path:sub(1, 1) ~= "/" then
+    path, headers = headers, path
+  end
+  local route = path:match("^[^?]*")                 -- strip ?query for routing
+  local query = path:match("%?(.*)$") or ""
+  headers = headers or {}
+
+  -- Voice selector: header X-Profile / X-Voice wins, else ?profile= / ?voice=.
+  local function param(name)
+    local v = query:match("[?&]?" .. name .. "=([^&]*)") or query:match("^" .. name .. "=([^&]*)")
+    return v and utils.urldecode(v) or nil
+  end
+  local sel = headers["X-Profile"] or headers["X-Voice"] or param("profile") or param("voice")
+
+  if method == "POST" and route == "/speak" then
+    local n = M.speak(body or "", sel)
     return (n > 0 and "queued\n" or "empty\n"), 200, {}
-  elseif path == "/stop" then
+  elseif route == "/stop" then
     -- Method-agnostic: stop carries no body, and hs.httpserver rejects a
     -- bodyless POST with 400 before the callback runs — so `curl .../stop`
     -- (a GET) must work too.
     M.stop()
     return "stopped\n", 200, {}
-  elseif path == "/status" then
+  elseif route == "/voices" then
+    local keys = {}
+    for k, v in pairs(cfg.TTS_PROFILES or {}) do keys[#keys + 1] = string.format('"%s":"%s"', k, v) end
+    table.sort(keys)
+    return "{" .. table.concat(keys, ",") .. "}\n", 200, { ["Content-Type"] = "application/json" }
+  elseif route == "/status" then
     local s = string.format('{"speaking":%s,"queued":%d,"enabled":%s,"voice":"%s"}\n',
       tostring(M.speaking), #M.queue, tostring(M.enabled), M.voice)
     return s, 200, { ["Content-Type"] = "application/json" }
@@ -119,13 +154,14 @@ logf("[tts] intake listening on http://127.0.0.1:%s", tostring(cfg.TTS_PORT))
 
 -- ---- CLI + URL entry points ----------------------------------------------
 -- Global so `hs -c 'speak("hi there")'` works from any shell/app.
-_G.speak = function(text) return M.speak(text) end
+-- Second arg picks a voice: profile key, raw voice name, or clone path.
+--   hs -c 'speak("build passed", "code")'   hs -c 'speak("hi", "marius")'
+_G.speak = function(text, sel) return M.speak(text, sel) end
 _G.speakStop = function() return M.stop() end
 
--- open 'hammerspoon://speak?text=hi%20there&voice=marius'
+-- open 'hammerspoon://speak?text=hi%20there&profile=alerts'  (or &voice=marius)
 hs.urlevent.bind("speak", function(_evt, params)
-  if params.voice and params.voice ~= "" then M.voice = params.voice end
-  M.speak(params.text or "")
+  M.speak(params.text or "", params.profile or params.voice)
 end)
 hs.urlevent.bind("speakStop", function() M.stop() end)
 
@@ -133,9 +169,21 @@ hs.urlevent.bind("speakStop", function() M.stop() end)
 M.menu = hs.menubar.new()
 if M.menu then
   M.menu:setMenu(function()
+    -- Submenu: pick the default voice by profile (sorted, tick the current one).
+    local keys = {}
+    for k in pairs(cfg.TTS_PROFILES or {}) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local voiceItems = {}
+    for _, k in ipairs(keys) do
+      local v = cfg.TTS_PROFILES[k]
+      voiceItems[#voiceItems + 1] = {
+        title = string.format("%s (%s)", k, v),
+        checked = (M.voice == v),
+        fn = function() M.voice = v; updateMenu() end,
+      }
+    end
     return {
-      { title = M.speaking and "Speaking…" or "Idle",
-        disabled = true },
+      { title = M.speaking and "Speaking…" or "Idle", disabled = true },
       { title = "Queued: " .. #M.queue, disabled = true },
       { title = "-" },
       { title = "Stop", fn = function() M.stop() end },
@@ -144,7 +192,7 @@ if M.menu then
       { title = "Speak clipboard",
         fn = function() M.speak(hs.pasteboard.getContents() or "") end },
       { title = "-" },
-      { title = "Voice: " .. M.voice, disabled = true },
+      { title = "Default voice: " .. M.voice, menu = voiceItems },
       { title = "Restart voice server", fn = function() M.restartServer() end },
     }
   end)
