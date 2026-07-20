@@ -20,6 +20,7 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 | `apps/brown_noise` | Menu-bar noise machine: play/stop, volume, and color (white/pink/brown/blue/violet). |
 | `apps/volume_tap` | Voice control for the Orchestrator via volume-key taps. |
 | `apps/noseguard` | Face-touch deterrent — a Python + MediaPipe daemon (`noseguard.py`) watches the camera and disrupts you when you touch your face. CPU delegate only (the Metal GPU delegate aborts on macOS). |
+| `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
 
 ## Assets not in git
 
@@ -34,6 +35,31 @@ Large binaries are `.gitignore`d (see `.gitignore`) — they live on disk but ar
   `swiftc -O apps/noseguard/overlay/overlay.swift -o apps/noseguard/overlay/overlay`.
 - **noseguard venv** (`apps/noseguard/.venv/`) — recreate with
   `python3 -m venv apps/noseguard/.venv && apps/noseguard/.venv/bin/pip install mediapipe numpy opencv-python pyobjc`.
+
+## TTS service setup
+
+`apps/tts` needs a Python venv with [pocket-tts](https://github.com/kyutai-labs/pocket-tts)
+installed (kept out of git, see `.gitignore`):
+
+```sh
+python3 -m venv ~/.hammerspoon/.venv-tts
+~/.hammerspoon/.venv-tts/bin/pip install pocket-tts
+hs -c 'hs.reload()'
+```
+
+On reload Hammerspoon frees port 8791 and launches the warm server; the model
+downloads on first run. Then any app can talk:
+
+```sh
+curl -sX POST localhost:8790/speak -d 'hello from any app'
+curl -sX POST localhost:8790/stop            # cancel + flush the queue
+curl -s     localhost:8790/status            # {"speaking":…,"queued":…,"voice":…}
+hs -c 'speak("or straight from a shell")'
+open 'hammerspoon://speak?text=or%20via%20url&voice=marius'
+```
+
+Change the default voice/language in `lib/config.lua` (`TTS_VOICE`, `TTS_LANGUAGE`).
+Logs: `/tmp/hs-tts.log` (queue) and the server's stdout.
 
 ## Tests
 
