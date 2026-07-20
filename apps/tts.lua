@@ -109,9 +109,11 @@ function M.stop()
 end
 
 -- ---- HTTP intake (the service other apps post to) -------------------------
-local intake = hs.httpserver.new()
-intake:setPort(cfg.TTS_PORT)
-intake:setCallback(function(method, headers, path, body)
+-- Kept on M (not a bare local): an unreferenced hs.httpserver gets garbage-
+-- collected after load and silently stops listening on the port.
+M.intake = hs.httpserver.new()
+M.intake:setPort(cfg.TTS_PORT)
+M.intake:setCallback(function(method, headers, path, body)
   -- hs.httpserver passes (method, path, headers, body) in some versions and
   -- (method, headers, path, body) in others; detect which arg is the path.
   if type(path) ~= "string" or path:sub(1, 1) ~= "/" then
@@ -149,7 +151,7 @@ intake:setCallback(function(method, headers, path, body)
   end
   return "ok\n", 200, {}
 end)
-intake:start()
+M.intake:start()
 logf("[tts] intake listening on http://127.0.0.1:%s", tostring(cfg.TTS_PORT))
 
 -- ---- CLI + URL entry points ----------------------------------------------
