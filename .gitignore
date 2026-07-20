@@ -4,6 +4,7 @@
 
 # Python runtime
 .venv/
+.venv-tts/
 __pycache__/
 *.pyc
 
