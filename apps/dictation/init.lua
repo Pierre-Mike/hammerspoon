@@ -39,7 +39,20 @@ local function logf(fmt, ...)
 end
 
 M.menu = hs.menubar.new()
-local function setIcon(s) M.menu:setTitle(s) end
+-- Native template image (monochrome, auto-tints to the menubar colour).
+local ICON_MIC = hs.image.imageFromName("NSTouchBarAudioInputTemplate")
+local function setIcon(s)
+  if s == "○" then          -- idle: microphone glyph
+    if ICON_MIC then M.menu:setTitle(""); M.menu:setIcon(ICON_MIC)
+    else M.menu:setIcon(nil); M.menu:setTitle("🎤") end
+  elseif s == "●" then      -- recording
+    M.menu:setIcon(nil); M.menu:setTitle("🔴")
+  elseif s == "…" then      -- transcribing
+    M.menu:setIcon(nil); M.menu:setTitle("⏳")
+  else
+    M.menu:setIcon(nil); M.menu:setTitle(s)
+  end
+end
 setIcon("○")
 
 -- ── Model selection ─────────────────────────────────────────────────────────
@@ -631,6 +644,7 @@ local function setMic(name)
 end
 
 local function buildMenu()
+  MICS = discoverMics()   -- refresh so the picker reflects currently-connected inputs
   local maxKB = 0
   for _, m in ipairs(MODELS) do if m.sizeKB and m.sizeKB > maxKB then maxKB = m.sizeKB end end
   local items = { { title = "Speech model · RAM footprint", disabled = true } }
@@ -729,6 +743,20 @@ M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
   return false
 end)
 M.keyWatcher:start()
+
+-- Keep the mic list fresh even without opening the menu: a headset that
+-- (dis)connects after launch retriggers discovery, and if the *selected* mic
+-- disappears we say so instead of silently recording nothing.
+hs.audiodevice.watcher.setCallback(function()
+  MICS = discoverMics()
+  local present = false
+  for _, m in ipairs(MICS) do if m.name == M.micName then present = true; break end end
+  if not present then
+    logf("[mic] selected %q disconnected", tostring(M.micName))
+    notify("Mic '" .. tostring(M.micName) .. "' disconnected — pick another", 2.8)
+  end
+end)
+hs.audiodevice.watcher.start()
 
 -- Public API for other apps (e.g. volume_tap) to drive voice → Orchestrator.
 M.isRecording = function() return M.recording end
