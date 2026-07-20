@@ -101,7 +101,10 @@ intake:setCallback(function(method, path, _headers, body)
   if method == "POST" and path == "/speak" then
     local n = M.speak(body or "")
     return (n > 0 and "queued\n" or "empty\n"), 200, {}
-  elseif method == "POST" and path == "/stop" then
+  elseif path == "/stop" then
+    -- Method-agnostic: stop carries no body, and hs.httpserver rejects a
+    -- bodyless POST with 400 before the callback runs — so `curl .../stop`
+    -- (a GET) must work too.
     M.stop()
     return "stopped\n", 200, {}
   elseif path == "/status" then

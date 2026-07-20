@@ -52,7 +52,7 @@ downloads on first run. Then any app can talk:
 
 ```sh
 curl -sX POST localhost:8790/speak -d 'hello from any app'
-curl -sX POST localhost:8790/stop            # cancel + flush the queue
+curl -s     localhost:8790/stop              # cancel + flush the queue (no body)
 curl -s     localhost:8790/status            # {"speaking":…,"queued":…,"voice":…}
 hs -c 'speak("or straight from a shell")'
 open 'hammerspoon://speak?text=or%20via%20url&voice=marius'

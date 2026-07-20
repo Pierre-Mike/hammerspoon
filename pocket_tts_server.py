@@ -12,22 +12,22 @@
 # time, so there is never useful concurrency to exploit, and one WAV writer at a
 # time keeps the rotating output paths race-free.
 #
-# API assumptions (pocket-tts >= Jan 2026):
-#   from pocket_tts.models.tts_model import TTSModel
-#   model = TTSModel.load_model()
-#   model.sample_rate                      -> 24000
-#   model.generate_audio_stream(text=..., voice=...)  -> yields PCM chunks
+# The generation flow mirrors pocket_tts.main.generate (the library's own CLI):
+#   model = TTSModel.load_model(language=...)
+#   state = model.get_state_for_audio_prompt(voice)          # predefined name / url / path
+#   chunks = model.generate_audio_stream(model_state=state, text_to_generate=text)
+#   stream_audio_chunks(path, chunks, model.config.mimi.sample_rate)   # writes the WAV
+# Voice states are cached per voice string (get_state_for_audio_prompt fetches the
+# prompt audio from HF the first time), so repeat requests skip that download.
 import os
-import sys
 import threading
 import time
-import wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("POCKET_TTS_PORT", "8790"))
-DEFAULT_VOICE = os.environ.get("POCKET_TTS_VOICE", "alba")
-LANGUAGE = os.environ.get("POCKET_TTS_LANGUAGE", "english")
+PORT = int(os.environ.get("POCKET_TTS_PORT", "8791"))
+DEFAULT_VOICE = os.environ.get("POCKET_TTS_VOICE", "").strip()   # "" -> language default
+LANGUAGE = os.environ.get("POCKET_TTS_LANGUAGE", "english").strip() or None
 OUT_DIR = os.environ.get("POCKET_TTS_OUT", "/tmp")
 ROTATE = 8  # keep the last N wavs so a file is never overwritten while afplay reads it
 
@@ -36,7 +36,9 @@ _lock = threading.RLock()         # serialise synthesis + the output counter (re
                                   # the handler holds it across synth(), which re-acquires
                                   # it for the rotating counter)
 _model = {"m": None, "sr": 24000}
+_states = {}                       # voice string -> model_state dict (cache)
 _counter = {"n": 0}
+_helpers = {}                      # lazily-imported library functions
 
 
 def log(msg):
@@ -47,21 +49,22 @@ def _load():
     t0 = time.time()
     log(f"loading model (language={LANGUAGE})")
     from pocket_tts.models.tts_model import TTSModel
+    from pocket_tts.data.audio import stream_audio_chunks
+    from pocket_tts.default_parameters import get_default_voice_for_language
 
-    try:
-        model = TTSModel.load_model(language=LANGUAGE)
-    except TypeError:
-        # older/newer signatures may not take `language`
-        model = TTSModel.load_model()
+    _helpers["stream_audio_chunks"] = stream_audio_chunks
+    _helpers["default_voice"] = get_default_voice_for_language
+
+    model = TTSModel.load_model(language=LANGUAGE)
+    model.to("cpu")                                    # match the "runs on CPU" contract
     _model["m"] = model
-    _model["sr"] = int(getattr(model, "sample_rate", 24000))
+    _model["sr"] = int(model.config.mimi.sample_rate)
     log(f"model loaded in {time.time() - t0:.2f}s, sr={_model['sr']}")
 
-    # Warm the graph so the first real /speak isn't slow.
+    # Warm the graph + prime the default voice state so the first /speak is fast.
     try:
         tw = time.time()
-        for _ in model.generate_audio_stream(text="Ready.", voice=DEFAULT_VOICE):
-            pass
+        synth("Ready.", DEFAULT_VOICE)
         log(f"warmup synth {time.time() - tw:.2f}s")
     except Exception as e:  # noqa: BLE001
         log(f"warmup skipped: {e}")
@@ -69,41 +72,28 @@ def _load():
     log("worker ready")
 
 
-def _to_int16(chunk):
-    """Coerce one yielded chunk (numpy/torch/list, float or int) to 1-D int16 bytes."""
-    import numpy as np
-
-    arr = chunk
-    if hasattr(arr, "detach"):          # torch tensor
-        arr = arr.detach().cpu().numpy()
-    arr = np.asarray(arr).reshape(-1)
-    if np.issubdtype(arr.dtype, np.floating):
-        arr = np.clip(arr, -1.0, 1.0)
-        arr = (arr * 32767.0).astype(np.int16)
-    else:
-        arr = arr.astype(np.int16)
-    return arr.tobytes()
+def _voice_state(voice):
+    """Return (and cache) the model_state for a voice string. '' -> language default."""
+    key = voice or ""
+    st = _states.get(key)
+    if st is None:
+        resolved = voice or _helpers["default_voice"](LANGUAGE)
+        st = _model["m"].get_state_for_audio_prompt(resolved)
+        _states[key] = st
+    return st
 
 
 def synth(text, voice):
     """Synthesise text to a WAV file, return its path. Raises on failure."""
     model = _model["m"]
-    sr = _model["sr"]
-    pcm = bytearray()
-    for chunk in model.generate_audio_stream(text=text, voice=voice):
-        pcm.extend(_to_int16(chunk))
-    if len(pcm) == 0:
-        raise RuntimeError("no audio produced")
+    state = _voice_state(voice)
+    chunks = model.generate_audio_stream(model_state=state, text_to_generate=text)
 
     with _lock:
         n = _counter["n"] % ROTATE
         _counter["n"] += 1
     path = os.path.join(OUT_DIR, f"hs-tts-{n}.wav")
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(sr)
-        w.writeframes(bytes(pcm))
+    _helpers["stream_audio_chunks"](path, chunks, _model["sr"])   # writes the WAV
     return path
 
 
@@ -135,11 +125,11 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, "no")
             return
         text = self._body()
-        voice = self.headers.get("X-Voice", DEFAULT_VOICE) or DEFAULT_VOICE
+        voice = (self.headers.get("X-Voice") or DEFAULT_VOICE).strip()
         if not text:
             self._reply(400, "__ERROR__ empty text")
             return
-        if not _ready.wait(timeout=120):
+        if not _ready.wait(timeout=180):
             self._reply(503, "__ERROR__ model not ready")
             return
         try:
