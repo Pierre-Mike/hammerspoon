@@ -1,7 +1,7 @@
 -- Dictation: hold Fn = record, release = transcribe & paste at cursor.
 -- Pipeline: ffmpeg → parakeet-mlx → pbpaste → ⌘V
 
-local AUDIO_DEVICE = "1"            -- 1=MacBook Pro Mic. List: ffmpeg -f avfoundation -list_devices true -i ""
+local DEFAULT_MIC = "MacBook Pro Microphone"  -- selected by NAME; avfoundation indices reshuffle when devices change
 local WAV  = "/tmp/hs-dictate.wav"
 local RAW  = "/tmp/hs-dictate.raw"   -- headerless s16le PCM, streamed live to the server
 local TXT  = "/tmp/hs-dictate.txt"
@@ -19,6 +19,7 @@ local PARAKEET_URL    = PARAKEET_BASE .. "/transcribe"  -- batch (fallback only)
 local MLXA_PY   = os.getenv("HOME") .. "/.local/share/uv/tools/mlx-audio/bin/python"
 local QWEN3_OUT = "/tmp/hs-qwen3"
 local MIN_DURATION = 0.6            -- avfoundation needs ~300ms to start; below this = no audio
+local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button release is ever missed
 local ZELLIJ = os.getenv("HOME") .. "/.cargo/bin/zellij"
 local SUPERVISOR_SESSION = "Orchestrator"
 local ZELLIJ_ENV = { HOME = os.getenv("HOME"), PATH = "/opt/homebrew/bin:/usr/bin:/bin:/usr/bin:/Users/pierre-mikel/.cargo/bin" }
@@ -101,6 +102,40 @@ end
 
 local MODELS = discoverModels()
 
+-- ── Microphone selection ────────────────────────────────────────────────────
+-- avfoundation device indices reshuffle whenever an input is added/removed, so
+-- we pick the mic by NAME and pass the name straight to ffmpeg (it matches).
+-- The menubar lists every current input; the choice persists in hs.settings.
+local function discoverMics()
+  local out = hs.execute(FFMPEG .. " -f avfoundation -list_devices true -i '' 2>&1") or ""
+  local mics, inAudio = {}, false
+  for line in out:gmatch("[^\n]+") do
+    if line:find("audio devices:", 1, true) then
+      inAudio = true
+    elseif line:find("video devices:", 1, true) then
+      inAudio = false
+    elseif inAudio then
+      local idx, name = line:match("%]%s*%[(%d+)%]%s+(.+)$")
+      if idx and name then
+        mics[#mics + 1] = { index = idx, name = (name:gsub("%s+$", "")) }
+      end
+    end
+  end
+  return mics
+end
+
+local MICS = discoverMics()
+
+-- Persisted mic (by name). If it's not currently connected we keep the name
+-- anyway, so it just works again once the device reappears.
+local function initMic()
+  local saved = hs.settings.get("dictate.audioDevice")
+  if saved and saved ~= "" then return saved end
+  for _, m in ipairs(MICS) do if m.name == DEFAULT_MIC then return m.name end end
+  return (MICS[1] and MICS[1].name) or DEFAULT_MIC
+end
+M.micName = initMic()
+
 -- Restore the persisted choice, else default to MODEL_PATH (v3).
 local function initModel()
   local savedId = hs.settings.get("dictate.modelId")
@@ -130,7 +165,7 @@ else
   local p = defaultParakeet()
   M.serverModelPath, M.serverModelName = p.path, p.name
 end
-M.menu:setTooltip("Dictate · " .. M.modelName .. " · " .. (M.modelSize or "?"))
+M.menu:setTooltip("Dictate · " .. M.modelName .. " · " .. (M.modelSize or "?") .. " · mic: " .. (M.micName or "?"))
 
 -- Floating HUD at screen center
 local function showHUD(label, dotColor)
@@ -419,6 +454,9 @@ local function transcribeQwen3()
   t:start()
 end
 
+-- Forward decl so startRecording's watchdog can call stopRecording (defined below).
+local stopRecording
+
 local function startRecording()
   os.remove(WAV); os.remove(RAW)
   M.recording = true
@@ -428,7 +466,7 @@ local function startRecording()
   hideLivePreview()
   showLivePreview(nil)   -- "Listening…" (stays put for batch engines: no partials)
   duckNoise()
-  logf("[dictate] recording start (device :%s, engine=%s)", AUDIO_DEVICE, M.engine)
+  logf("[dictate] recording start (mic=%q, engine=%s)", M.micName, M.engine)
   -- Two outputs from one capture: WAV for batch transcription (CLI / Qwen3),
   -- plus a headerless s16le PCM file the parakeet server tails live.
   M.ffmpegTask = hs.task.new(FFMPEG, function(code, _, err)
@@ -437,10 +475,21 @@ local function startRecording()
     -- Non-streaming engine: WAV is finalized now, so kick off the batch transcribe.
     if M.qwenFinish then M.qwenFinish = false; transcribeQwen3() end
   end,
-    {"-y", "-f", "avfoundation", "-i", ":" .. AUDIO_DEVICE,
+    {"-y", "-f", "avfoundation", "-i", ":" .. M.micName,
      "-ar", "16000", "-ac", "1", WAV,
      "-ar", "16000", "-ac", "1", "-f", "s16le", "-flush_packets", "1", RAW})
   M.ffmpegTask:start()
+  -- Watchdog: never hold the mic open forever if a release event is missed
+  -- (e.g. a spurious headset PLAY press, or a swallowed Fn key-up).
+  if M.watchdog then M.watchdog:stop() end
+  M.watchdog = hs.timer.doAfter(MAX_RECORD, function()
+    M.watchdog = nil
+    if M.recording then
+      logf("[dictate] watchdog fired after %ds — auto-stopping (missed release?)", MAX_RECORD)
+      notify("recording auto-stopped after " .. MAX_RECORD .. "s", 2.2)
+      stopRecording()
+    end
+  end)
   if M.stream then
     -- Begin streaming this recording into the warm model as it's captured.
     hs.http.asyncPost(PARAKEET_BASE .. "/start", RAW, {}, function(status, _, _)
@@ -462,7 +511,8 @@ local function cancelStream()
   hs.http.asyncPost(PARAKEET_BASE .. "/cancel", "", {}, function() end)
 end
 
-local function stopRecording()
+function stopRecording()
+  if M.watchdog then M.watchdog:stop(); M.watchdog = nil end
   local dur = hs.timer.secondsSinceEpoch() - M.startedAt
   -- For batch engines, flag the finish BEFORE terminating ffmpeg so its exit
   -- callback (which fires once the WAV is finalized) runs transcribeQwen3.
@@ -571,6 +621,15 @@ local function sizeBar(kb, maxKB)
   return string.rep("█", filled) .. string.rep("░", cells - filled)
 end
 
+local function setMic(name)
+  if M.recording then notify("stop recording before switching mic", 1.8); return end
+  M.micName = name
+  hs.settings.set("dictate.audioDevice", name)
+  M.menu:setTooltip("Dictate · " .. (M.modelName or "?") .. " · mic: " .. name)
+  logf("[mic] switch → %q", name)
+  notify("Mic: " .. name, 1.6)
+end
+
 local function buildMenu()
   local maxKB = 0
   for _, m in ipairs(MODELS) do if m.sizeKB and m.sizeKB > maxKB then maxKB = m.sizeKB end end
@@ -584,6 +643,22 @@ local function buildMenu()
   end
   items[#items + 1] = { title = "-" }
   items[#items + 1] = { title = "█ RAM resident   🟢 live preview   🟡 batch (on release)", disabled = true }
+  items[#items + 1] = { title = "-" }
+  -- Microphone picker: select by name so it survives avfoundation reshuffles.
+  items[#items + 1] = { title = "-" }
+  items[#items + 1] = { title = "Microphone", disabled = true }
+  local micSeen = false
+  for _, mic in ipairs(MICS) do
+    if mic.name == M.micName then micSeen = true end
+    items[#items + 1] = { title = mic.name,
+      checked = (mic.name == M.micName),
+      fn = function() setMic(mic.name) end }
+  end
+  if not micSeen and M.micName then
+    items[#items + 1] = { title = M.micName .. "  (disconnected)", checked = true, disabled = true }
+  end
+  items[#items + 1] = { title = "Rescan microphones",
+    fn = function() MICS = discoverMics(); notify("Rescanned mics (" .. #MICS .. ")", 1.6) end }
   items[#items + 1] = { title = "-" }
   items[#items + 1] = { title = "Restart server",
     fn = function() notify("Restarting STT server…", 1.6); restartServer() end }
