@@ -23,6 +23,13 @@ local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button relea
 local ZELLIJ = os.getenv("HOME") .. "/.cargo/bin/zellij"
 local SUPERVISOR_SESSION = "Orchestrator"
 local ZELLIJ_ENV = { HOME = os.getenv("HOME"), PATH = "/opt/homebrew/bin:/usr/bin:/bin:/usr/bin:/Users/pierre-mikel/.cargo/bin" }
+-- Keepalive: a headless zellij client kept attached to the Orchestrator so that
+-- `zellij action write-chars` always has a client to route keystrokes to. zellij
+-- 0.44 silently DROPS writes to a session with zero attached clients — which is
+-- why sends only worked while the Orchestrator was the session on screen.
+local PYTHON3   = "/usr/bin/python3"
+local KEEPALIVE = os.getenv("HOME") .. "/.hammerspoon/apps/dictation/zellij_keepalive.py"
+local KEEPALIVE_CHECK = 20   -- seconds between "is a client still attached?" re-checks
 
 local M = { recording = false, ffmpegTask = nil, fnDown = false, playDown = false, startedAt = 0, lastResult = nil, cancelled = false, supervisor = false }
 
@@ -338,10 +345,37 @@ local function paste(text)
   hs.eventtap.keyStroke({"cmd"}, "v", 0)
 end
 
+-- ── Orchestrator keepalive ───────────────────────────────────────────────────
+-- Hold a headless zellij client attached to the Orchestrator at all times so
+-- write-chars/write below always have a client to land on. zellij_keepalive.py
+-- attaches an OVERSIZED client; zellij sizes a shared session to its smallest
+-- client, so it never shrinks the user's own view. Self-healing: hs.task's exit
+-- callback clears the handle and the periodic watchdog (see init) respawns it,
+-- e.g. after the Orchestrator session is restarted.
+local function keepaliveRunning()
+  return M.keepalive ~= nil and M.keepalive:isRunning()
+end
+
+local function ensureSupervisorClient()
+  if keepaliveRunning() then return end
+  M.keepalive = hs.task.new(PYTHON3, function(code, _, err)
+    if code ~= 0 and err and err ~= "" then
+      logf("[keepalive] exited code=%d err=%s", code, tostring(err))
+    end
+    M.keepalive = nil
+  end, { KEEPALIVE, SUPERVISOR_SESSION })
+  M.keepalive:setEnvironment(ZELLIJ_ENV)
+  M.keepalive:start()
+  logf("[keepalive] launched client for %s", SUPERVISOR_SESSION)
+end
+
 -- Write the transcript straight into the Orchestrator zellij pane, then Enter.
 -- Skips the event queue: text appears in the Claude Code prompt and submits.
 local function sendToSupervisor(text)
   if not text or text == "" then return end
+  -- Final guard: make sure a client is attached before we write (idempotent —
+  -- a no-op when the keepalive is already up, which it normally is).
+  ensureSupervisorClient()
   text = text:gsub("^%s+", ""):gsub("%s+$", "")
   if text == "" then return end
 
@@ -472,6 +506,10 @@ local stopRecording
 
 local function startRecording()
   os.remove(WAV); os.remove(RAW)
+  -- Pre-warm the Orchestrator client: if the keepalive is down (e.g. the session
+  -- was just restarted), relaunch it now so a client is attached by the time this
+  -- recording finishes and (maybe) routes to the Orchestrator. Idempotent.
+  ensureSupervisorClient()
   M.recording = true
   M.qwenFinish = false
   M.startedAt = hs.timer.secondsSinceEpoch()
@@ -590,6 +628,15 @@ killStale:start()
 local killStaleFfmpeg = hs.task.new("/bin/sh", nil,
   {"-c", "pkill -f 'ffmpeg .*hs-dictate[.]wav' 2>/dev/null; true"})
 killStaleFfmpeg:start()
+
+-- Reap a keepalive client orphaned by a previous HS session, then start a fresh
+-- one. The watchdog re-checks every KEEPALIVE_CHECK seconds and respawns it if
+-- the client ever drops (Orchestrator restarted, session killed, etc.), so a
+-- client is essentially always attached and sends never silently vanish.
+local killStaleKeepalive = hs.task.new("/bin/sh", function() ensureSupervisorClient() end,
+  {"-c", "pkill -f zellij_keepalive[.]py 2>/dev/null; true"})
+killStaleKeepalive:start()
+M.keepaliveTimer = hs.timer.doEvery(KEEPALIVE_CHECK, ensureSupervisorClient)
 
 -- Relaunch the warm server against M.serverModelPath. Frees :8765 first so the new
 -- model loads cleanly into a fresh process (the previous worker held the GPU).
