@@ -1,6 +1,10 @@
 -- Dictation: hold Fn = record, release = transcribe & paste at cursor.
 -- Pipeline: ffmpeg → parakeet-mlx → pbpaste → ⌘V
 
+local earcon      = require("lib.earcon")
+local configFile  = require("lib.config")
+local EARCONS_CFG = configFile.EARCONS
+
 local DEFAULT_MIC = "MacBook Pro Microphone"  -- selected by NAME; avfoundation indices reshuffle when devices change
 local WAV  = "/tmp/hs-dictate.wav"
 local RAW  = "/tmp/hs-dictate.raw"   -- headerless s16le PCM, streamed live to the server
@@ -36,6 +40,48 @@ local function logf(fmt, ...)
     f:close()
   end
   print(line)
+end
+
+-- Earcon player: hs.sound is non-blocking, so calling this from startRecording
+-- does NOT delay ffmpeg spawn. Failures are swallowed on purpose — a missing
+-- .aiff must never break the dictation path. Sounds are cached after first load
+-- so subsequent triggers are effectively free.
+local _earconCache = {}
+local function _loadSystemSound(name)
+  if _earconCache[name] ~= nil then return _earconCache[name] or nil end
+  local ok, snd = pcall(hs.sound.getByName, name)
+  if not ok or not snd then
+    -- Fall back to /System/Library/Sounds/<name>.aiff — hs.sound.getByName
+    -- occasionally misses freshly-registered sounds.
+    local path = "/System/Library/Sounds/" .. name .. ".aiff"
+    ok, snd = pcall(hs.sound.soundFromFile, path)
+    if not ok then snd = nil end
+  end
+  _earconCache[name] = snd or false
+  return snd or nil
+end
+local function _loadFileSound(path)
+  if _earconCache[path] ~= nil then return _earconCache[path] or nil end
+  local ok, snd = pcall(hs.sound.soundFromFile, path)
+  if not ok then snd = nil end
+  _earconCache[path] = snd or false
+  return snd or nil
+end
+local _earconPlayer = {
+  system = function(name, volume)
+    local snd = _loadSystemSound(name); if not snd then return end
+    pcall(function() snd:volume(volume); snd:stop(); snd:play() end)
+  end,
+  file = function(path, volume)
+    local snd = _loadFileSound(path); if not snd then return end
+    pcall(function() snd:volume(volume); snd:stop(); snd:play() end)
+  end,
+}
+-- kind: "start" (mic just began), "stop" (recording ended, transcribing),
+-- "sent" (transcript delivered to Orchestrator).
+local function playEarcon(kind)
+  local ok, err = pcall(earcon.play, EARCONS_CFG, kind, _earconPlayer)
+  if not ok then logf("[earcon] play(%s) failed: %s", tostring(kind), tostring(err)) end
 end
 
 M.menu = hs.menubar.new()
@@ -356,7 +402,11 @@ local function sendToSupervisor(text)
         function(c2, _, e2)
           if c2 ~= 0 then
             logf("[supervisor] zellij write 13 exit=%d err=%s", c2, tostring(e2))
+            return
           end
+          -- Transcript is now committed in the Orchestrator prompt: fire the
+          -- "delivered" cue so a headset-only operator hears the handoff.
+          playEarcon("sent")
         end,
         {"--session", SUPERVISOR_SESSION, "action", "write", "13"})
       enterTask:setEnvironment(ZELLIJ_ENV)
@@ -471,6 +521,9 @@ end
 local stopRecording
 
 local function startRecording()
+  -- Fire the "listening" cue FIRST so it lands before ffmpeg spins up. hs.sound
+  -- is non-blocking, so this adds no measurable latency to mic capture.
+  playEarcon("start")
   os.remove(WAV); os.remove(RAW)
   M.recording = true
   M.qwenFinish = false
@@ -525,6 +578,9 @@ local function cancelStream()
 end
 
 function stopRecording()
+  -- Fire the "captured" cue immediately on release, before terminating ffmpeg
+  -- or dispatching transcription. Distinguishable from the start cue by ear.
+  playEarcon("stop")
   if M.watchdog then M.watchdog:stop(); M.watchdog = nil end
   local dur = hs.timer.secondsSinceEpoch() - M.startedAt
   -- For batch engines, flag the finish BEFORE terminating ffmpeg so its exit
