@@ -81,6 +81,23 @@ hs.urlevent = {
   bind = function(_, _) end,
 }
 
+-- hs.sound stub. Tests that care about earcon playback substitute their own
+-- getByName / soundFromFile so they can capture the call and assert on it.
+hs.sound = {
+  getByName = function(_)
+    local s = {}
+    s.volume = function(self, _) return self end
+    s.play   = function(self)    return self end
+    return s
+  end,
+  soundFromFile = function(_)
+    local s = {}
+    s.volume = function(self, _) return self end
+    s.play   = function(self)    return self end
+    return s
+  end,
+}
+
 -- Inject into globals so `require("hs.ipc")` etc. resolve without error.
 hs.ipc = {}
 

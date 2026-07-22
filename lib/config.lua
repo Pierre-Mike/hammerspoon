@@ -44,6 +44,30 @@ return {
 
   DUCK_LEVEL          = 0.50,
 
+  -- Audible pipeline cues. Three distinguishable earcons so a headset-only
+  -- operator can tell state by ear:
+  --   START — mic capture just began ("listening")
+  --   STOP  — recording ended, transcription dispatched ("processing")
+  --   SENT  — transcript written into the Orchestrator zellij pane ("delivered")
+  -- Kept LOCAL (hs.sound) so it is instant and does not queue behind the
+  -- /speak TTS service on 8790.
+  --
+  -- Each slot accepts either:
+  --   • a bare macOS system-sound name (e.g. "Tink", "Pop", "Morse")
+  --     — anything under /System/Library/Sounds/*.aiff
+  --   • an absolute path to a short .wav / .aiff / .caf on disk
+  --
+  -- VOLUME is 0.0–1.0 (applied to the hs.sound before play).
+  -- Set enabled = false to silence all three; set an individual slot to nil
+  -- or "" to silence just that step.
+  EARCONS = {
+    enabled = true,
+    START   = "Tink",       -- high, short — "listening now"
+    STOP    = "Pop",        -- subtler, lower — "captured, transcribing"
+    SENT    = "Submarine",  -- distinct, deeper — "delivered to Orchestrator"
+    VOLUME  = 0.45,
+  },
+
   PREVIEW = {
     FONT_SIZE         = 28,
     PAD               = 24,
