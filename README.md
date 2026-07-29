@@ -19,7 +19,7 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 | `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+A` routes the transcript to a zellij `Orchestrator` session instead of pasting; `Fn+C` cancels & recalls the last result. Menu-bar picker switches speech models. |
 | `apps/brown_noise` | Menu-bar noise machine: play/stop, volume, and color (white/pink/brown/blue/violet). |
 | `apps/volume_tap` | Voice control for the Orchestrator via volume-key taps. |
-| `apps/noseguard` | Face-touch deterrent — a Python + MediaPipe daemon (`noseguard.py`) watches the camera and disrupts you when you touch your face. CPU delegate only (the Metal GPU delegate aborts on macOS). |
+| `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
 
 ## Assets not in git
@@ -34,7 +34,8 @@ Large binaries are `.gitignore`d (see `.gitignore`) — they live on disk but ar
 - **Swift overlay binary** (`apps/noseguard/overlay/overlay`) — build from source:
   `swiftc -O apps/noseguard/overlay/overlay.swift -o apps/noseguard/overlay/overlay`.
 - **noseguard venv** (`apps/noseguard/.venv/`) — recreate with
-  `python3 -m venv apps/noseguard/.venv && apps/noseguard/.venv/bin/pip install mediapipe numpy opencv-python pyobjc`.
+  `python3 -m venv apps/noseguard/.venv && apps/noseguard/.venv/bin/pip install pyobjc`.
+  Detection runs on Apple Vision, so `pyobjc` is the only requirement.
 
 ## TTS service setup
 
@@ -86,5 +87,12 @@ Logs: `/tmp/hs-tts.log` (queue) and the server's stdout.
 
 ```sh
 make install-deps   # luarocks install busted
-make test           # busted specs under tests/
+make test           # busted specs under tests/, plus the noseguard geometry
+```
+
+`apps/noseguard/nose_geom.py` deliberately imports nothing from Vision or
+AVFoundation, so its tests need no venv and no camera:
+
+```sh
+python3 -m unittest discover apps/noseguard/tests
 ```
