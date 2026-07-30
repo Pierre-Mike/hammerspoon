@@ -33,10 +33,18 @@ function M.urldecode(s)
   return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
 end
 
--- Truncate text to maxLen chars, appending "…" when cut.
+-- Truncate text to maxLen bytes, appending "…" when cut. The cut point backs off
+-- so a multi-byte UTF-8 character is never sliced in half (half a character
+-- renders as a replacement glyph in alerts and log lines).
 function M.truncate(text, maxLen)
   if not text or #text <= maxLen then return text end
-  return text:sub(1, maxLen) .. "…"
+  local cut = maxLen
+  while cut > 1 do
+    local b = text:byte(cut + 1)
+    if not b or b < 0x80 or b >= 0xC0 then break end   -- next byte starts a new char
+    cut = cut - 1
+  end
+  return text:sub(1, cut) .. "…"
 end
 
 -- Estimate the number of display lines for text wrapped at charsPerLine.

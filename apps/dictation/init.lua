@@ -782,8 +782,14 @@ M.playWatcher:start()
 -- Chord detection while holding Fn:
 --   Fn+C  cancel current recording and recall last
 --   Fn+A  send this recording's transcript to the Orchestrator zellij session (instead of paste)
+--   Fn+S  speak the current selection through the TTS queue (no dictation)
 M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
   if not M.fnDown then return false end
+  -- Bare Fn+<key> only. Without this guard the synthetic ⌘C that Fn+S fires to
+  -- grab the selection comes straight back through this tap as Fn+C, cancelling
+  -- the chord that just sent it — and Fn+⌘C would never reach the focused app.
+  local f = e:getFlags()
+  if f.cmd or f.alt or f.ctrl or f.shift then return false end
   local kc = e:getKeyCode()
   if kc == hs.keycodes.map["c"] then
     M.cancelled = true
@@ -794,6 +800,21 @@ M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
     M.supervisor = true
     logf("[chord] Fn+A — Orchestrator mode armed")
     notify("→ Orchestrator mode (release Fn to send)", 1.6)
+    return true
+  end
+  if kc == hs.keycodes.map["s"] then
+    -- Reading out, not dictating in. Fn-down already opened the mic, so mark the
+    -- capture cancelled (release drops the clip and unducks) and hand off to the
+    -- TTS queue. Required lazily: init.lua loads dictation before apps.tts.
+    M.cancelled = true
+    logf("[chord] Fn+S — speak selection")
+    local ok, tts = pcall(require, "apps.tts")
+    if ok and type(tts) == "table" and tts.speakSelection then
+      tts.speakSelection()
+    else
+      logf("[chord] Fn+S — apps.tts unavailable: %s", tostring(tts))
+      notify("TTS service not loaded", 1.8)
+    end
     return true
   end
   return false
@@ -830,7 +851,7 @@ M.stopVoice = function()
   return true
 end
 
-notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+A → " .. SUPERVISOR_SESSION, 2.0)
+notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+A → " .. SUPERVISOR_SESSION .. " · Fn+S speak selection", 2.0)
 logf("[dictate] init complete")
 
 return M

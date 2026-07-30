@@ -42,6 +42,17 @@ return {
     system  = "michael",  -- status / system messages
   },
 
+  -- Fn+S — speak whatever is selected. macOS has no "read the selection" API, so
+  -- the chord copies it (⌘C), reads the pasteboard, then puts the clipboard back.
+  --   PROFILE  voice for read-aloud text (a TTS_PROFILES key or a raw voice name)
+  --   POLL     how often to check whether the copy landed
+  --   TIMEOUT  give up after this long and treat it as "nothing selected"
+  TTS_SELECTION       = {
+    PROFILE = "reading",
+    POLL    = 0.03,
+    TIMEOUT = 0.45,
+  },
+
   DUCK_LEVEL          = 0.50,
 
   -- Audible pipeline cues. Three distinguishable earcons so a headset-only
