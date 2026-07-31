@@ -1,6 +1,6 @@
 -- Pure routing logic for lib/voice_targets: target resolution across both
--- transports, which chord picks which supervisor, the per-transport argv, and
--- the refusals that keep dictation out of a crewmate pane.
+-- transports, which chord picks which supervisor, the per-transport delivery
+-- steps, and the refusals that keep dictation out of a crewmate pane.
 -- No hs.* here — the module deliberately has no Hammerspoon dependency.
 
 local vt = require("lib.voice_targets")
@@ -21,10 +21,23 @@ local function cfg(overrides)
       tmux   = { bin = "/opt/homebrew/bin/tmux", env = { HOME = "/home", PATH = "/tbin" } },
     },
     VOICE_TARGET_DEFAULT    = "orchestrator",
+    VOICE_TMUX_BUFFER       = "hs-voice",
     FIRSTMATE_CREW_SESSIONS = { "firstmate" },
   }
   for k, v in pairs(overrides or {}) do c[k] = v end
   return c
+end
+
+-- Collapse a step list to { name, argv…, stdin } shapes for readable asserts.
+local function argvOf(steps)
+  local out = {}
+  for i, s in ipairs(steps) do out[i] = s.argv end
+  return out
+end
+local function namesOf(steps)
+  local out = {}
+  for i, s in ipairs(steps) do out[i] = s.name end
+  return out
 end
 
 describe("voice_targets.resolve", function()
@@ -153,12 +166,11 @@ describe("voice_targets tmux target guard", function()
     assert.is_false(vt.isExplicitTmuxTarget("firstmate:.0"))
   end)
 
-  it("builds no argv for a refused tmux target", function()
+  it("builds no steps for a refused tmux target", function()
     local c = cfg()
     c.VOICE_TARGETS.firstmate.target = "firstmate"
     local t = vt.resolve(c, "firstmate")   -- nil
-    assert.is_nil(vt.inputArgs(t, "hello"))
-    assert.is_nil(vt.submitArgs(t))
+    assert.is_nil(vt.deliverySteps(c, t, "hello"))
   end)
 
   it("arms no chord at all when a target is ambient", function()
@@ -205,12 +217,11 @@ describe("voice_targets crewmate-session guard (zellij)", function()
     assert.is_false(vt.isCrewSession({}, "firstmate"))
   end)
 
-  it("builds no argv for a refused zellij route", function()
+  it("builds no steps for a refused zellij route", function()
     local c = cfg()
     c.VOICE_TARGETS.orchestrator.session = "firstmate"
     local t = vt.resolve(c, "orchestrator")   -- nil
-    assert.is_nil(vt.inputArgs(t, "hello"))
-    assert.is_nil(vt.submitArgs(t))
+    assert.is_nil(vt.deliverySteps(c, t, "hello"))
   end)
 end)
 
@@ -421,121 +432,155 @@ describe("voice_targets.normalize", function()
   end)
 end)
 
-describe("voice_targets.tmuxSafeText", function()
-  -- `tmux send-keys` has no `--` terminator, so a leading dash would parse as
-  -- flags (verified against tmux 3.7b). A leading space makes it an operand.
-  it("leaves ordinary speech untouched", function()
-    assert.equals("ship the branch", vt.tmuxSafeText("  ship the branch  "))
-  end)
+describe("voice_targets.deliverySteps — zellij transport", function()
+  local c    = cfg()
+  local orch = vt.resolve(c, "orchestrator")
 
-  it("prefixes a space when the text starts with a dash", function()
-    assert.equals(" -- dashes ahead", vt.tmuxSafeText("-- dashes ahead"))
-    assert.equals(" -t foo", vt.tmuxSafeText("-t foo"))
+  it("is two steps: type then submit", function()
+    local steps = vt.deliverySteps(c, orch, "hello")
+    assert.equals(2, #steps)
+    assert.same({ "write-chars", "submit" }, namesOf(steps))
   end)
-
-  it("returns nil for blank input", function()
-    assert.is_nil(vt.tmuxSafeText("   "))
-    assert.is_nil(vt.tmuxSafeText(nil))
-  end)
-end)
-
-describe("voice_targets argv — zellij transport", function()
-  local orch = vt.resolve(cfg(), "orchestrator")
 
   it("builds byte-for-byte the argv the old hardcoded Orchestrator call used", function()
-    assert.same({ "--session", "Orchestrator", "action", "write-chars", "hello" },
-      vt.inputArgs(orch, "hello"))
-    assert.same({ "--session", "Orchestrator", "action", "write", "13" },
-      vt.submitArgs(orch))
+    assert.same({
+      { "--session", "Orchestrator", "action", "write-chars", "hello" },
+      { "--session", "Orchestrator", "action", "write", "13" },
+    }, argvOf(vt.deliverySteps(c, orch, "hello")))
+  end)
+
+  it("never asks for stdin — zellij carries the text in argv", function()
+    for _, s in ipairs(vt.deliverySteps(c, orch, "hello")) do
+      assert.is_nil(s.stdin)
+    end
   end)
 
   it("builds bracketed paste + send-keys Enter when the target asks for them", function()
-    local c = cfg()
-    c.VOICE_TARGETS.orchestrator.input  = "paste"
-    c.VOICE_TARGETS.orchestrator.submit = "enter"
-    local t = vt.resolve(c, "orchestrator")
-    assert.same({ "--session", "Orchestrator", "action", "paste", "--", "hello" },
-      vt.inputArgs(t, "hello"))
-    assert.same({ "--session", "Orchestrator", "action", "send-keys", "Enter" },
-      vt.submitArgs(t))
+    local c2 = cfg()
+    c2.VOICE_TARGETS.orchestrator.input  = "paste"
+    c2.VOICE_TARGETS.orchestrator.submit = "enter"
+    assert.same({
+      { "--session", "Orchestrator", "action", "paste", "--", "hello" },
+      { "--session", "Orchestrator", "action", "send-keys", "Enter" },
+    }, argvOf(vt.deliverySteps(c2, vt.resolve(c2, "orchestrator"), "hello")))
   end)
 
   it("passes a leading-dash transcript as an operand under paste", function()
-    local c = cfg()
-    c.VOICE_TARGETS.orchestrator.input = "paste"
-    local argv = vt.inputArgs(vt.resolve(c, "orchestrator"), "-- not a flag")
+    local c2 = cfg()
+    c2.VOICE_TARGETS.orchestrator.input = "paste"
+    local argv = vt.deliverySteps(c2, vt.resolve(c2, "orchestrator"), "-- not a flag")[1].argv
     assert.equals("--", argv[5])
     assert.equals("-- not a flag", argv[6])
   end)
 
-  it("adds --pane-id before the operands when the target pins a pane", function()
-    local c = cfg()
-    c.VOICE_TARGETS.orchestrator.paneId = "terminal_1"
-    local pinned = vt.resolve(c, "orchestrator")
-    assert.same({ "--session", "Orchestrator", "action", "write-chars",
-                  "--pane-id", "terminal_1", "hello" },
-      vt.inputArgs(pinned, "hello"))
-    assert.same({ "--session", "Orchestrator", "action", "write",
-                  "--pane-id", "terminal_1", "13" },
-      vt.submitArgs(pinned))
+  it("adds --pane-id before the operands on every step when a pane is pinned", function()
+    local c2 = cfg()
+    c2.VOICE_TARGETS.orchestrator.paneId = "terminal_1"
+    assert.same({
+      { "--session", "Orchestrator", "action", "write-chars", "--pane-id", "terminal_1", "hello" },
+      { "--session", "Orchestrator", "action", "write", "--pane-id", "terminal_1", "13" },
+    }, argvOf(vt.deliverySteps(c2, vt.resolve(c2, "orchestrator"), "hello")))
   end)
 
   it("trims the text it sends", function()
-    assert.equals("hello", vt.inputArgs(orch, "  hello  ")[5])
+    assert.equals("hello", vt.deliverySteps(c, orch, "  hello  ")[1].argv[5])
   end)
 end)
 
-describe("voice_targets argv — tmux transport", function()
-  local fm = vt.resolve(cfg(), "firstmate")
+describe("voice_targets.deliverySteps — tmux transport", function()
+  local c  = cfg()
+  local fm = vt.resolve(c, "firstmate")
 
-  it("types with send-keys -l and submits with send-keys Enter", function()
-    assert.same({ "send-keys", "-t", "firstmate:0.0", "-l", "hello" },
-      vt.inputArgs(fm, "hello"))
-    assert.same({ "send-keys", "-t", "firstmate:0.0", "Enter" },
-      vt.submitArgs(fm))
+  it("is three steps: stage a buffer, bracketed-paste it, submit", function()
+    local steps = vt.deliverySteps(c, fm, "hello")
+    assert.equals(3, #steps)
+    assert.same({ "load-buffer", "paste-buffer", "submit" }, namesOf(steps))
   end)
 
-  it("space-prefixes a leading-dash transcript so tmux sees an operand", function()
-    assert.same({ "send-keys", "-t", "firstmate:0.0", "-l", " -- dashes" },
-      vt.inputArgs(fm, "-- dashes"))
+  it("builds the flags verified against tmux 3.7b", function()
+    assert.same({
+      { "load-buffer", "-b", "hs-voice", "-" },
+      { "paste-buffer", "-b", "hs-voice", "-p", "-d", "-t", "firstmate:0.0" },
+      { "send-keys", "-t", "firstmate:0.0", "Enter" },
+    }, argvOf(vt.deliverySteps(c, fm, "hello")))
   end)
 
-  it("trims the text it sends", function()
-    assert.equals("hello", vt.inputArgs(fm, "  hello  ")[5])
+  it("carries the transcript on stdin, never in argv", function()
+    local steps = vt.deliverySteps(c, fm, "hello")
+    assert.equals("hello", steps[1].stdin)
+    for _, s in ipairs(steps) do
+      for _, a in ipairs(s.argv) do
+        assert.not_equal("hello", a)
+      end
+    end
+    assert.is_nil(steps[2].stdin)
+    assert.is_nil(steps[3].stdin)
   end)
 
-  it("follows a retargeted pane", function()
-    local c = cfg()
-    c.VOICE_TARGETS.firstmate.target = "fm:2.1"
-    local t = vt.resolve(c, "firstmate")
-    assert.same({ "send-keys", "-t", "fm:2.1", "-l", "hi" }, vt.inputArgs(t, "hi"))
-    assert.same({ "send-keys", "-t", "fm:2.1", "Enter" }, vt.submitArgs(t))
+  it("needs no dash escaping, because the text is not an argument", function()
+    -- `tmux send-keys` has no `--` terminator, so an argv-carried transcript
+    -- starting with a dash would parse as flags. On stdin it simply cannot.
+    local steps = vt.deliverySteps(c, fm, "-- dashes ahead")
+    assert.equals("-- dashes ahead", steps[1].stdin)   -- verbatim, no space added
+    assert.same({ "load-buffer", "-b", "hs-voice", "-" }, steps[1].argv)
+  end)
+
+  it("uses the configured buffer name", function()
+    local c2 = cfg({ VOICE_TMUX_BUFFER = "other-buf" })
+    local steps = vt.deliverySteps(c2, vt.resolve(c2, "firstmate"), "hi")
+    assert.equals("other-buf", steps[1].argv[3])
+    assert.equals("other-buf", steps[2].argv[3])
+  end)
+
+  it("falls back to a dedicated buffer name when none is configured", function()
+    local c2 = cfg(); c2.VOICE_TMUX_BUFFER = nil
+    local steps = vt.deliverySteps(c2, vt.resolve(c2, "firstmate"), "hi")
+    assert.equals("hs-voice", steps[1].argv[3])
+  end)
+
+  it("trims the text it stages", function()
+    assert.equals("hello", vt.deliverySteps(c, fm, "  hello  ")[1].stdin)
+  end)
+
+  it("follows a retargeted pane on both targeted steps", function()
+    local c2 = cfg()
+    c2.VOICE_TARGETS.firstmate.target = "fm:2.1"
+    local steps = vt.deliverySteps(c2, vt.resolve(c2, "firstmate"), "hi")
+    assert.same({ "paste-buffer", "-b", "hs-voice", "-p", "-d", "-t", "fm:2.1" }, steps[2].argv)
+    assert.same({ "send-keys", "-t", "fm:2.1", "Enter" }, steps[3].argv)
   end)
 end)
 
-describe("voice_targets argv — shared refusals", function()
-  local orch = vt.resolve(cfg(), "orchestrator")
-  local fm   = vt.resolve(cfg(), "firstmate")
+describe("voice_targets.deliverySteps — shared refusals", function()
+  local c    = cfg()
+  local orch = vt.resolve(c, "orchestrator")
+  local fm   = vt.resolve(c, "firstmate")
 
   it("refuses blank text on both transports so nothing is spawned", function()
-    assert.is_nil(vt.inputArgs(orch, "   "))
-    assert.is_nil(vt.inputArgs(orch, nil))
-    assert.is_nil(vt.inputArgs(fm, ""))
-    assert.is_nil(vt.inputArgs(fm, nil))
+    assert.is_nil(vt.deliverySteps(c, orch, "   "))
+    assert.is_nil(vt.deliverySteps(c, orch, nil))
+    assert.is_nil(vt.deliverySteps(c, fm, ""))
+    assert.is_nil(vt.deliverySteps(c, fm, nil))
   end)
 
   it("refuses a nil or address-less target", function()
-    assert.is_nil(vt.inputArgs(nil, "hello"))
-    assert.is_nil(vt.inputArgs({ label = "x" }, "hello"))
-    assert.is_nil(vt.inputArgs({ transport = "tmux" }, "hello"))
-    assert.is_nil(vt.submitArgs(nil))
-    assert.is_nil(vt.submitArgs({ label = "x" }))
-    assert.is_nil(vt.submitArgs({ transport = "zellij" }))
+    assert.is_nil(vt.deliverySteps(c, nil, "hello"))
+    assert.is_nil(vt.deliverySteps(c, { label = "x" }, "hello"))
+    assert.is_nil(vt.deliverySteps(c, { transport = "tmux" }, "hello"))
+    assert.is_nil(vt.deliverySteps(c, { transport = "zellij" }, "hello"))
   end)
 
   it("refuses a target naming a transport that does not exist", function()
-    assert.is_nil(vt.inputArgs({ transport = "screen", address = "x" }, "hello"))
-    assert.is_nil(vt.submitArgs({ transport = "screen", address = "x" }))
+    assert.is_nil(vt.deliverySteps(c, { transport = "screen", address = "x" }, "hello"))
+  end)
+
+  it("every step has a name and a non-empty argv", function()
+    for _, target in ipairs({ orch, fm }) do
+      for _, s in ipairs(vt.deliverySteps(c, target, "hello")) do
+        assert.is_string(s.name)
+        assert.is_true(#s.argv > 0)
+      end
+    end
   end)
 end)
 
@@ -580,12 +625,12 @@ describe("lib/config voice wiring", function()
     assert.equals("orchestrator", vt.chordRoute(real, "a"))
   end)
 
-  it("keeps the Orchestrator argv exactly as it was before this change", function()
+  it("keeps the Orchestrator delivery exactly as it was before this change", function()
     local orch = vt.resolve(real, "orchestrator")
-    assert.same({ "--session", "Orchestrator", "action", "write-chars", "hello" },
-      vt.inputArgs(orch, "hello"))
-    assert.same({ "--session", "Orchestrator", "action", "write", "13" },
-      vt.submitArgs(orch))
+    assert.same({
+      { "--session", "Orchestrator", "action", "write-chars", "hello" },
+      { "--session", "Orchestrator", "action", "write", "13" },
+    }, argvOf(vt.deliverySteps(real, orch, "hello")))
   end)
 
   it("still drives Orchestrator with the cargo zellij binary", function()
@@ -609,11 +654,17 @@ describe("lib/config voice wiring", function()
     assert.is_true(vt.isExplicitTmuxTarget(real.FIRSTMATE_PRIMARY_TMUX_TARGET))
   end)
 
-  it("delivers to firstmate with the same pair firstmate's own daemon uses", function()
+  it("delivers to firstmate by bracketed paste, staged on stdin", function()
     local fm = vt.resolve(real, "firstmate")
     local t  = real.FIRSTMATE_PRIMARY_TMUX_TARGET
-    assert.same({ "send-keys", "-t", t, "-l", "hello" }, vt.inputArgs(fm, "hello"))
-    assert.same({ "send-keys", "-t", t, "Enter" }, vt.submitArgs(fm))
+    local b  = real.VOICE_TMUX_BUFFER
+    local steps = vt.deliverySteps(real, fm, "hello")
+    assert.same({
+      { "load-buffer", "-b", b, "-" },
+      { "paste-buffer", "-b", b, "-p", "-d", "-t", t },
+      { "send-keys", "-t", t, "Enter" },
+    }, argvOf(steps))
+    assert.equals("hello", steps[1].stdin)
   end)
 
   it("treats the shared firstmate zellij session as crew, never a destination", function()

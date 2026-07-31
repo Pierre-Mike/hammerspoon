@@ -107,22 +107,17 @@ function M.isExplicitTmuxTarget(target)
   return rest:find("%.") == nil                       -- "window" with no stray dot
 end
 
--- `tmux send-keys` has NO `--` option terminator (verified against tmux 3.7b:
--- `send-keys -l "-x…"` fails with "unknown flag -x"), so a transcript starting
--- with a dash would be parsed as flags. A single leading space makes it an
--- unambiguous operand and is invisible in a prompt — better than dropping the
--- take or mangling the words.
-function M.tmuxSafeText(text)
-  local t = M.normalize(text)
-  if not t then return nil end
-  if t:sub(1, 1) == "-" then return " " .. t end
-  return t
-end
-
 -- ── Transport dispatch table ───────────────────────────────────────────────
 -- Each entry owns: which config field carries the address, how to validate it,
--- and how to build the type / submit argv. apps/dictation never branches on
--- transport — it calls M.inputArgs / M.submitArgs / M.binary / M.environment.
+-- and the ordered STEPS that deliver a transcript. Steps rather than a fixed
+-- type/submit pair because the count differs per transport — zellij needs two,
+-- tmux needs three (stage a buffer, paste it, submit). apps/dictation just walks
+-- whatever list it is handed, so neither the step count nor the argv shape is its
+-- business, and a third multiplexer needs no change there.
+--
+-- A step is: { name = <label for logs>, argv = { … }, stdin = <string?> }
+-- `stdin` means the caller must feed that data to the process's standard input;
+-- it is how the tmux transport keeps the transcript out of argv entirely.
 M.TRANSPORTS = {
   zellij = {
     addressField = "session",
@@ -144,27 +139,31 @@ M.TRANSPORTS = {
       end
       return argv
     end,
-    inputArgs = function(self, target, text)
+    steps = function(self, _cfg, target, text)
       local t = M.normalize(text)
       if not t then return nil end
+
       local verb = target.input == "paste" and "paste" or "write-chars"
-      local argv = self.action(target, verb)
+      local typeArgv = self.action(target, verb)
       -- `--` terminates options so a leading-dash transcript stays text.
       -- write-chars keeps its historical bare form: the Orchestrator route's
       -- argv must stay byte-for-byte what it has always been.
-      if verb == "paste" then argv[#argv + 1] = "--" end
-      argv[#argv + 1] = t
-      return argv
-    end,
-    submitArgs = function(self, target)
+      if verb == "paste" then typeArgv[#typeArgv + 1] = "--" end
+      typeArgv[#typeArgv + 1] = t
+
+      local submitArgv
       if target.submit == "enter" then
-        local argv = self.action(target, "send-keys")
-        argv[#argv + 1] = "Enter"
-        return argv
+        submitArgv = self.action(target, "send-keys")
+        submitArgv[#submitArgv + 1] = "Enter"
+      else
+        submitArgv = self.action(target, "write")
+        submitArgv[#submitArgv + 1] = "13"
       end
-      local argv = self.action(target, "write")
-      argv[#argv + 1] = "13"
-      return argv
+
+      return {
+        { name = verb,     argv = typeArgv },
+        { name = "submit", argv = submitArgv },
+      }
     end,
   },
 
@@ -178,17 +177,43 @@ M.TRANSPORTS = {
       end
       return nil
     end,
-    -- `tmux send-keys -t <target> -l <text>` then `send-keys -t <target> Enter`
-    -- — the same literal-then-Enter pair firstmate uses for tmux panes
-    -- (bin/fm-tmux-lib.sh:426,398), so voice-in speaks to the captain exactly
-    -- the way firstmate's own away-mode daemon does.
-    inputArgs = function(_, target, text)
-      local t = M.tmuxSafeText(text)
+    -- Three steps, every flag verified against the installed tmux 3.7b:
+    --   1. `load-buffer -b <buf> -` — the transcript arrives on STDIN, so it
+    --      never appears in argv. That removes the quoting hazard entirely:
+    --      `send-keys` has no `--` option terminator (verified: `send-keys -l
+    --      "-x…"` → "unknown flag -x"), so any argv-carried transcript starting
+    --      with a dash would be read as flags. Nothing to escape if nothing is
+    --      passed as an argument.
+    --   2. `paste-buffer -b <buf> -p -d -t <target>` — `-p` uses bracketed paste
+    --      (popup-safe: the pane sees one paste, not N keystrokes, so a Claude
+    --      Code completion/slash popup can't swallow the Enter), `-d` deletes the
+    --      buffer afterwards so spoken text doesn't linger in tmux's buffer
+    --      stack, and paste-buffer does NOT auto-submit.
+    --   3. `send-keys -t <target> Enter` — the explicit submit.
+    --
+    -- This deliberately diverges from firstmate's own tmux adapter, which uses
+    -- `send-keys -l` (bin/fm-tmux-lib.sh:426): bracketed paste is the safer
+    -- primitive, for the same reason firstmate itself picked `action paste` over
+    -- `write-chars` on the zellij side.
+    --
+    -- On `-p`: tmux only emits the bracketed-paste framing when the program in
+    -- the pane has enabled bracketed paste mode (`\27[?2004h`). A Claude Code TUI
+    -- does; a bare shell does not and receives the text plain. Either way the text
+    -- arrives intact, so `-p` is safe to pass unconditionally.
+    steps = function(_self, cfg, target, text)
+      local t = M.normalize(text)
       if not t then return nil end
-      return { "send-keys", "-t", target.address, "-l", t }
-    end,
-    submitArgs = function(_, target)
-      return { "send-keys", "-t", target.address, "Enter" }
+      local buffer = (type(cfg) == "table" and nonEmptyString(cfg.VOICE_TMUX_BUFFER))
+                     and cfg.VOICE_TMUX_BUFFER or "hs-voice"
+      return {
+        { name  = "load-buffer",
+          argv  = { "load-buffer", "-b", buffer, "-" },
+          stdin = t },
+        { name = "paste-buffer",
+          argv = { "paste-buffer", "-b", buffer, "-p", "-d", "-t", target.address } },
+        { name = "submit",
+          argv = { "send-keys", "-t", target.address, "Enter" } },
+      }
     end,
   },
 }
@@ -392,7 +417,7 @@ function M.chordKeycodeMap(cfg, keycodeMap)
   return map, problems
 end
 
--- ── argv, per transport ────────────────────────────────────────────────────
+-- ── delivery steps, per transport ──────────────────────────────────────────
 
 local function transportOf(target)
   if type(target) ~= "table" then return nil end
@@ -400,22 +425,21 @@ local function transportOf(target)
   return M.TRANSPORTS[target.transport]
 end
 
--- argv that types the transcript WITHOUT submitting it. nil when the target is
--- unresolved or the text is blank — the caller must not spawn a task then.
-function M.inputArgs(target, text)
+-- The ordered commands that deliver `text` to a resolved target. Returns nil
+-- when the target is unresolved or the text is blank — the caller must spawn
+-- nothing in that case.
+--
+-- Each step is { name = <label>, argv = { … }, stdin = <string?> }. Callers run
+-- them IN ORDER and stop on the first non-zero exit: the transcript is typed
+-- exactly once and the newline only follows a confirmed type, so a failed submit
+-- never retypes — a duplicated instruction is worse than an unsubmitted one.
+-- None of these multiplexers has an atomic type-and-submit, hence the sequence.
+function M.deliverySteps(cfg, target, text)
   local transport = transportOf(target)
   if not transport then return nil end
-  return transport:inputArgs(target, text)
-end
-
--- argv that submits the typed text. Kept separate from inputArgs because none of
--- these multiplexers has an atomic type-and-submit: the text is typed once, and
--- the newline follows only after the type is confirmed — never retyped on a
--- failed submit, since a duplicated instruction is worse than an unsubmitted one.
-function M.submitArgs(target)
-  local transport = transportOf(target)
-  if not transport then return nil end
-  return transport:submitArgs(target)
+  local steps = transport:steps(cfg, target, text)
+  if type(steps) ~= "table" or #steps == 0 then return nil end
+  return steps
 end
 
 -- ── display strings ────────────────────────────────────────────────────────

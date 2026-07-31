@@ -39,6 +39,11 @@ local HOME = os.getenv("HOME")
 -- window cannot silently take delivery.
 local FIRSTMATE_PRIMARY_TMUX_TARGET = "firstmate:0.0"
 
+-- Dedicated tmux paste buffer the transcript is staged in. Its own name so a
+-- dictation never clobbers one of the operator's buffers, and `paste-buffer -d`
+-- deletes it on success so spoken text doesn't linger in tmux's buffer stack.
+local VOICE_TMUX_BUFFER = "hs-voice"
+
 -- zellij sessions holding firstmate crewmate tabs — never a voice destination.
 local FIRSTMATE_CREW_SESSIONS = { "firstmate" }
 do
@@ -89,10 +94,13 @@ return {
   --   paneId    — OPTIONAL pane id (e.g. "terminal_3"); when set every action
   --               carries --pane-id so delivery ignores which pane is focused.
   --
-  -- The tmux transport always types with `send-keys -l` and submits with
-  -- `send-keys Enter` — the same pair firstmate itself uses for tmux panes
-  -- (bin/fm-tmux-lib.sh), so voice-in speaks to the captain exactly the way
-  -- firstmate's own away-mode daemon does.
+  -- The tmux transport stages the transcript in VOICE_TMUX_BUFFER over stdin and
+  -- pastes it with `paste-buffer -p` (bracketed paste), then sends Enter — the
+  -- same popup-safety reasoning as zellij's `action paste`: per-character input
+  -- can trip a Claude Code completion/slash-command popup that then swallows the
+  -- Enter. This deliberately diverges from firstmate's own tmux adapter, which
+  -- uses `send-keys -l` (bin/fm-tmux-lib.sh:426); bracketed paste is the safer
+  -- primitive and the transcript never touches argv.
   --
   -- Orchestrator deliberately stays on zellij write-chars + write 13, the exact
   -- pair it has always used, so this addition changes no working live path.
@@ -110,6 +118,7 @@ return {
   VOICE_TARGET_DEFAULT            = "orchestrator",
   FIRSTMATE_PRIMARY_TMUX_TARGET   = FIRSTMATE_PRIMARY_TMUX_TARGET,
   FIRSTMATE_CREW_SESSIONS         = FIRSTMATE_CREW_SESSIONS,
+  VOICE_TMUX_BUFFER               = VOICE_TMUX_BUFFER,
 
   PARAKEET            = HOME .. "/.local/bin/parakeet-mlx",
   PARAKEET_PY         = HOME .. "/.local/share/uv/tools/parakeet-mlx/bin/python",

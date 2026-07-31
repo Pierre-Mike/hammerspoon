@@ -29,24 +29,27 @@ straight into a supervisor's terminal pane and submitted. Every destination live
 in one table, `VOICE_TARGETS` in `lib/config.lua`, and each one names its own
 **transport** — which multiplexer owns the pane:
 
-| Chord | Route | Transport | Address | typed with | submitted with |
-|---|---|---|---|---|---|
-| `Fn+A` | `orchestrator` | zellij | session `Orchestrator` | `action write-chars` | `action write 13` |
-| `Fn+P` | `firstmate` | tmux | `firstmate:0.0` (`FIRSTMATE_PRIMARY_TMUX_TARGET`) | `send-keys -l` | `send-keys Enter` |
+| Chord | Route | Transport | Address | Delivered by |
+|---|---|---|---|---|
+| `Fn+A` | `orchestrator` | zellij | session `Orchestrator` | `action write-chars` → `action write 13` |
+| `Fn+P` | `firstmate` | tmux | `firstmate:0.0` (`FIRSTMATE_PRIMARY_TMUX_TARGET`) | `load-buffer -` → `paste-buffer -p -d` → `send-keys Enter` |
 
 Headset MFB and `apps/volume_tap` use `VOICE_TARGET_DEFAULT`, which is
 `orchestrator`. `Fn+C` is reserved for cancel-and-recall and can't be claimed by
 a target. `lib/voice_targets.lua` (pure, unit tested in
-`tests/spec/voice_targets_spec.lua`) does all resolution and argv construction —
-no module holds a session name or a multiplexer path of its own, and
-`apps/dictation` never branches on transport. Adding a destination is one
-`VOICE_TARGETS` entry; adding a third multiplexer is one entry in
-`voice_targets.TRANSPORTS` plus one in `config.VOICE_TRANSPORTS`.
+`tests/spec/voice_targets_spec.lua`) does all resolution and command
+construction — no module holds a session name or a multiplexer path of its own.
 
-Delivery is always two steps, because neither multiplexer has an atomic
-type-and-submit: the text is typed **once**, unsubmitted, and the newline follows
-only after the type is confirmed — never retyping on a failed submit, since a
-duplicated instruction is worse than an unsubmitted one.
+Each transport returns an ordered **step list**, so the step *count* differs by
+transport (two for zellij, three for tmux) and `apps/dictation` simply runs
+whatever list it is handed, stopping at the first failure. It never branches on
+transport. Adding a destination is one `VOICE_TARGETS` entry; adding a third
+multiplexer is one entry in `voice_targets.TRANSPORTS` plus one in
+`config.VOICE_TRANSPORTS` — and no change in `apps/dictation` either way.
+
+No multiplexer here has an atomic type-and-submit, so the text is typed **once**
+and the newline follows only after the type is confirmed. A failed submit never
+retypes: a duplicated instruction is worse than an unsubmitted one.
 
 ### Why firstmate is reached over tmux, not zellij
 
@@ -58,19 +61,46 @@ than `tmux` or `herdr` (`bin/fm-supervise-daemon.sh`, `docs/configuration.md`
 independently of the runtime backend that spawns crewmates. So voice-in speaks
 tmux to reach the captain and zellij only for the Orchestrator.
 
-The tmux route types with `send-keys -l` and submits with `send-keys Enter` — the
-same pair firstmate itself uses for tmux panes (`bin/fm-tmux-lib.sh`), so voice-in
-talks to the captain exactly the way firstmate's own away-mode daemon does.
-`orchestrator` stays on zellij `write-chars` + `write 13`, byte-for-byte the pair
-it has always used, so this addition changes no working live path.
-
 Launch the captain so that target resolves:
 
 ```sh
-tmux new-session -s firstmate          # captain / primary in window 0, pane 0
+tmux new-session -s firstmate -c ~/Github/firstmate   # primary in window 0, pane 0
 # crewmate tabs stay in the shared "firstmate" ZELLIJ session — a different
 # namespace entirely, which the tmux route cannot reach
 ```
+
+### Why both routes paste rather than type
+
+`zellij action paste` and `tmux paste-buffer -p` both use **bracketed paste
+mode**, and neither auto-submits. That's the point: the pane receives one paste
+rather than N keystrokes, so a Claude Code completion or slash-command popup can't
+open mid-transcript and swallow the Enter that follows. Verified against the
+installed tmux 3.7b — with the pane's program having enabled bracketed paste
+(`DECSET 2004`), the payload arrives wrapped:
+
+```
+033 [ 2 0 0 ~   p o p u p   s a f e   p a y l o a d   033 [ 2 0 1 ~
+```
+
+When the program hasn't enabled it (a bare shell), tmux sends the text plain, so
+`-p` is safe to pass unconditionally.
+
+On tmux the transcript is staged with `load-buffer -b <buf> -`, i.e. **on stdin**,
+so it never appears in argv at all. That matters: `tmux send-keys` has no `--`
+option terminator (verified — `send-keys -l "-x…"` fails with "unknown flag -x"),
+so an argv-carried transcript starting with a dash would be parsed as flags.
+Nothing needs escaping if nothing is passed as an argument. `paste-buffer -d` then
+deletes the buffer so spoken text doesn't linger in tmux's buffer stack.
+
+This deliberately diverges from firstmate's own tmux adapter, which uses
+`send-keys -l` (`bin/fm-tmux-lib.sh:426`) — bracketed paste is the safer
+primitive, for the same reason firstmate itself chose `action paste` over
+`write-chars` on the zellij side.
+
+`orchestrator` deliberately stays on zellij `write-chars` + `write 13`,
+byte-for-byte the pair it has always used, so this addition changes no working
+live path. Switching it to `paste` + `enter` later is a one-word config edit
+(`input` / `submit` on that target).
 
 ### Safety: never deliver into a crewmate pane
 
@@ -92,18 +122,23 @@ guessing a destination:
   primary's pane id isn't known when a chord is pressed and changes across
   restarts, so pane-id can't be the primary defence.
 
-The argv builders also refuse an unresolved target, so no code path can construct
+`deliverySteps` also refuses an unresolved target, so no code path can construct
 a delivery aimed at a crewmate even if `VOICE_TARGETS` is later edited to point
 there. Any config conflict — a duplicate chord, a stolen `Fn+C`, an unknown
-transport, an ambient target — arms **no** chord at all and shows "voice route
-refused".
+transport, an ambient target, a misspelled `input`/`submit` — arms **no** chord at
+all and shows "voice route refused".
 
-One tmux wrinkle worth knowing: `send-keys` has no `--` option terminator
-(verified against tmux 3.7b — `send-keys -l "-x…"` fails with "unknown flag"), so
-a transcript starting with a dash would be read as flags. `voice_targets` prefixes
-a single space in that case, which is invisible in a prompt and preserves every
-word. Because `hs.task` passes argv directly with no shell, quotes, `$VAR`, and
-`;` all arrive literally.
+Because `hs.task` passes argv directly with no shell, quotes, `$VAR`, and `;`
+arrive literally on both transports. Verified end-to-end against a real tmux pane,
+running the exact steps the module builds:
+
+```
+ship the migration branch then open a draft PR
+-- a transcript that starts with dashes
+-t looks like a tmux flag
+quotes 'single' and "double" plus $HOME and a ; semicolon
+unicode déjà vu — em dash and émoji ✅
+```
 
 ## Assets not in git
 

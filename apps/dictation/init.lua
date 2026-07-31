@@ -391,15 +391,20 @@ local function paste(text)
   hs.eventtap.keyStroke({"cmd"}, "v", 0)
 end
 
--- Deliver the transcript straight into a supervisor's zellij pane, then submit.
+-- Deliver the transcript straight into a supervisor's terminal pane, then submit.
 -- Skips the event queue: text appears in the Claude Code prompt and submits.
--- Two steps, because zellij has no atomic type-and-submit action: the target's
--- `input` method types the text unsubmitted, then its `submit` method sends the
--- newline only once the text is confirmed in (never retyping on a failed
--- submit — a duplicated instruction is worse than an unsubmitted one).
--- `routeKey` is a lib/config.VOICE_TARGETS key. An unresolvable route (unknown
--- key, or a session voice_targets refuses because it holds crewmate tabs) sends
--- NOTHING — dropping the take is safer than guessing a destination.
+--
+-- lib/voice_targets hands back an ordered list of steps — two for zellij (type,
+-- submit), three for tmux (stage a paste buffer, paste it, submit) — and this
+-- runs them strictly in sequence, stopping at the first failure. The transcript
+-- is therefore typed exactly once and the newline only follows a confirmed type;
+-- a failed submit never retypes, because a duplicated instruction is worse than
+-- an unsubmitted one. Nothing here knows which transport it is driving, so a new
+-- multiplexer (or a different step count) needs no change in this file.
+--
+-- `routeKey` is a lib/config.VOICE_TARGETS key. An unresolvable route — unknown
+-- key, a zellij session holding crewmate tabs, an ambient tmux target — sends
+-- NOTHING: dropping the take is safer than guessing a destination.
 local function sendToTarget(routeKey, text)
   local target, why = voiceTargets.resolve(configFile, routeKey)
   if not target then
@@ -413,39 +418,42 @@ local function sendToTarget(routeKey, text)
     notify("no " .. target.transport .. " binary configured", 2.8)
     return
   end
-  local env = voiceTargets.environment(configFile, target)
-  local writeArgs = voiceTargets.inputArgs(target, text)
-  if not writeArgs then return end
-  local submitArgs = voiceTargets.submitArgs(target)
+  local env   = voiceTargets.environment(configFile, target)
+  local steps = voiceTargets.deliverySteps(configFile, target, text)
+  if not steps then return end
   local clean = voiceTargets.normalize(text)
 
-  local writeTask = hs.task.new(bin,
-    function(code, _, err)
+  -- Run steps[i…] in order. Each step's completion callback starts the next, so
+  -- the sequence is serialised without blocking Hammerspoon's main loop.
+  local runStep
+  runStep = function(i)
+    local step = steps[i]
+    local task = hs.task.new(bin, function(code, _, err)
       if code ~= 0 then
-        logf("[supervisor] %s type exit=%d err=%s", target.transport, code, tostring(err))
-        notify(target.transport .. " send failed", 2.4)
-        return
+        logf("[supervisor] %s %s exit=%d err=%s",
+             target.transport, step.name, code, tostring(err))
+        notify(target.transport .. " " .. step.name .. " failed", 2.4)
+        return   -- stop the chain; never retry, never retype
       end
-      local enterTask = hs.task.new(bin,
-        function(c2, _, e2)
-          if c2 ~= 0 then
-            logf("[supervisor] %s submit exit=%d err=%s", target.transport, c2, tostring(e2))
-            return
-          end
-          -- Transcript is now committed in the supervisor's prompt: fire the
-          -- "delivered" cue so a headset-only operator hears the handoff.
-          playEarcon("sent")
-        end,
-        submitArgs)
-      if env then enterTask:setEnvironment(env) end
-      enterTask:start()
-    end,
-    writeArgs)
-  if env then writeTask:setEnvironment(env) end
-  writeTask:start()
+      if i < #steps then
+        runStep(i + 1)
+      else
+        -- Transcript is now committed in the supervisor's prompt: fire the
+        -- "delivered" cue so a headset-only operator hears the handoff.
+        playEarcon("sent")
+      end
+    end, step.argv)
+    if env then task:setEnvironment(env) end
+    -- Steps carrying `stdin` keep the transcript out of argv entirely. For a
+    -- non-streaming task hs.task closes stdin once this data is written, so the
+    -- child sees EOF and does not hang.
+    if step.stdin then task:setInput(step.stdin) end
+    task:start()
+  end
+  runStep(1)
 
-  logf("[supervisor] voice → %s (%s %s) len=%d preview=%q",
-       target.label, target.transport, target.address, #clean, clean:sub(1, 60))
+  logf("[supervisor] voice → %s (%s %s, %d steps) len=%d preview=%q",
+       target.label, target.transport, target.address, #steps, #clean, clean:sub(1, 60))
   notify(voiceTargets.notifyText(target, clean, 60), 1.8)
 end
 
