@@ -391,8 +391,12 @@ local function paste(text)
   hs.eventtap.keyStroke({"cmd"}, "v", 0)
 end
 
--- Write the transcript straight into a supervisor's zellij pane, then Enter.
+-- Deliver the transcript straight into a supervisor's zellij pane, then submit.
 -- Skips the event queue: text appears in the Claude Code prompt and submits.
+-- Two steps, because zellij has no atomic type-and-submit action: the target's
+-- `input` method types the text unsubmitted, then its `submit` method sends the
+-- newline only once the text is confirmed in (never retyping on a failed
+-- submit — a duplicated instruction is worse than an unsubmitted one).
 -- `routeKey` is a lib/config.VOICE_TARGETS key. An unresolvable route (unknown
 -- key, or a session voice_targets refuses because it holds crewmate tabs) sends
 -- NOTHING — dropping the take is safer than guessing a destination.
@@ -403,7 +407,7 @@ local function sendToTarget(routeKey, text)
     notify("voice route refused: " .. tostring(why), 2.8)
     return
   end
-  local writeArgs = voiceTargets.writeCharsArgs(target, text)
+  local writeArgs = voiceTargets.inputArgs(target, text)
   if not writeArgs then return end
   local submitArgs = voiceTargets.submitArgs(target)
   local clean = voiceTargets.normalize(text)
@@ -411,14 +415,14 @@ local function sendToTarget(routeKey, text)
   local writeTask = hs.task.new(ZELLIJ,
     function(code, _, err)
       if code ~= 0 then
-        logf("[supervisor] zellij write-chars exit=%d err=%s", code, tostring(err))
-        notify("zellij write-chars failed", 2.4)
+        logf("[supervisor] zellij %s exit=%d err=%s", target.input, code, tostring(err))
+        notify("zellij " .. target.input .. " failed", 2.4)
         return
       end
       local enterTask = hs.task.new(ZELLIJ,
         function(c2, _, e2)
           if c2 ~= 0 then
-            logf("[supervisor] zellij write 13 exit=%d err=%s", c2, tostring(e2))
+            logf("[supervisor] zellij submit(%s) exit=%d err=%s", target.submit, c2, tostring(e2))
             return
           end
           -- Transcript is now committed in the supervisor's prompt: fire the
@@ -433,8 +437,9 @@ local function sendToTarget(routeKey, text)
   writeTask:setEnvironment(ZELLIJ_ENV)
   writeTask:start()
 
-  logf("[supervisor] voice → %s (%s) len=%d preview=%q",
-       target.label, target.session, #clean, clean:sub(1, 60))
+  logf("[supervisor] voice → %s (%s pane=%s %s+%s) len=%d preview=%q",
+       target.label, target.session, target.paneId or "focused",
+       target.input, target.submit, #clean, clean:sub(1, 60))
   notify(voiceTargets.notifyText(target, clean, 60), 1.8)
 end
 

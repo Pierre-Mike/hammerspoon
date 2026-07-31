@@ -8,18 +8,25 @@
 --
 -- ── SAFETY: never write into a crewmate pane ────────────────────────────────
 -- firstmate runs one zellij TAB PER CREWMATE TASK inside one shared session
--- (default "firstmate", overridable with FM_ZELLIJ_SESSION). `zellij --session
--- <name> action write-chars` targets whichever pane is FOCUSED in that session,
--- with no way to name a pane — so routing to the shared session would deliver
--- the captain's dictation into whatever worker tab happened to be focused.
+-- (default "firstmate", overridable with FM_ZELLIJ_SESSION). Without an explicit
+-- --pane-id, `zellij --session <name> action …` targets whichever pane is
+-- FOCUSED there — so routing to the shared session would deliver the captain's
+-- dictation into whatever worker tab happened to be focused.
 --
--- The assumption this module enforces: the firstmate PRIMARY runs in its own
--- dedicated session (config.FIRSTMATE_PRIMARY_SESSION, default
--- "firstmate-primary") holding nothing but the primary, and the shared session
--- is crewmates-only. resolve() REFUSES any target whose session appears in
--- config.FIRSTMATE_CREW_SESSIONS, and the argv builders refuse an unresolved
--- target — so no code path can construct a write-chars aimed at the crew
--- session, even if VOICE_TARGETS is later edited to point at it.
+-- zellij 0.44 does let you name a pane (`--pane-id terminal_3`, supported on
+-- write-chars / paste / write / send-keys — verified against 0.44.3), and a
+-- target may set `paneId` to use it. But the primary's pane id isn't known when
+-- a chord is pressed and changes across restarts, so pane-id can't be the
+-- primary defence.
+--
+-- The assumption this module enforces instead: the firstmate PRIMARY runs in its
+-- own dedicated session (config.FIRSTMATE_PRIMARY_SESSION, default
+-- "firstmate-primary") holding nothing but the primary, so the focused pane is
+-- always the right pane; the shared session is crewmates-only. resolve()
+-- REFUSES any target whose session appears in config.FIRSTMATE_CREW_SESSIONS,
+-- and the argv builders refuse an unresolved target — so no code path can
+-- construct a delivery aimed at the crew session, even if VOICE_TARGETS is later
+-- edited to point at it.
 --
 -- Comparison is case-insensitive on purpose: zellij session names are
 -- case-sensitive, so "Firstmate" is a *different* session than "firstmate" and
@@ -50,11 +57,20 @@ function M.isCrewSession(cfg, session)
   return false
 end
 
+-- How a target types text and submits it. Unknown/absent values fall back to
+-- the pair apps/dictation has always used, so an older VOICE_TARGETS entry that
+-- names neither keeps working unchanged.
+M.INPUT_METHODS  = { ["write-chars"] = true, paste = true }
+M.SUBMIT_METHODS = { write13 = true, enter = true }
+M.INPUT_DEFAULT  = "write-chars"
+M.SUBMIT_DEFAULT = "write13"
+
 -- Resolve a route key ("orchestrator", "firstmate", …) to a target.
 --
 -- Returns, on success:
 --   { key = <route>, session = <zellij session>, label = <human name>,
---     chord = <letter or nil> }, nil
+--     chord = <letter or nil>, input = <method>, submit = <method>,
+--     paneId = <string or nil> }, nil
 -- Returns nil plus a short reason otherwise. Callers must treat nil as "do not
 -- send anything" — there is no fallback destination, because guessing which
 -- supervisor should receive speech is worse than dropping it.
@@ -70,15 +86,20 @@ function M.resolve(cfg, key)
     return nil, "route " .. key .. " has no session"
   end
   if M.isCrewSession(cfg, session) then
-    -- Hard stop: this session holds crewmate tabs, so write-chars could land in
-    -- a worker's prompt. See the safety note at the top of this file.
+    -- Hard stop: this session holds crewmate tabs, so delivery could land in a
+    -- worker's prompt. See the safety note at the top of this file.
     return nil, "route " .. key .. " points at crewmate session " .. session
   end
+  local input  = M.INPUT_METHODS[t.input]   and t.input  or M.INPUT_DEFAULT
+  local submit = M.SUBMIT_METHODS[t.submit] and t.submit or M.SUBMIT_DEFAULT
   return {
     key     = key,
     session = session,
     label   = (type(t.label) == "string" and t.label ~= "") and t.label or key,
     chord   = type(t.chord) == "string" and t.chord or nil,
+    input   = input,
+    submit  = submit,
+    paneId  = (type(t.paneId) == "string" and t.paneId ~= "") and t.paneId or nil,
   }, nil
 end
 
@@ -150,9 +171,10 @@ function M.routeKeys(cfg)
 end
 
 -- Config audit: returns a list of human-readable problems (empty when clean).
--- Catches the mistakes that would silently misroute speech: two targets sharing
--- a chord, a target stealing a reserved chord, a missing session, and a target
--- aimed at a crewmate session.
+-- Catches the mistakes that would silently misroute or mis-deliver speech: two
+-- targets sharing a chord, a target stealing a reserved chord, a missing
+-- session, a target aimed at a crewmate session, and a misspelled input/submit
+-- method (which resolve() would otherwise quietly replace with the default).
 function M.conflicts(cfg)
   local problems = {}
   local targets = (type(cfg) == "table" and cfg.VOICE_TARGETS) or nil
@@ -179,6 +201,15 @@ function M.conflicts(cfg)
         seenChord[chord] = key
       end
     end
+    if t.input ~= nil and not M.INPUT_METHODS[t.input] then
+      problems[#problems + 1] = key .. ": unknown input method '" .. tostring(t.input) .. "'"
+    end
+    if t.submit ~= nil and not M.SUBMIT_METHODS[t.submit] then
+      problems[#problems + 1] = key .. ": unknown submit method '" .. tostring(t.submit) .. "'"
+    end
+    if t.paneId ~= nil and (type(t.paneId) ~= "string" or t.paneId == "") then
+      problems[#problems + 1] = key .. ": paneId must be a non-empty string"
+    end
   end
   return problems
 end
@@ -191,24 +222,60 @@ function M.normalize(text)
   return t
 end
 
--- argv for `zellij --session <s> action write-chars <text>`.
--- nil when the target is unresolved or the text is blank — the caller must not
--- spawn a task in that case.
-function M.writeCharsArgs(target, text)
-  if type(target) ~= "table" or type(target.session) ~= "string" or target.session == "" then
-    return nil
-  end
-  local t = M.normalize(text)
-  if not t then return nil end
-  return { "--session", target.session, "action", "write-chars", t }
+local function sessionOf(target)
+  if type(target) ~= "table" then return nil end
+  local s = target.session
+  if type(s) ~= "string" or s == "" then return nil end
+  return s
 end
 
--- argv for the Enter keypress that submits the prompt (byte 13).
-function M.submitArgs(target)
-  if type(target) ~= "table" or type(target.session) ~= "string" or target.session == "" then
-    return nil
+-- `zellij --session <s> action <verb>` plus `--pane-id <id>` when the target
+-- pins one. Pane-id goes before the trailing operands because zellij's clap
+-- parser takes it as an option on the action subcommand.
+local function actionArgs(target, verb)
+  local session = sessionOf(target)
+  if not session then return nil end
+  local argv = { "--session", session, "action", verb }
+  if target.paneId then
+    argv[#argv + 1] = "--pane-id"
+    argv[#argv + 1] = target.paneId
   end
-  return { "--session", target.session, "action", "write", "13" }
+  return argv
+end
+
+-- argv that types the transcript WITHOUT submitting it, per target.input:
+--   "paste"       → `action paste -- <text>`   (bracketed paste; popup-safe)
+--   "write-chars" → `action write-chars <text>` (per-character)
+-- `--` terminates options for paste so a transcript starting with "-" is not
+-- parsed as a flag. write-chars keeps its historical bare form so the
+-- Orchestrator route's argv is byte-for-byte what it has always been.
+-- nil when the target is unresolved or the text is blank — the caller must not
+-- spawn a task in that case.
+function M.inputArgs(target, text)
+  local t = M.normalize(text)
+  if not t then return nil end
+  local verb = (target and target.input == "paste") and "paste" or "write-chars"
+  local argv = actionArgs(target, verb)
+  if not argv then return nil end
+  if verb == "paste" then argv[#argv + 1] = "--" end
+  argv[#argv + 1] = t
+  return argv
+end
+
+-- argv that submits the typed text, per target.submit:
+--   "enter"   → `action send-keys Enter`  (zellij's named key)
+--   "write13" → `action write 13`         (raw CR byte)
+function M.submitArgs(target)
+  if target and target.submit == "enter" then
+    local argv = actionArgs(target, "send-keys")
+    if not argv then return nil end
+    argv[#argv + 1] = "Enter"
+    return argv
+  end
+  local argv = actionArgs(target, "write")
+  if not argv then return nil end
+  argv[#argv + 1] = "13"
+  return argv
 end
 
 -- "→ Orchestrator (voice): first sixty chars…" for the on-screen notify.

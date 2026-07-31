@@ -24,14 +24,14 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 
 ## Voice routing targets
 
-A dictated transcript either pastes at the cursor (plain **Fn**) or is written
-straight into a supervisor's zellij pane and submitted (`write-chars` + Enter).
-Every destination lives in one table, `VOICE_TARGETS` in `lib/config.lua`:
+A dictated transcript either pastes at the cursor (plain **Fn**) or is delivered
+straight into a supervisor's zellij pane and submitted. Every destination lives
+in one table, `VOICE_TARGETS` in `lib/config.lua`:
 
-| Chord | Route | zellij session |
-|---|---|---|
-| `Fn+A` | `orchestrator` | `Orchestrator` |
-| `Fn+P` | `firstmate` | `firstmate-primary` (`FIRSTMATE_PRIMARY_SESSION`) |
+| Chord | Route | zellij session | typed with | submitted with |
+|---|---|---|---|---|
+| `Fn+A` | `orchestrator` | `Orchestrator` | `action write-chars` | `action write 13` |
+| `Fn+P` | `firstmate` | `firstmate-primary` (`FIRSTMATE_PRIMARY_SESSION`) | `action paste` | `action send-keys Enter` |
 
 Headset MFB and `apps/volume_tap` use `VOICE_TARGET_DEFAULT`, which is
 `orchestrator`. `Fn+C` is reserved for cancel-and-recall and can't be claimed by
@@ -39,31 +39,57 @@ a target. Adding or retargeting a destination is a `lib/config.lua` edit — no
 module holds a session name of its own, and `lib/voice_targets.lua` (pure, unit
 tested in `tests/spec/voice_targets_spec.lua`) does all the resolution.
 
+Delivery is always two steps, because zellij has no atomic type-and-submit
+action: the text is typed **once**, unsubmitted, and the newline follows only
+after the type is confirmed — never retyping on a failed submit, since a
+duplicated instruction is worse than an unsubmitted one.
+
+### Why the two routes use different zellij primitives
+
+`action paste` uses **bracketed paste mode** and does not auto-submit, which is
+popup-safe: per-character `write-chars` can trip a Claude Code completion or
+slash-command popup that then swallows the Enter. This was verified empirically
+against real zellij 0.44 by firstmate (`bin/backends/zellij.sh`), which uses
+`paste` + `send-keys Enter` for exactly this reason.
+
+The new `firstmate` route takes that better pair. `orchestrator` deliberately
+stays on `write-chars` + `write 13` — the exact pair it has always used — so
+adding a second destination doesn't change a working live path. Each target
+names its own `input` / `submit` method, so switching Orchestrator over later is
+a one-word config edit.
+
 ### Why firstmate gets its own session
 
 **firstmate runs one zellij tab per crewmate task inside a single shared
 session** (default name `firstmate`, overridable with `FM_ZELLIJ_SESSION`).
-`zellij --session <name> action write-chars` delivers to whichever pane is
-*focused* in that session, with no way to name a pane — so aiming voice at the
-shared session would drop the captain's dictation into whatever worker tab
-happened to be focused.
+Without an explicit `--pane-id`, `zellij --session <name> action …` delivers to
+whichever pane is *focused* — so aiming voice at the shared session would drop
+the captain's dictation into whatever worker tab happened to be focused.
 
 So the `firstmate` route targets a **dedicated session holding only the
-primary**. This is an assumption the config makes about how you launch things:
+primary**, where the focused pane is always the right pane. This is an assumption
+the config makes about how you launch things:
 
 ```sh
 zellij --session firstmate-primary        # captain / primary lives here, alone
 # crewmate tabs stay in the shared "firstmate" session, which voice never touches
 ```
 
+zellij 0.44 *can* name a pane (`--pane-id terminal_3`, supported on
+`write-chars` / `paste` / `write` / `send-keys` — checked against 0.44.3), and a
+target may set `paneId` to pin one. It isn't the default because the primary's
+pane id isn't known when a chord is pressed and changes across restarts, so it
+can't be the primary defence — but it's there if you ever run the primary inside
+a session that holds other panes.
+
 The shared session names are listed in `FIRSTMATE_CREW_SESSIONS` (the default
 `firstmate`, plus `FM_ZELLIJ_SESSION` when it is set in Hammerspoon's
 environment). `lib/voice_targets.lua` refuses to resolve any route pointing at
 one of them — case-insensitively — and the argv builders refuse an unresolved
-target, so no code path can construct a `write-chars` aimed at a crewmate pane
-even if `VOICE_TARGETS` is later edited to point there. A route that fails this
-check arms **no** chord at all and shows "voice route refused" instead of
-guessing a destination.
+target, so no code path can construct a delivery aimed at a crewmate pane even
+if `VOICE_TARGETS` is later edited to point there. A route that fails this check,
+or any other config conflict, arms **no** chord at all and shows "voice route
+refused" instead of guessing a destination.
 
 ## Assets not in git
 

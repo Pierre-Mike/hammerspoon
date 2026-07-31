@@ -11,15 +11,18 @@ local HOME = os.getenv("HOME")
 -- SAFETY — why firstmate gets its own session:
 --   firstmate runs one zellij TAB PER CREWMATE TASK inside a single shared
 --   session (default name "firstmate", overridable with FM_ZELLIJ_SESSION).
---   `zellij --session <name> action write-chars` delivers to whichever pane is
---   FOCUSED in that session, not to a pane we name. So if we ever targeted the
---   shared session, a dictated sentence would land in whatever crewmate tab
---   happened to be focused — feeding speech meant for the captain straight into
---   a worker's prompt.
+--   Without an explicit --pane-id, `zellij --session <name> action …` delivers
+--   to whichever pane is FOCUSED. So if we targeted the shared session, a
+--   dictated sentence would land in whatever crewmate tab happened to be
+--   focused — feeding speech meant for the captain into a worker's prompt.
+--   zellij 0.44 CAN name a pane (`--pane-id terminal_3`, see paneId below), but
+--   the primary's pane id is not known at dictation time and changes across
+--   restarts, so it can't be the primary defence.
 --   The assumption baked in here: the firstmate PRIMARY (captain) runs in its
 --   own dedicated session, FIRSTMATE_PRIMARY_SESSION, whose only pane is the
---   primary. The shared session is treated as crewmates-only and is listed in
---   FIRSTMATE_CREW_SESSIONS, which lib/voice_targets.lua refuses to route to.
+--   primary — so "the focused pane" is always the right pane. The shared
+--   session is crewmates-only, listed in FIRSTMATE_CREW_SESSIONS, which
+--   lib/voice_targets.lua refuses to route to at all.
 local FIRSTMATE_PRIMARY_SESSION = "firstmate-primary"
 local FIRSTMATE_CREW_SESSIONS   = { "firstmate" }   -- never a voice destination
 do
@@ -43,14 +46,32 @@ return {
 
   -- Routable supervisors, keyed by route name. Resolve these through
   -- lib/voice_targets.lua — it enforces the crewmate-session guard above.
-  --   session — zellij session `write-chars` is aimed at
+  --   session — zellij session the transcript is delivered into
   --   label   — human name used in HUD/notify text and the ready banner
   --   chord   — letter that, held with Fn, arms this route for the current take
+  --   input   — how the text is typed: "paste" (bracketed paste, `action paste`)
+  --             or "write-chars" (per-character, `action write-chars`)
+  --   submit  — how it is submitted: "enter" (`action send-keys Enter`) or
+  --             "write13" (`action write 13`)
+  --   paneId  — OPTIONAL zellij pane id (e.g. "terminal_3"). When set, every
+  --             action carries `--pane-id`, so delivery no longer depends on
+  --             which pane is focused. Leave nil unless the pane id is stable.
+  --
+  -- Why the two routes differ: firstmate verified empirically (real zellij
+  -- 0.44.0, bin/backends/zellij.sh) that `action paste` does not auto-submit and
+  -- uses bracketed paste mode, which is popup-safe — per-character write-chars
+  -- can trip a Claude Code completion/slash-command popup that then swallows the
+  -- Enter. The new firstmate route takes that better primitive. Orchestrator
+  -- deliberately stays on write-chars + write 13, the exact pair it has used all
+  -- along, so a working live path isn't changed by this addition.
+  --
   -- "c" is reserved by apps/dictation for cancel-and-recall; voice_targets
   -- .conflicts() fails the config if a target ever claims it.
   VOICE_TARGETS = {
-    orchestrator = { session = "Orchestrator",              label = "Orchestrator", chord = "a" },
-    firstmate    = { session = FIRSTMATE_PRIMARY_SESSION,   label = "firstmate",    chord = "p" },
+    orchestrator = { session = "Orchestrator",            label = "Orchestrator",
+                     chord = "a", input = "write-chars",  submit = "write13" },
+    firstmate    = { session = FIRSTMATE_PRIMARY_SESSION, label = "firstmate",
+                     chord = "p", input = "paste",        submit = "enter" },
   },
   -- Route used when something asks for "the supervisor" without naming one
   -- (headset MFB, apps/volume_tap, dictate.startSupervisorVoice()).
