@@ -1,17 +1,24 @@
--- Pure routing logic for lib/voice_targets: target resolution, which chord
--- picks which supervisor, the zellij argv, and the crewmate-session refusal.
+-- Pure routing logic for lib/voice_targets: target resolution across both
+-- transports, which chord picks which supervisor, the per-transport argv, and
+-- the refusals that keep dictation out of a crewmate pane.
 -- No hs.* here — the module deliberately has no Hammerspoon dependency.
 
 local vt = require("lib.voice_targets")
 
--- Minimal config shaped like lib/config.lua's voice keys.
+-- Minimal config shaped like lib/config.lua's voice keys: the Orchestrator on
+-- zellij, the firstmate primary on tmux.
 local function cfg(overrides)
   local c = {
     VOICE_TARGETS = {
-      orchestrator = { session = "Orchestrator",      label = "Orchestrator", chord = "a",
-                       input = "write-chars",         submit = "write13" },
-      firstmate    = { session = "firstmate-primary", label = "firstmate",    chord = "p",
-                       input = "paste",               submit = "enter" },
+      orchestrator = { transport = "zellij", session = "Orchestrator",
+                       label = "Orchestrator", chord = "a",
+                       input = "write-chars", submit = "write13" },
+      firstmate    = { transport = "tmux", target = "firstmate:0.0",
+                       label = "firstmate", chord = "p" },
+    },
+    VOICE_TRANSPORTS = {
+      zellij = { bin = "/cargo/bin/zellij", env = { HOME = "/home", PATH = "/zbin" } },
+      tmux   = { bin = "/opt/homebrew/bin/tmux", env = { HOME = "/home", PATH = "/tbin" } },
     },
     VOICE_TARGET_DEFAULT    = "orchestrator",
     FIRSTMATE_CREW_SESSIONS = { "firstmate" },
@@ -21,24 +28,53 @@ local function cfg(overrides)
 end
 
 describe("voice_targets.resolve", function()
-  it("resolves the orchestrator route to its zellij session", function()
+  it("resolves the orchestrator route onto the zellij transport", function()
     local t = vt.resolve(cfg(), "orchestrator")
-    assert.equals("Orchestrator", t.session)
-    assert.equals("Orchestrator", t.label)
     assert.equals("orchestrator", t.key)
+    assert.equals("zellij", t.transport)
+    assert.equals("Orchestrator", t.address)
+    assert.equals("Orchestrator", t.session)
+    assert.is_nil(t.target)
+    assert.equals("Orchestrator", t.label)
     assert.equals("a", t.chord)
     assert.equals("write-chars", t.input)
     assert.equals("write13", t.submit)
     assert.is_nil(t.paneId)
   end)
 
-  it("resolves the firstmate route to the dedicated primary session", function()
+  it("resolves the firstmate route onto the tmux transport", function()
     local t = vt.resolve(cfg(), "firstmate")
-    assert.equals("firstmate-primary", t.session)
+    assert.equals("tmux", t.transport)
+    assert.equals("firstmate:0.0", t.address)
+    assert.equals("firstmate:0.0", t.target)
+    assert.is_nil(t.session)
     assert.equals("firstmate", t.label)
     assert.equals("p", t.chord)
-    assert.equals("paste", t.input)
-    assert.equals("enter", t.submit)
+  end)
+
+  it("defaults a target that names no transport to zellij", function()
+    local c = cfg()
+    c.VOICE_TARGETS.legacy = { session = "Legacy" }
+    local t = vt.resolve(c, "legacy")
+    assert.equals("zellij", t.transport)
+    assert.equals("Legacy", t.address)
+  end)
+
+  it("refuses an unknown transport", function()
+    local c = cfg()
+    c.VOICE_TARGETS.weird = { transport = "screen", session = "x" }
+    local t, why = vt.resolve(c, "weird")
+    assert.is_nil(t)
+    assert.truthy(why:find("unknown transport"))
+  end)
+
+  it("reads the address from the field its transport owns", function()
+    local c = cfg()
+    -- a tmux entry carrying only `session` has no address at all
+    c.VOICE_TARGETS.firstmate = { transport = "tmux", session = "firstmate:0.0" }
+    local t, why = vt.resolve(c, "firstmate")
+    assert.is_nil(t)
+    assert.truthy(why:find("no target"))
   end)
 
   it("falls back to the route key when no label is given", function()
@@ -47,7 +83,7 @@ describe("voice_targets.resolve", function()
     assert.equals("bare", vt.resolve(c, "bare").label)
   end)
 
-  it("defaults a target that names no input/submit to the historical pair", function()
+  it("defaults a zellij target naming no input/submit to the historical pair", function()
     local c = cfg()
     c.VOICE_TARGETS.bare = { session = "Bare" }
     local t = vt.resolve(c, "bare")
@@ -55,16 +91,16 @@ describe("voice_targets.resolve", function()
     assert.equals("write13", t.submit)
   end)
 
-  it("carries an explicit paneId through", function()
+  it("carries an explicit zellij paneId through", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.paneId = "terminal_3"
-    assert.equals("terminal_3", vt.resolve(c, "firstmate").paneId)
+    c.VOICE_TARGETS.orchestrator.paneId = "terminal_3"
+    assert.equals("terminal_3", vt.resolve(c, "orchestrator").paneId)
   end)
 
   it("treats a blank paneId as unset", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.paneId = ""
-    assert.is_nil(vt.resolve(c, "firstmate").paneId)
+    c.VOICE_TARGETS.orchestrator.paneId = ""
+    assert.is_nil(vt.resolve(c, "orchestrator").paneId)
   end)
 
   it("refuses an unknown route", function()
@@ -78,47 +114,89 @@ describe("voice_targets.resolve", function()
     assert.is_nil(vt.resolve(cfg(), ""))
   end)
 
-  it("refuses a target with no session", function()
-    local c = cfg()
-    c.VOICE_TARGETS.broken = { label = "Broken" }
-    local t, why = vt.resolve(c, "broken")
-    assert.is_nil(t)
-    assert.truthy(why:find("no session"))
-  end)
-
   it("refuses a config with no VOICE_TARGETS table", function()
     assert.is_nil(vt.resolve({}, "orchestrator"))
     assert.is_nil(vt.resolve(nil, "orchestrator"))
   end)
 end)
 
-describe("voice_targets crewmate-session guard", function()
-  -- The safety property: dictation must never be deliverable into firstmate's
-  -- shared session, because write-chars lands in whatever crewmate tab is
-  -- focused there.
-  it("refuses a route aimed at the shared firstmate session", function()
+describe("voice_targets tmux target guard", function()
+  -- The safety property on the tmux side: the target must be explicit, never
+  -- ambient, so delivery can't follow "whatever window is current".
+  it("accepts session:window and session:window.pane", function()
+    assert.is_true(vt.isExplicitTmuxTarget("firstmate:0"))
+    assert.is_true(vt.isExplicitTmuxTarget("firstmate:0.0"))
+    assert.is_true(vt.isExplicitTmuxTarget("fm-primary:captain"))
+  end)
+
+  it("refuses a bare session — that would be the session's CURRENT window", function()
+    assert.is_false(vt.isExplicitTmuxTarget("firstmate"))
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.session = "firstmate"
+    c.VOICE_TARGETS.firstmate.target = "firstmate"
     local t, why = vt.resolve(c, "firstmate")
+    assert.is_nil(t)
+    assert.truthy(why:find("not an explicit session:window"))
+  end)
+
+  it("refuses empty, whitespace-bearing, and flag-like targets", function()
+    assert.is_false(vt.isExplicitTmuxTarget(""))
+    assert.is_false(vt.isExplicitTmuxTarget(nil))
+    assert.is_false(vt.isExplicitTmuxTarget("firstmate:0 extra"))
+    assert.is_false(vt.isExplicitTmuxTarget("-t:0"))
+  end)
+
+  it("refuses malformed colon/dot shapes", function()
+    assert.is_false(vt.isExplicitTmuxTarget("firstmate:"))
+    assert.is_false(vt.isExplicitTmuxTarget(":0"))
+    assert.is_false(vt.isExplicitTmuxTarget("a:b:c"))
+    assert.is_false(vt.isExplicitTmuxTarget("firstmate:0."))
+    assert.is_false(vt.isExplicitTmuxTarget("firstmate:.0"))
+  end)
+
+  it("builds no argv for a refused tmux target", function()
+    local c = cfg()
+    c.VOICE_TARGETS.firstmate.target = "firstmate"
+    local t = vt.resolve(c, "firstmate")   -- nil
+    assert.is_nil(vt.inputArgs(t, "hello"))
+    assert.is_nil(vt.submitArgs(t))
+  end)
+
+  it("arms no chord at all when a target is ambient", function()
+    local c = cfg()
+    c.VOICE_TARGETS.firstmate.target = "firstmate"
+    assert.same({}, vt.chordKeycodeMap(c, { a = 0, c = 8, p = 35 }))
+  end)
+end)
+
+describe("voice_targets crewmate-session guard (zellij)", function()
+  -- firstmate's crewmates are zellij tabs in one shared session, and write-chars
+  -- without --pane-id lands in whichever pane is focused there.
+  it("refuses a zellij route aimed at the shared firstmate session", function()
+    local c = cfg()
+    c.VOICE_TARGETS.orchestrator.session = "firstmate"
+    local t, why = vt.resolve(c, "orchestrator")
     assert.is_nil(t)
     assert.truthy(why:find("crewmate session"))
   end)
 
   it("refuses case variants of the crew session", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.session = "FirstMate"
-    assert.is_nil(vt.resolve(c, "firstmate"))
+    c.VOICE_TARGETS.orchestrator.session = "FirstMate"
+    assert.is_nil(vt.resolve(c, "orchestrator"))
   end)
 
   it("refuses an FM_ZELLIJ_SESSION-style override listed as crew", function()
     local c = cfg({ FIRSTMATE_CREW_SESSIONS = { "firstmate", "fm-test-abc" } })
-    c.VOICE_TARGETS.firstmate.session = "fm-test-abc"
-    assert.is_nil(vt.resolve(c, "firstmate"))
+    c.VOICE_TARGETS.orchestrator.session = "fm-test-abc"
+    assert.is_nil(vt.resolve(c, "orchestrator"))
   end)
 
-  it("still allows the dedicated primary session", function()
-    assert.is_false(vt.isCrewSession(cfg(), "firstmate-primary"))
-    assert.truthy(vt.resolve(cfg(), "firstmate"))
+  it("does not apply the zellij crew guard to a tmux target", function()
+    -- "firstmate" is a crew ZELLIJ session; a tmux session of the same name is a
+    -- different namespace entirely, and crewmates are never tmux panes.
+    local c = cfg()
+    c.VOICE_TARGETS.firstmate.target = "firstmate:0.0"
+    assert.truthy(vt.resolve(c, "firstmate"))
   end)
 
   it("isCrewSession is false for nil and unknown sessions", function()
@@ -127,41 +205,52 @@ describe("voice_targets crewmate-session guard", function()
     assert.is_false(vt.isCrewSession({}, "firstmate"))
   end)
 
-  it("builds no argv for a refused route", function()
+  it("builds no argv for a refused zellij route", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.session = "firstmate"
-    local t = vt.resolve(c, "firstmate")   -- nil
+    c.VOICE_TARGETS.orchestrator.session = "firstmate"
+    local t = vt.resolve(c, "orchestrator")   -- nil
     assert.is_nil(vt.inputArgs(t, "hello"))
     assert.is_nil(vt.submitArgs(t))
-  end)
-
-  it("cannot be tricked into an argv naming the crew session", function()
-    -- Even handed a raw table that never went through resolve(), the builders
-    -- only ever emit the session they are given — the refusal is what keeps a
-    -- crew session from ever reaching them, so assert resolve() is the only
-    -- source of targets by checking it yields nothing to pass on.
-    local c = cfg()
-    c.VOICE_TARGETS.firstmate.session = "firstmate"
-    local t, why = vt.resolve(c, "firstmate")
-    assert.is_nil(t)
-    assert.truthy(why)
-    assert.same({}, vt.chordKeycodeMap(c, { a = 0, c = 8, p = 35 }))
   end)
 end)
 
 describe("voice_targets.resolveDefault", function()
   it("uses VOICE_TARGET_DEFAULT", function()
-    assert.equals("Orchestrator", vt.resolveDefault(cfg()).session)
+    assert.equals("Orchestrator", vt.resolveDefault(cfg()).address)
   end)
 
   it("honours a changed default", function()
-    assert.equals("firstmate-primary",
-      vt.resolveDefault(cfg({ VOICE_TARGET_DEFAULT = "firstmate" })).session)
+    assert.equals("firstmate:0.0",
+      vt.resolveDefault(cfg({ VOICE_TARGET_DEFAULT = "firstmate" })).address)
   end)
 
   it("falls back to orchestrator when the key is absent", function()
     local c = cfg(); c.VOICE_TARGET_DEFAULT = nil
-    assert.equals("Orchestrator", vt.resolveDefault(c).session)
+    assert.equals("Orchestrator", vt.resolveDefault(c).address)
+  end)
+end)
+
+describe("voice_targets.binary / .environment", function()
+  it("picks the CLI for the target's transport", function()
+    assert.equals("/cargo/bin/zellij", vt.binary(cfg(), vt.resolve(cfg(), "orchestrator")))
+    assert.equals("/opt/homebrew/bin/tmux", vt.binary(cfg(), vt.resolve(cfg(), "firstmate")))
+  end)
+
+  it("picks the environment for the target's transport", function()
+    assert.equals("/zbin", vt.environment(cfg(), vt.resolve(cfg(), "orchestrator")).PATH)
+    assert.equals("/tbin", vt.environment(cfg(), vt.resolve(cfg(), "firstmate")).PATH)
+  end)
+
+  it("returns nil when the transport has no entry, so nothing is spawned", function()
+    local c = cfg(); c.VOICE_TRANSPORTS.tmux = nil
+    assert.is_nil(vt.binary(c, vt.resolve(c, "firstmate")))
+    assert.is_nil(vt.environment(c, vt.resolve(c, "firstmate")))
+  end)
+
+  it("returns nil for a nil target or missing VOICE_TRANSPORTS", function()
+    assert.is_nil(vt.binary(cfg(), nil))
+    assert.is_nil(vt.binary({}, vt.resolve(cfg(), "firstmate")))
+    assert.is_nil(vt.environment(cfg(), nil))
   end)
 end)
 
@@ -205,9 +294,9 @@ describe("voice_targets.chordKeycodeMap", function()
 
   it("arms nothing at all when the config has a conflict", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.session = "firstmate"   -- crewmate session
+    c.VOICE_TARGETS.orchestrator.session = "firstmate"   -- crewmate session
     local map, problems = vt.chordKeycodeMap(c, KEYCODES)
-    assert.same({}, map)                    -- including the healthy orchestrator route
+    assert.same({}, map)                    -- including the healthy firstmate route
     assert.equals(1, #problems)
   end)
 
@@ -257,37 +346,58 @@ describe("voice_targets.conflicts", function()
     assert.truthy(vt.conflicts(c)[1]:find("reserved"))
   end)
 
-  it("flags a target aimed at a crewmate session", function()
+  it("flags a zellij target aimed at a crewmate session", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.session = "firstmate"
+    c.VOICE_TARGETS.orchestrator.session = "firstmate"
     assert.truthy(vt.conflicts(c)[1]:find("crewmate session"))
   end)
 
-  it("flags a missing session", function()
+  it("flags an ambient tmux target", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.session = nil
-    assert.truthy(vt.conflicts(c)[1]:find("missing session"))
+    c.VOICE_TARGETS.firstmate.target = "firstmate"
+    assert.truthy(vt.conflicts(c)[1]:find("not an explicit"))
   end)
 
-  it("flags a misspelled input method rather than silently defaulting", function()
+  it("flags a missing address, named per transport", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.input = "pate"
+    c.VOICE_TARGETS.orchestrator.session = nil
+    assert.truthy(vt.conflicts(c)[1]:find("missing session"))
+    local c2 = cfg()
+    c2.VOICE_TARGETS.firstmate.target = nil
+    assert.truthy(vt.conflicts(c2)[1]:find("missing target"))
+  end)
+
+  it("flags an unknown transport", function()
+    local c = cfg()
+    c.VOICE_TARGETS.firstmate.transport = "screen"
+    assert.truthy(vt.conflicts(c)[1]:find("unknown transport"))
+  end)
+
+  it("flags a misspelled zellij input method rather than silently defaulting", function()
+    local c = cfg()
+    c.VOICE_TARGETS.orchestrator.input = "pate"
     assert.truthy(vt.conflicts(c)[1]:find("unknown input method"))
   end)
 
-  it("flags a misspelled submit method", function()
+  it("flags a misspelled zellij submit method", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.submit = "retrun"
+    c.VOICE_TARGETS.orchestrator.submit = "retrun"
     assert.truthy(vt.conflicts(c)[1]:find("unknown submit method"))
   end)
 
-  it("flags a non-string paneId", function()
+  it("flags a non-string zellij paneId", function()
     local c = cfg()
-    c.VOICE_TARGETS.firstmate.paneId = 3
+    c.VOICE_TARGETS.orchestrator.paneId = 3
     assert.truthy(vt.conflicts(c)[1]:find("paneId"))
   end)
 
-  it("accepts a target that omits input/submit entirely", function()
+  it("flags zellij-only knobs set on a tmux target", function()
+    local c = cfg()
+    c.VOICE_TARGETS.firstmate.input = "paste"
+    assert.truthy(vt.conflicts(c)[1]:find("zellij transport only"))
+  end)
+
+  it("accepts a target that omits the optional knobs entirely", function()
     local c = cfg()
     c.VOICE_TARGETS.bare = { session = "Bare", chord = "b" }
     assert.same({}, vt.conflicts(c))
@@ -311,9 +421,26 @@ describe("voice_targets.normalize", function()
   end)
 end)
 
-describe("voice_targets argv builders", function()
+describe("voice_targets.tmuxSafeText", function()
+  -- `tmux send-keys` has no `--` terminator, so a leading dash would parse as
+  -- flags (verified against tmux 3.7b). A leading space makes it an operand.
+  it("leaves ordinary speech untouched", function()
+    assert.equals("ship the branch", vt.tmuxSafeText("  ship the branch  "))
+  end)
+
+  it("prefixes a space when the text starts with a dash", function()
+    assert.equals(" -- dashes ahead", vt.tmuxSafeText("-- dashes ahead"))
+    assert.equals(" -t foo", vt.tmuxSafeText("-t foo"))
+  end)
+
+  it("returns nil for blank input", function()
+    assert.is_nil(vt.tmuxSafeText("   "))
+    assert.is_nil(vt.tmuxSafeText(nil))
+  end)
+end)
+
+describe("voice_targets argv — zellij transport", function()
   local orch = vt.resolve(cfg(), "orchestrator")
-  local fm   = vt.resolve(cfg(), "firstmate")
 
   it("builds byte-for-byte the argv the old hardcoded Orchestrator call used", function()
     assert.same({ "--session", "Orchestrator", "action", "write-chars", "hello" },
@@ -322,33 +449,26 @@ describe("voice_targets argv builders", function()
       vt.submitArgs(orch))
   end)
 
-  it("builds bracketed paste + send-keys Enter for firstmate", function()
-    assert.same({ "--session", "firstmate-primary", "action", "paste", "--", "hello" },
-      vt.inputArgs(fm, "hello"))
-    assert.same({ "--session", "firstmate-primary", "action", "send-keys", "Enter" },
-      vt.submitArgs(fm))
+  it("builds bracketed paste + send-keys Enter when the target asks for them", function()
+    local c = cfg()
+    c.VOICE_TARGETS.orchestrator.input  = "paste"
+    c.VOICE_TARGETS.orchestrator.submit = "enter"
+    local t = vt.resolve(c, "orchestrator")
+    assert.same({ "--session", "Orchestrator", "action", "paste", "--", "hello" },
+      vt.inputArgs(t, "hello"))
+    assert.same({ "--session", "Orchestrator", "action", "send-keys", "Enter" },
+      vt.submitArgs(t))
   end)
 
-  it("passes a leading-dash transcript as an operand, not a flag", function()
-    -- `--` terminates options, so `action paste -- "-- rm -rf"` is text.
-    local argv = vt.inputArgs(fm, "-- not a flag")
+  it("passes a leading-dash transcript as an operand under paste", function()
+    local c = cfg()
+    c.VOICE_TARGETS.orchestrator.input = "paste"
+    local argv = vt.inputArgs(vt.resolve(c, "orchestrator"), "-- not a flag")
     assert.equals("--", argv[5])
     assert.equals("-- not a flag", argv[6])
   end)
 
   it("adds --pane-id before the operands when the target pins a pane", function()
-    local c = cfg()
-    c.VOICE_TARGETS.firstmate.paneId = "terminal_3"
-    local pinned = vt.resolve(c, "firstmate")
-    assert.same({ "--session", "firstmate-primary", "action", "paste",
-                  "--pane-id", "terminal_3", "--", "hello" },
-      vt.inputArgs(pinned, "hello"))
-    assert.same({ "--session", "firstmate-primary", "action", "send-keys",
-                  "--pane-id", "terminal_3", "Enter" },
-      vt.submitArgs(pinned))
-  end)
-
-  it("pins a pane on the write-chars/write13 pair too", function()
     local c = cfg()
     c.VOICE_TARGETS.orchestrator.paneId = "terminal_1"
     local pinned = vt.resolve(c, "orchestrator")
@@ -362,30 +482,60 @@ describe("voice_targets argv builders", function()
 
   it("trims the text it sends", function()
     assert.equals("hello", vt.inputArgs(orch, "  hello  ")[5])
-    assert.equals("hello", vt.inputArgs(fm, "  hello  ")[6])
+  end)
+end)
+
+describe("voice_targets argv — tmux transport", function()
+  local fm = vt.resolve(cfg(), "firstmate")
+
+  it("types with send-keys -l and submits with send-keys Enter", function()
+    assert.same({ "send-keys", "-t", "firstmate:0.0", "-l", "hello" },
+      vt.inputArgs(fm, "hello"))
+    assert.same({ "send-keys", "-t", "firstmate:0.0", "Enter" },
+      vt.submitArgs(fm))
   end)
 
-  it("falls back to write-chars/write13 for a target naming neither", function()
+  it("space-prefixes a leading-dash transcript so tmux sees an operand", function()
+    assert.same({ "send-keys", "-t", "firstmate:0.0", "-l", " -- dashes" },
+      vt.inputArgs(fm, "-- dashes"))
+  end)
+
+  it("trims the text it sends", function()
+    assert.equals("hello", vt.inputArgs(fm, "  hello  ")[5])
+  end)
+
+  it("follows a retargeted pane", function()
     local c = cfg()
-    c.VOICE_TARGETS.bare = { session = "Bare" }
-    local bare = vt.resolve(c, "bare")
-    assert.same({ "--session", "Bare", "action", "write-chars", "hi" },
-      vt.inputArgs(bare, "hi"))
-    assert.same({ "--session", "Bare", "action", "write", "13" },
-      vt.submitArgs(bare))
+    c.VOICE_TARGETS.firstmate.target = "fm:2.1"
+    local t = vt.resolve(c, "firstmate")
+    assert.same({ "send-keys", "-t", "fm:2.1", "-l", "hi" }, vt.inputArgs(t, "hi"))
+    assert.same({ "send-keys", "-t", "fm:2.1", "Enter" }, vt.submitArgs(t))
   end)
+end)
 
-  it("refuses blank text so nothing is spawned", function()
+describe("voice_targets argv — shared refusals", function()
+  local orch = vt.resolve(cfg(), "orchestrator")
+  local fm   = vt.resolve(cfg(), "firstmate")
+
+  it("refuses blank text on both transports so nothing is spawned", function()
     assert.is_nil(vt.inputArgs(orch, "   "))
     assert.is_nil(vt.inputArgs(orch, nil))
     assert.is_nil(vt.inputArgs(fm, ""))
+    assert.is_nil(vt.inputArgs(fm, nil))
   end)
 
-  it("refuses a nil or session-less target", function()
+  it("refuses a nil or address-less target", function()
     assert.is_nil(vt.inputArgs(nil, "hello"))
     assert.is_nil(vt.inputArgs({ label = "x" }, "hello"))
+    assert.is_nil(vt.inputArgs({ transport = "tmux" }, "hello"))
     assert.is_nil(vt.submitArgs(nil))
     assert.is_nil(vt.submitArgs({ label = "x" }))
+    assert.is_nil(vt.submitArgs({ transport = "zellij" }))
+  end)
+
+  it("refuses a target naming a transport that does not exist", function()
+    assert.is_nil(vt.inputArgs({ transport = "screen", address = "x" }, "hello"))
+    assert.is_nil(vt.submitArgs({ transport = "screen", address = "x" }))
   end)
 end)
 
@@ -415,15 +565,18 @@ end)
 
 describe("lib/config voice wiring", function()
   -- Guards the real shipped config, not a fixture: the live table must be
-  -- conflict-free and must not point the firstmate route at the crew session.
+  -- conflict-free, keep Orchestrator exactly as it was, and reach the firstmate
+  -- primary over tmux at an explicit target.
   local real = require("lib.config")
 
   it("has no routing conflicts", function()
     assert.same({}, vt.conflicts(real))
   end)
 
-  it("still routes Fn+A to the Orchestrator session", function()
-    assert.equals("Orchestrator", vt.resolve(real, "orchestrator").session)
+  it("still routes Fn+A to the Orchestrator zellij session", function()
+    local orch = vt.resolve(real, "orchestrator")
+    assert.equals("zellij", orch.transport)
+    assert.equals("Orchestrator", orch.session)
     assert.equals("orchestrator", vt.chordRoute(real, "a"))
   end)
 
@@ -435,35 +588,36 @@ describe("lib/config voice wiring", function()
       vt.submitArgs(orch))
   end)
 
-  it("delivers to firstmate by bracketed paste, submitted with send-keys Enter", function()
-    -- firstmate verified `action paste` is popup-safe where write-chars is not
-    -- (firstmate bin/backends/zellij.sh, real zellij 0.44).
-    local fm = vt.resolve(real, "firstmate")
-    assert.equals("paste", fm.input)
-    assert.equals("enter", fm.submit)
-    assert.same({ "--session", real.FIRSTMATE_PRIMARY_SESSION, "action", "paste", "--", "hello" },
-      vt.inputArgs(fm, "hello"))
-    assert.same({ "--session", real.FIRSTMATE_PRIMARY_SESSION, "action", "send-keys", "Enter" },
-      vt.submitArgs(fm))
-  end)
-
-  it("pins no pane by default, so the dedicated session is the guarantee", function()
-    assert.is_nil(vt.resolve(real, "orchestrator").paneId)
-    assert.is_nil(vt.resolve(real, "firstmate").paneId)
+  it("still drives Orchestrator with the cargo zellij binary", function()
+    local orch = vt.resolve(real, "orchestrator")
+    assert.truthy(vt.binary(real, orch):find("/%.cargo/bin/zellij$"))
   end)
 
   it("defaults to the orchestrator route", function()
     assert.equals("Orchestrator", vt.resolveDefault(real).session)
   end)
 
-  it("routes Fn+P to the dedicated firstmate primary session", function()
+  it("routes Fn+P to the firstmate primary over tmux", function()
     assert.equals("firstmate", vt.chordRoute(real, "p"))
-    assert.equals(real.FIRSTMATE_PRIMARY_SESSION, vt.resolve(real, "firstmate").session)
+    local fm = vt.resolve(real, "firstmate")
+    assert.equals("tmux", fm.transport)
+    assert.equals(real.FIRSTMATE_PRIMARY_TMUX_TARGET, fm.target)
+    assert.equals("/opt/homebrew/bin/tmux", vt.binary(real, fm))
   end)
 
-  it("treats the shared firstmate session as crew, never a destination", function()
+  it("targets the firstmate primary explicitly, never an ambient window", function()
+    assert.is_true(vt.isExplicitTmuxTarget(real.FIRSTMATE_PRIMARY_TMUX_TARGET))
+  end)
+
+  it("delivers to firstmate with the same pair firstmate's own daemon uses", function()
+    local fm = vt.resolve(real, "firstmate")
+    local t  = real.FIRSTMATE_PRIMARY_TMUX_TARGET
+    assert.same({ "send-keys", "-t", t, "-l", "hello" }, vt.inputArgs(fm, "hello"))
+    assert.same({ "send-keys", "-t", t, "Enter" }, vt.submitArgs(fm))
+  end)
+
+  it("treats the shared firstmate zellij session as crew, never a destination", function()
     assert.is_true(vt.isCrewSession(real, "firstmate"))
-    assert.is_false(vt.isCrewSession(real, real.FIRSTMATE_PRIMARY_SESSION))
   end)
 
   it("arms both chords against the real hs.keycodes map", function()

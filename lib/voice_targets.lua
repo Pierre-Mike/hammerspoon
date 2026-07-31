@@ -1,38 +1,50 @@
--- Voice routing targets: which zellij session a dictated transcript goes to.
+-- Voice routing targets: where a dictated transcript is delivered, and how.
 --
 -- Why this module exists: apps/dictation used to hardcode its own copy of the
 -- Orchestrator session name, so adding a second destination meant a second
 -- hardcoded string and a second place to get wrong. Every destination now lives
 -- in lib/config.VOICE_TARGETS and is resolved through here. Pure: no hs.*, no
--- side effects, so the routing decision and the zellij argv are unit-testable.
+-- side effects, so the routing decision and the argv are unit-testable.
 --
--- ── SAFETY: never write into a crewmate pane ────────────────────────────────
--- firstmate runs one zellij TAB PER CREWMATE TASK inside one shared session
--- (default "firstmate", overridable with FM_ZELLIJ_SESSION). Without an explicit
--- --pane-id, `zellij --session <name> action …` targets whichever pane is
--- FOCUSED there — so routing to the shared session would deliver the captain's
--- dictation into whatever worker tab happened to be focused.
+-- ── Two transports, because firstmate is a hybrid ───────────────────────────
+-- The firstmate captain/primary runs in a **tmux** pane while its crewmate tasks
+-- spawn as **zellij** tabs. firstmate's away-mode supervisor daemon refuses at
+-- startup for any supervisor backend other than tmux or herdr, and resolves the
+-- supervisor pane's backend independently of the runtime backend that spawns
+-- crewmates. So voice-in speaks tmux to reach the captain and zellij for the
+-- Orchestrator, and each target names its own transport.
 --
--- zellij 0.44 does let you name a pane (`--pane-id terminal_3`, supported on
--- write-chars / paste / write / send-keys — verified against 0.44.3), and a
--- target may set `paneId` to use it. But the primary's pane id isn't known when
--- a chord is pressed and changes across restarts, so pane-id can't be the
--- primary defence.
+-- Adding a third multiplexer = one entry in M.TRANSPORTS here plus one in
+-- config.VOICE_TRANSPORTS. Adding a destination = one entry in VOICE_TARGETS.
+-- Neither needs a new branch in apps/dictation.
 --
--- The assumption this module enforces instead: the firstmate PRIMARY runs in its
--- own dedicated session (config.FIRSTMATE_PRIMARY_SESSION, default
--- "firstmate-primary") holding nothing but the primary, so the focused pane is
--- always the right pane; the shared session is crewmates-only. resolve()
--- REFUSES any target whose session appears in config.FIRSTMATE_CREW_SESSIONS,
--- and the argv builders refuse an unresolved target — so no code path can
--- construct a delivery aimed at the crew session, even if VOICE_TARGETS is later
--- edited to point at it.
+-- ── SAFETY: never deliver into a crewmate pane ──────────────────────────────
+-- Both transports address "whatever the target resolves to", so an ambient or
+-- under-specified target can land dictation in a worker's prompt.
 --
--- Comparison is case-insensitive on purpose: zellij session names are
--- case-sensitive, so "Firstmate" is a *different* session than "firstmate" and
--- would not be a real crew session — but a near-miss like that is far more
--- likely a typo aimed at the crew session than a deliberate third session, and
--- refusing to speak is always the safe failure.
+--   tmux — `send-keys -t <target>` follows the target exactly, so the target must
+--     name session AND window explicitly. A bare "firstmate" goes to that
+--     session's CURRENT window — ambient — and is refused. (Crewmates are zellij
+--     tabs, so a tmux target cannot reach a crewmate at all; the explicit target
+--     is what stops delivery reaching the wrong tmux pane.)
+--
+--   zellij — without an explicit --pane-id, `zellij --session <name> action …`
+--     delivers to whichever pane is FOCUSED. firstmate's crewmates share one
+--     session (default "firstmate", overridable with FM_ZELLIJ_SESSION), so a
+--     zellij-transport route pointing at one of config.FIRSTMATE_CREW_SESSIONS
+--     is refused outright. zellij 0.44 CAN name a pane (`--pane-id terminal_3`,
+--     verified against 0.44.3) and a target may set `paneId`, but the primary's
+--     pane id isn't known when a chord is pressed and changes across restarts,
+--     so pane-id can't be the primary defence.
+--
+-- resolve() returns nil for any of these, and the argv builders refuse an
+-- unresolved target — so no code path can construct a delivery aimed at a
+-- crewmate, even if VOICE_TARGETS is later edited to point at one.
+--
+-- Crew-session comparison is case-insensitive on purpose: zellij session names
+-- are case-sensitive, so "Firstmate" is technically a different session — but a
+-- near-miss like that is far more likely a typo aimed at the crew session than a
+-- deliberate third session, and refusing to speak is the safe failure.
 
 local M = {}
 
@@ -40,12 +52,33 @@ local M = {}
 -- apps/dictation already binds them while Fn is held.
 M.RESERVED_CHORDS = { "c" }   -- Fn+C = cancel recording & recall last result
 
+-- zellij-only delivery methods. Unknown/absent values fall back to the pair
+-- apps/dictation has always used, so an older target naming neither still works.
+M.INPUT_METHODS  = { ["write-chars"] = true, paste = true }
+M.SUBMIT_METHODS = { write13 = true, enter = true }
+M.INPUT_DEFAULT  = "write-chars"
+M.SUBMIT_DEFAULT = "write13"
+
+M.TRANSPORT_DEFAULT = "zellij"
+
 local function lower(s)
   if type(s) ~= "string" then return nil end
   return s:lower()
 end
 
--- true when `session` is one of the shared crewmate sessions in cfg.
+local function nonEmptyString(v)
+  return type(v) == "string" and v ~= ""
+end
+
+-- Trim; returns nil for nil/blank so callers can treat nil as "nothing to send".
+function M.normalize(text)
+  if type(text) ~= "string" then return nil end
+  local t = text:gsub("^%s+", ""):gsub("%s+$", "")
+  if t == "" then return nil end
+  return t
+end
+
+-- true when `session` is one of the shared crewmate zellij sessions in cfg.
 function M.isCrewSession(cfg, session)
   local want = lower(session)
   if not want then return false end
@@ -57,20 +90,115 @@ function M.isCrewSession(cfg, session)
   return false
 end
 
--- How a target types text and submits it. Unknown/absent values fall back to
--- the pair apps/dictation has always used, so an older VOICE_TARGETS entry that
--- names neither keeps working unchanged.
-M.INPUT_METHODS  = { ["write-chars"] = true, paste = true }
-M.SUBMIT_METHODS = { write13 = true, enter = true }
-M.INPUT_DEFAULT  = "write-chars"
-M.SUBMIT_DEFAULT = "write13"
+-- ── tmux helpers ───────────────────────────────────────────────────────────
+
+-- Is this an explicit tmux target — "session:window" or "session:window.pane"?
+-- A bare "session" is REFUSED: tmux would deliver to that session's current
+-- window, which is exactly the ambient targeting we must not allow.
+function M.isExplicitTmuxTarget(target)
+  if not nonEmptyString(target) then return false end
+  if target:find("%s") then return false end          -- no whitespace in a target
+  if target:sub(1, 1) == "-" then return false end    -- never parseable as a flag
+  local session, rest = target:match("^([^:]+):([^:]+)$")
+  if not session or not rest then return false end    -- needs exactly one colon
+  -- rest is "window" or "window.pane"; both halves must be non-empty.
+  local window, pane = rest:match("^([^.]+)%.([^.]+)$")
+  if window then return pane ~= "" end
+  return rest:find("%.") == nil                       -- "window" with no stray dot
+end
+
+-- `tmux send-keys` has NO `--` option terminator (verified against tmux 3.7b:
+-- `send-keys -l "-x…"` fails with "unknown flag -x"), so a transcript starting
+-- with a dash would be parsed as flags. A single leading space makes it an
+-- unambiguous operand and is invisible in a prompt — better than dropping the
+-- take or mangling the words.
+function M.tmuxSafeText(text)
+  local t = M.normalize(text)
+  if not t then return nil end
+  if t:sub(1, 1) == "-" then return " " .. t end
+  return t
+end
+
+-- ── Transport dispatch table ───────────────────────────────────────────────
+-- Each entry owns: which config field carries the address, how to validate it,
+-- and how to build the type / submit argv. apps/dictation never branches on
+-- transport — it calls M.inputArgs / M.submitArgs / M.binary / M.environment.
+M.TRANSPORTS = {
+  zellij = {
+    addressField = "session",
+    -- Refuse a zellij target pointing at a shared crewmate session.
+    validate = function(cfg, address)
+      if M.isCrewSession(cfg, address) then
+        return "points at crewmate session " .. address
+      end
+      return nil
+    end,
+    -- `zellij --session <s> action <verb> [--pane-id <id>] …`
+    -- pane-id goes before the operands: zellij's parser takes it as an option on
+    -- the action subcommand.
+    action = function(target, verb)
+      local argv = { "--session", target.address, "action", verb }
+      if target.paneId then
+        argv[#argv + 1] = "--pane-id"
+        argv[#argv + 1] = target.paneId
+      end
+      return argv
+    end,
+    inputArgs = function(self, target, text)
+      local t = M.normalize(text)
+      if not t then return nil end
+      local verb = target.input == "paste" and "paste" or "write-chars"
+      local argv = self.action(target, verb)
+      -- `--` terminates options so a leading-dash transcript stays text.
+      -- write-chars keeps its historical bare form: the Orchestrator route's
+      -- argv must stay byte-for-byte what it has always been.
+      if verb == "paste" then argv[#argv + 1] = "--" end
+      argv[#argv + 1] = t
+      return argv
+    end,
+    submitArgs = function(self, target)
+      if target.submit == "enter" then
+        local argv = self.action(target, "send-keys")
+        argv[#argv + 1] = "Enter"
+        return argv
+      end
+      local argv = self.action(target, "write")
+      argv[#argv + 1] = "13"
+      return argv
+    end,
+  },
+
+  tmux = {
+    addressField = "target",
+    -- Refuse anything but an explicit session:window[.pane] target.
+    validate = function(_, address)
+      if not M.isExplicitTmuxTarget(address) then
+        return "tmux target '" .. tostring(address)
+               .. "' is not an explicit session:window[.pane]"
+      end
+      return nil
+    end,
+    -- `tmux send-keys -t <target> -l <text>` then `send-keys -t <target> Enter`
+    -- — the same literal-then-Enter pair firstmate uses for tmux panes
+    -- (bin/fm-tmux-lib.sh:426,398), so voice-in speaks to the captain exactly
+    -- the way firstmate's own away-mode daemon does.
+    inputArgs = function(_, target, text)
+      local t = M.tmuxSafeText(text)
+      if not t then return nil end
+      return { "send-keys", "-t", target.address, "-l", t }
+    end,
+    submitArgs = function(_, target)
+      return { "send-keys", "-t", target.address, "Enter" }
+    end,
+  },
+}
 
 -- Resolve a route key ("orchestrator", "firstmate", …) to a target.
 --
 -- Returns, on success:
---   { key = <route>, session = <zellij session>, label = <human name>,
---     chord = <letter or nil>, input = <method>, submit = <method>,
---     paneId = <string or nil> }, nil
+--   { key, transport, address, label, chord,
+--     session = <zellij only>, target = <tmux only>,
+--     input, submit, paneId }, nil
 -- Returns nil plus a short reason otherwise. Callers must treat nil as "do not
 -- send anything" — there is no fallback destination, because guessing which
 -- supervisor should receive speech is worse than dropping it.
@@ -81,25 +209,34 @@ function M.resolve(cfg, key)
   if type(targets) ~= "table" then return nil, "no VOICE_TARGETS" end
   local t = targets[key]
   if type(t) ~= "table" then return nil, "unknown route: " .. key end
-  local session = t.session
-  if type(session) ~= "string" or session == "" then
-    return nil, "route " .. key .. " has no session"
+
+  local transportName = nonEmptyString(t.transport) and t.transport or M.TRANSPORT_DEFAULT
+  local transport = M.TRANSPORTS[transportName]
+  if not transport then
+    return nil, "route " .. key .. " has unknown transport " .. transportName
   end
-  if M.isCrewSession(cfg, session) then
-    -- Hard stop: this session holds crewmate tabs, so delivery could land in a
-    -- worker's prompt. See the safety note at the top of this file.
-    return nil, "route " .. key .. " points at crewmate session " .. session
+
+  local address = t[transport.addressField]
+  if not nonEmptyString(address) then
+    return nil, "route " .. key .. " has no " .. transport.addressField
   end
-  local input  = M.INPUT_METHODS[t.input]   and t.input  or M.INPUT_DEFAULT
-  local submit = M.SUBMIT_METHODS[t.submit] and t.submit or M.SUBMIT_DEFAULT
+  local why = transport.validate(cfg, address)
+  if why then
+    -- Hard stop. See the safety note at the top of this file.
+    return nil, "route " .. key .. " " .. why
+  end
+
   return {
-    key     = key,
-    session = session,
-    label   = (type(t.label) == "string" and t.label ~= "") and t.label or key,
-    chord   = type(t.chord) == "string" and t.chord or nil,
-    input   = input,
-    submit  = submit,
-    paneId  = (type(t.paneId) == "string" and t.paneId ~= "") and t.paneId or nil,
+    key       = key,
+    transport = transportName,
+    address   = address,
+    label     = nonEmptyString(t.label) and t.label or key,
+    chord     = type(t.chord) == "string" and t.chord or nil,
+    session   = transportName == "zellij" and address or nil,
+    target    = transportName == "tmux" and address or nil,
+    input     = M.INPUT_METHODS[t.input]   and t.input  or M.INPUT_DEFAULT,
+    submit    = M.SUBMIT_METHODS[t.submit] and t.submit or M.SUBMIT_DEFAULT,
+    paneId    = nonEmptyString(t.paneId) and t.paneId or nil,
   }, nil
 end
 
@@ -109,6 +246,39 @@ end
 function M.resolveDefault(cfg)
   local key = (type(cfg) == "table" and cfg.VOICE_TARGET_DEFAULT) or "orchestrator"
   return M.resolve(cfg, key)
+end
+
+local function transportEntry(cfg, target)
+  if type(target) ~= "table" then return nil end
+  local transports = (type(cfg) == "table" and cfg.VOICE_TRANSPORTS) or nil
+  if type(transports) ~= "table" then return nil end
+  local entry = transports[target.transport]
+  if type(entry) ~= "table" then return nil end
+  return entry
+end
+
+-- The CLI binary for a resolved target's transport, from config.VOICE_TRANSPORTS.
+function M.binary(cfg, target)
+  local entry = transportEntry(cfg, target)
+  if not entry or not nonEmptyString(entry.bin) then return nil end
+  return entry.bin
+end
+
+-- The environment a target's transport CLI should run with.
+function M.environment(cfg, target)
+  local entry = transportEntry(cfg, target)
+  if not entry or type(entry.env) ~= "table" then return nil end
+  return entry.env
+end
+
+-- Route keys, sorted — for banners and menus that list every destination.
+function M.routeKeys(cfg)
+  local targets = (type(cfg) == "table" and cfg.VOICE_TARGETS) or nil
+  if type(targets) ~= "table" then return {} end
+  local keys = {}
+  for key in pairs(targets) do keys[#keys + 1] = key end
+  table.sort(keys)
+  return keys
 end
 
 -- Which route does holding Fn plus `letter` select? Returns the route key, or
@@ -122,16 +292,78 @@ function M.chordRoute(cfg, letter)
   end
   local targets = (type(cfg) == "table" and cfg.VOICE_TARGETS) or nil
   if type(targets) ~= "table" then return nil end
-  -- Sorted so a duplicate chord resolves deterministically rather than by
-  -- pairs() order. conflicts() is what actually flags the duplicate.
-  local keys = {}
-  for key in pairs(targets) do keys[#keys + 1] = key end
-  table.sort(keys)
-  for _, key in ipairs(keys) do
+  -- routeKeys is sorted, so a duplicate chord resolves deterministically rather
+  -- than by pairs() order. conflicts() is what actually flags the duplicate.
+  for _, key in ipairs(M.routeKeys(cfg)) do
     local t = targets[key]
     if type(t) == "table" and lower(t.chord) == want then return key end
   end
   return nil
+end
+
+-- Config audit: returns a list of human-readable problems (empty when clean).
+-- Catches the mistakes that would silently misroute or mis-deliver speech: two
+-- targets sharing a chord, a target stealing a reserved chord, an unknown
+-- transport, a missing or ambient address, a zellij target aimed at a crewmate
+-- session, and a misspelled input/submit method (which resolve() would otherwise
+-- quietly replace with the default).
+function M.conflicts(cfg)
+  local problems = {}
+  local targets = (type(cfg) == "table" and cfg.VOICE_TARGETS) or nil
+  if type(targets) ~= "table" then return { "no VOICE_TARGETS table" } end
+
+  local seenChord = {}
+  for _, key in ipairs(M.routeKeys(cfg)) do
+    local t = targets[key]
+
+    -- Transport + address, resolved exactly the way resolve() does it.
+    local transportName = nonEmptyString(t.transport) and t.transport or M.TRANSPORT_DEFAULT
+    local transport = M.TRANSPORTS[transportName]
+    if not transport then
+      problems[#problems + 1] = key .. ": unknown transport '" .. tostring(t.transport) .. "'"
+    else
+      local address = t[transport.addressField]
+      if not nonEmptyString(address) then
+        problems[#problems + 1] = key .. ": missing " .. transport.addressField
+      else
+        local why = transport.validate(cfg, address)
+        if why then problems[#problems + 1] = key .. ": " .. why end
+      end
+      -- input/submit/paneId are zellij-only knobs. Flag them on any other
+      -- transport so a copy-paste mistake is loud rather than silently ignored.
+      if transportName ~= "zellij" then
+        if t.input ~= nil or t.submit ~= nil or t.paneId ~= nil then
+          problems[#problems + 1] = key ..
+            ": input/submit/paneId apply to the zellij transport only"
+        end
+      else
+        if t.input ~= nil and not M.INPUT_METHODS[t.input] then
+          problems[#problems + 1] = key .. ": unknown input method '" .. tostring(t.input) .. "'"
+        end
+        if t.submit ~= nil and not M.SUBMIT_METHODS[t.submit] then
+          problems[#problems + 1] = key .. ": unknown submit method '" .. tostring(t.submit) .. "'"
+        end
+        if t.paneId ~= nil and not nonEmptyString(t.paneId) then
+          problems[#problems + 1] = key .. ": paneId must be a non-empty string"
+        end
+      end
+    end
+
+    local chord = lower(t.chord)
+    if chord then
+      for _, reserved in ipairs(M.RESERVED_CHORDS) do
+        if lower(reserved) == chord then
+          problems[#problems + 1] = key .. ": chord '" .. chord .. "' is reserved"
+        end
+      end
+      if seenChord[chord] then
+        problems[#problems + 1] = key .. ": chord '" .. chord .. "' already used by " .. seenChord[chord]
+      else
+        seenChord[chord] = key
+      end
+    end
+  end
+  return problems
 end
 
 -- Build the keycode → route-key table the Fn-chord eventtap dispatches on.
@@ -160,123 +392,33 @@ function M.chordKeycodeMap(cfg, keycodeMap)
   return map, problems
 end
 
--- Route keys, sorted — for banners and menus that list every destination.
-function M.routeKeys(cfg)
-  local targets = (type(cfg) == "table" and cfg.VOICE_TARGETS) or nil
-  if type(targets) ~= "table" then return {} end
-  local keys = {}
-  for key in pairs(targets) do keys[#keys + 1] = key end
-  table.sort(keys)
-  return keys
-end
+-- ── argv, per transport ────────────────────────────────────────────────────
 
--- Config audit: returns a list of human-readable problems (empty when clean).
--- Catches the mistakes that would silently misroute or mis-deliver speech: two
--- targets sharing a chord, a target stealing a reserved chord, a missing
--- session, a target aimed at a crewmate session, and a misspelled input/submit
--- method (which resolve() would otherwise quietly replace with the default).
-function M.conflicts(cfg)
-  local problems = {}
-  local targets = (type(cfg) == "table" and cfg.VOICE_TARGETS) or nil
-  if type(targets) ~= "table" then return { "no VOICE_TARGETS table" } end
-
-  local seenChord = {}
-  for _, key in ipairs(M.routeKeys(cfg)) do
-    local t = targets[key]
-    if type(t.session) ~= "string" or t.session == "" then
-      problems[#problems + 1] = key .. ": missing session"
-    elseif M.isCrewSession(cfg, t.session) then
-      problems[#problems + 1] = key .. ": session '" .. t.session .. "' is a firstmate crewmate session"
-    end
-    local chord = lower(t.chord)
-    if chord then
-      for _, reserved in ipairs(M.RESERVED_CHORDS) do
-        if lower(reserved) == chord then
-          problems[#problems + 1] = key .. ": chord '" .. chord .. "' is reserved"
-        end
-      end
-      if seenChord[chord] then
-        problems[#problems + 1] = key .. ": chord '" .. chord .. "' already used by " .. seenChord[chord]
-      else
-        seenChord[chord] = key
-      end
-    end
-    if t.input ~= nil and not M.INPUT_METHODS[t.input] then
-      problems[#problems + 1] = key .. ": unknown input method '" .. tostring(t.input) .. "'"
-    end
-    if t.submit ~= nil and not M.SUBMIT_METHODS[t.submit] then
-      problems[#problems + 1] = key .. ": unknown submit method '" .. tostring(t.submit) .. "'"
-    end
-    if t.paneId ~= nil and (type(t.paneId) ~= "string" or t.paneId == "") then
-      problems[#problems + 1] = key .. ": paneId must be a non-empty string"
-    end
-  end
-  return problems
-end
-
--- Trim; returns nil for nil/blank so callers can treat nil as "nothing to send".
-function M.normalize(text)
-  if type(text) ~= "string" then return nil end
-  local t = text:gsub("^%s+", ""):gsub("%s+$", "")
-  if t == "" then return nil end
-  return t
-end
-
-local function sessionOf(target)
+local function transportOf(target)
   if type(target) ~= "table" then return nil end
-  local s = target.session
-  if type(s) ~= "string" or s == "" then return nil end
-  return s
+  if not nonEmptyString(target.address) then return nil end
+  return M.TRANSPORTS[target.transport]
 end
 
--- `zellij --session <s> action <verb>` plus `--pane-id <id>` when the target
--- pins one. Pane-id goes before the trailing operands because zellij's clap
--- parser takes it as an option on the action subcommand.
-local function actionArgs(target, verb)
-  local session = sessionOf(target)
-  if not session then return nil end
-  local argv = { "--session", session, "action", verb }
-  if target.paneId then
-    argv[#argv + 1] = "--pane-id"
-    argv[#argv + 1] = target.paneId
-  end
-  return argv
-end
-
--- argv that types the transcript WITHOUT submitting it, per target.input:
---   "paste"       → `action paste -- <text>`   (bracketed paste; popup-safe)
---   "write-chars" → `action write-chars <text>` (per-character)
--- `--` terminates options for paste so a transcript starting with "-" is not
--- parsed as a flag. write-chars keeps its historical bare form so the
--- Orchestrator route's argv is byte-for-byte what it has always been.
--- nil when the target is unresolved or the text is blank — the caller must not
--- spawn a task in that case.
+-- argv that types the transcript WITHOUT submitting it. nil when the target is
+-- unresolved or the text is blank — the caller must not spawn a task then.
 function M.inputArgs(target, text)
-  local t = M.normalize(text)
-  if not t then return nil end
-  local verb = (target and target.input == "paste") and "paste" or "write-chars"
-  local argv = actionArgs(target, verb)
-  if not argv then return nil end
-  if verb == "paste" then argv[#argv + 1] = "--" end
-  argv[#argv + 1] = t
-  return argv
+  local transport = transportOf(target)
+  if not transport then return nil end
+  return transport:inputArgs(target, text)
 end
 
--- argv that submits the typed text, per target.submit:
---   "enter"   → `action send-keys Enter`  (zellij's named key)
---   "write13" → `action write 13`         (raw CR byte)
+-- argv that submits the typed text. Kept separate from inputArgs because none of
+-- these multiplexers has an atomic type-and-submit: the text is typed once, and
+-- the newline follows only after the type is confirmed — never retyped on a
+-- failed submit, since a duplicated instruction is worse than an unsubmitted one.
 function M.submitArgs(target)
-  if target and target.submit == "enter" then
-    local argv = actionArgs(target, "send-keys")
-    if not argv then return nil end
-    argv[#argv + 1] = "Enter"
-    return argv
-  end
-  local argv = actionArgs(target, "write")
-  if not argv then return nil end
-  argv[#argv + 1] = "13"
-  return argv
+  local transport = transportOf(target)
+  if not transport then return nil end
+  return transport:submitArgs(target)
 end
+
+-- ── display strings ────────────────────────────────────────────────────────
 
 -- "→ Orchestrator (voice): first sixty chars…" for the on-screen notify.
 function M.notifyText(target, text, maxLen)

@@ -8,23 +8,39 @@ local HOME = os.getenv("HOME")
 -- VOICE_TARGETS table below — this is the ONLY place a session name is spelled,
 -- so retargeting is a one-line edit and no module keeps its own copy.
 --
--- SAFETY — why firstmate gets its own session:
---   firstmate runs one zellij TAB PER CREWMATE TASK inside a single shared
---   session (default name "firstmate", overridable with FM_ZELLIJ_SESSION).
---   Without an explicit --pane-id, `zellij --session <name> action …` delivers
---   to whichever pane is FOCUSED. So if we targeted the shared session, a
---   dictated sentence would land in whatever crewmate tab happened to be
---   focused — feeding speech meant for the captain into a worker's prompt.
---   zellij 0.44 CAN name a pane (`--pane-id terminal_3`, see paneId below), but
---   the primary's pane id is not known at dictation time and changes across
---   restarts, so it can't be the primary defence.
---   The assumption baked in here: the firstmate PRIMARY (captain) runs in its
---   own dedicated session, FIRSTMATE_PRIMARY_SESSION, whose only pane is the
---   primary — so "the focused pane" is always the right pane. The shared
---   session is crewmates-only, listed in FIRSTMATE_CREW_SESSIONS, which
---   lib/voice_targets.lua refuses to route to at all.
-local FIRSTMATE_PRIMARY_SESSION = "firstmate-primary"
-local FIRSTMATE_CREW_SESSIONS   = { "firstmate" }   -- never a voice destination
+-- Each target names its TRANSPORT (which multiplexer owns the pane), because
+-- firstmate runs a HYBRID: the captain/primary sits in a **tmux** pane while
+-- crewmate tasks spawn as **zellij** tabs. That isn't a preference — firstmate's
+-- away-mode supervisor daemon refuses at startup for any supervisor backend
+-- other than tmux or herdr (bin/fm-supervise-daemon.sh, docs/configuration.md
+-- "Away-mode supervisor backend"), and it resolves the supervisor pane's backend
+-- independently of the runtime backend that spawns crewmates. So voice-in has to
+-- speak tmux to reach the captain, and zellij only for the Orchestrator.
+--
+-- SAFETY — never deliver into a crewmate pane:
+--   Both transports address "wherever the target resolves to", so an ambient or
+--   under-specified target can land dictation in a worker's prompt.
+--   • tmux (firstmate primary): the target must name session AND window (and
+--     ideally pane) explicitly. A bare "firstmate" would go to that session's
+--     CURRENT window — ambient, and therefore refused. Crewmates are zellij
+--     tabs, so a tmux target cannot reach one at all; the explicit target is
+--     what stops delivery reaching the wrong tmux pane.
+--   • zellij (Orchestrator): without an explicit --pane-id, `zellij --session
+--     <name> action …` delivers to whichever pane is FOCUSED. firstmate's
+--     crewmates live in one shared session (default "firstmate", overridable
+--     with FM_ZELLIJ_SESSION), so any zellij-transport route pointing there is
+--     refused outright — see FIRSTMATE_CREW_SESSIONS.
+--   lib/voice_targets.lua enforces both, and refuses rather than guessing.
+--
+-- The tmux target for the captain. Single named constant: change it here when
+-- the session/window naming settles. Explicit down to the pane — firstmate's own
+-- default supervisor target is the window-level "firstmate:0"
+-- (FM_SUPERVISOR_TARGET_DEFAULT), and this pins the pane too so a split in that
+-- window cannot silently take delivery.
+local FIRSTMATE_PRIMARY_TMUX_TARGET = "firstmate:0.0"
+
+-- zellij sessions holding firstmate crewmate tabs — never a voice destination.
+local FIRSTMATE_CREW_SESSIONS = { "firstmate" }
 do
   local envCrew = os.getenv("FM_ZELLIJ_SESSION")
   if envCrew and envCrew ~= "" then
@@ -44,40 +60,56 @@ return {
   ZELLIJ              = "/opt/homebrew/bin/zellij",
   ZELLIJ_SOCKET_DIR   = "/var/z",
 
+  -- Per-transport CLI: which binary drives each multiplexer, and the environment
+  -- its task runs with. Adding a transport here plus a dispatch entry in
+  -- lib/voice_targets.TRANSPORTS is all a third multiplexer needs.
+  -- NOTE the zellij binary is the ~/.cargo one, not the ZELLIJ path above —
+  -- that is the path apps/dictation has always used and the one that works.
+  VOICE_TRANSPORTS = {
+    zellij = {
+      bin = HOME .. "/.cargo/bin/zellij",
+      env = { HOME = HOME, PATH = "/opt/homebrew/bin:/usr/bin:/bin:" .. HOME .. "/.cargo/bin" },
+    },
+    tmux = {
+      bin = "/opt/homebrew/bin/tmux",
+      env = { HOME = HOME, PATH = "/opt/homebrew/bin:/usr/bin:/bin" },
+    },
+  },
+
   -- Routable supervisors, keyed by route name. Resolve these through
-  -- lib/voice_targets.lua — it enforces the crewmate-session guard above.
-  --   session — zellij session the transcript is delivered into
-  --   label   — human name used in HUD/notify text and the ready banner
-  --   chord   — letter that, held with Fn, arms this route for the current take
-  --   input   — how the text is typed: "paste" (bracketed paste, `action paste`)
-  --             or "write-chars" (per-character, `action write-chars`)
-  --   submit  — how it is submitted: "enter" (`action send-keys Enter`) or
-  --             "write13" (`action write 13`)
-  --   paneId  — OPTIONAL zellij pane id (e.g. "terminal_3"). When set, every
-  --             action carries `--pane-id`, so delivery no longer depends on
-  --             which pane is focused. Leave nil unless the pane id is stable.
+  -- lib/voice_targets.lua — it enforces the per-transport target guards above.
+  --   transport — "zellij" or "tmux"; decides which CLI and argv shape is used
+  --   session   — zellij transport: the session to deliver into
+  --   target    — tmux transport: explicit "session:window[.pane]" target
+  --   label     — human name used in HUD/notify text and the ready banner
+  --   chord     — letter that, held with Fn, arms this route for the current take
+  -- zellij transport only:
+  --   input     — "paste" (bracketed paste, `action paste`) or "write-chars"
+  --   submit    — "enter" (`action send-keys Enter`) or "write13" (`action write 13`)
+  --   paneId    — OPTIONAL pane id (e.g. "terminal_3"); when set every action
+  --               carries --pane-id so delivery ignores which pane is focused.
   --
-  -- Why the two routes differ: firstmate verified empirically (real zellij
-  -- 0.44.0, bin/backends/zellij.sh) that `action paste` does not auto-submit and
-  -- uses bracketed paste mode, which is popup-safe — per-character write-chars
-  -- can trip a Claude Code completion/slash-command popup that then swallows the
-  -- Enter. The new firstmate route takes that better primitive. Orchestrator
-  -- deliberately stays on write-chars + write 13, the exact pair it has used all
-  -- along, so a working live path isn't changed by this addition.
+  -- The tmux transport always types with `send-keys -l` and submits with
+  -- `send-keys Enter` — the same pair firstmate itself uses for tmux panes
+  -- (bin/fm-tmux-lib.sh), so voice-in speaks to the captain exactly the way
+  -- firstmate's own away-mode daemon does.
+  --
+  -- Orchestrator deliberately stays on zellij write-chars + write 13, the exact
+  -- pair it has always used, so this addition changes no working live path.
   --
   -- "c" is reserved by apps/dictation for cancel-and-recall; voice_targets
   -- .conflicts() fails the config if a target ever claims it.
   VOICE_TARGETS = {
-    orchestrator = { session = "Orchestrator",            label = "Orchestrator",
-                     chord = "a", input = "write-chars",  submit = "write13" },
-    firstmate    = { session = FIRSTMATE_PRIMARY_SESSION, label = "firstmate",
-                     chord = "p", input = "paste",        submit = "enter" },
+    orchestrator = { transport = "zellij", session = "Orchestrator", label = "Orchestrator",
+                     chord = "a", input = "write-chars", submit = "write13" },
+    firstmate    = { transport = "tmux", target = FIRSTMATE_PRIMARY_TMUX_TARGET,
+                     label = "firstmate", chord = "p" },
   },
   -- Route used when something asks for "the supervisor" without naming one
   -- (headset MFB, apps/volume_tap, dictate.startSupervisorVoice()).
-  VOICE_TARGET_DEFAULT      = "orchestrator",
-  FIRSTMATE_PRIMARY_SESSION = FIRSTMATE_PRIMARY_SESSION,
-  FIRSTMATE_CREW_SESSIONS   = FIRSTMATE_CREW_SESSIONS,
+  VOICE_TARGET_DEFAULT            = "orchestrator",
+  FIRSTMATE_PRIMARY_TMUX_TARGET   = FIRSTMATE_PRIMARY_TMUX_TARGET,
+  FIRSTMATE_CREW_SESSIONS         = FIRSTMATE_CREW_SESSIONS,
 
   PARAKEET            = HOME .. "/.local/bin/parakeet-mlx",
   PARAKEET_PY         = HOME .. "/.local/share/uv/tools/parakeet-mlx/bin/python",

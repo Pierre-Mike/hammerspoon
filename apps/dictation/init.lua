@@ -25,12 +25,12 @@ local MLXA_PY   = os.getenv("HOME") .. "/.local/share/uv/tools/mlx-audio/bin/pyt
 local QWEN3_OUT = "/tmp/hs-qwen3"
 local MIN_DURATION = 0.6            -- avfoundation needs ~300ms to start; below this = no audio
 local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button release is ever missed
-local ZELLIJ = os.getenv("HOME") .. "/.cargo/bin/zellij"
-local ZELLIJ_ENV = { HOME = os.getenv("HOME"), PATH = "/opt/homebrew/bin:/usr/bin:/bin:/usr/bin:/Users/pierre-mikel/.cargo/bin" }
--- Every supervisor destination (session name, label, Fn chord) comes from
--- lib/config.VOICE_TARGETS via lib/voice_targets — this module holds no session
--- name of its own. voice_targets also refuses to route into firstmate's shared
--- crewmate session, so a dictated sentence can never land in a worker's prompt.
+-- Every supervisor destination — transport, session/target, label, Fn chord —
+-- comes from lib/config.VOICE_TARGETS via lib/voice_targets, including which CLI
+-- binary and environment each transport needs. This module holds no session name
+-- and no multiplexer path of its own, and never branches on transport.
+-- voice_targets refuses to route into firstmate's shared crewmate zellij session
+-- or at an ambient tmux target, so dictation can't land in a worker's prompt.
 local DEFAULT_ROUTE = configFile.VOICE_TARGET_DEFAULT or "orchestrator"
 
 -- M.route is the destination armed for the CURRENT take: nil = paste at cursor,
@@ -407,22 +407,29 @@ local function sendToTarget(routeKey, text)
     notify("voice route refused: " .. tostring(why), 2.8)
     return
   end
+  local bin = voiceTargets.binary(configFile, target)
+  if not bin then
+    logf("[supervisor] no binary configured for transport %s", target.transport)
+    notify("no " .. target.transport .. " binary configured", 2.8)
+    return
+  end
+  local env = voiceTargets.environment(configFile, target)
   local writeArgs = voiceTargets.inputArgs(target, text)
   if not writeArgs then return end
   local submitArgs = voiceTargets.submitArgs(target)
   local clean = voiceTargets.normalize(text)
 
-  local writeTask = hs.task.new(ZELLIJ,
+  local writeTask = hs.task.new(bin,
     function(code, _, err)
       if code ~= 0 then
-        logf("[supervisor] zellij %s exit=%d err=%s", target.input, code, tostring(err))
-        notify("zellij " .. target.input .. " failed", 2.4)
+        logf("[supervisor] %s type exit=%d err=%s", target.transport, code, tostring(err))
+        notify(target.transport .. " send failed", 2.4)
         return
       end
-      local enterTask = hs.task.new(ZELLIJ,
+      local enterTask = hs.task.new(bin,
         function(c2, _, e2)
           if c2 ~= 0 then
-            logf("[supervisor] zellij submit(%s) exit=%d err=%s", target.submit, c2, tostring(e2))
+            logf("[supervisor] %s submit exit=%d err=%s", target.transport, c2, tostring(e2))
             return
           end
           -- Transcript is now committed in the supervisor's prompt: fire the
@@ -430,16 +437,15 @@ local function sendToTarget(routeKey, text)
           playEarcon("sent")
         end,
         submitArgs)
-      enterTask:setEnvironment(ZELLIJ_ENV)
+      if env then enterTask:setEnvironment(env) end
       enterTask:start()
     end,
     writeArgs)
-  writeTask:setEnvironment(ZELLIJ_ENV)
+  if env then writeTask:setEnvironment(env) end
   writeTask:start()
 
-  logf("[supervisor] voice → %s (%s pane=%s %s+%s) len=%d preview=%q",
-       target.label, target.session, target.paneId or "focused",
-       target.input, target.submit, #clean, clean:sub(1, 60))
+  logf("[supervisor] voice → %s (%s %s) len=%d preview=%q",
+       target.label, target.transport, target.address, #clean, clean:sub(1, 60))
   notify(voiceTargets.notifyText(target, clean, 60), 1.8)
 end
 
