@@ -20,7 +20,9 @@ hs.eventtap = {
   event = { types = { flagsChanged = 1, keyDown = 2, systemDefined = 3 } },
 }
 
-hs.keycodes = { map = { c = 8, a = 0 } }
+-- Real macOS virtual keycodes for the letters apps/dictation chords on
+-- (Fn+C cancel, Fn+A → Orchestrator, Fn+P → firstmate).
+hs.keycodes = { map = { a = 0, c = 8, p = 35 } }
 
 hs.screen = {
   mainScreen = function()

@@ -2,6 +2,33 @@
 
 local HOME = os.getenv("HOME")
 
+-- ── Voice routing targets ───────────────────────────────────────────────────
+-- A dictated transcript either pastes at the cursor (default) or is written
+-- into a supervisor's zellij pane. Every routable supervisor lives in the
+-- VOICE_TARGETS table below — this is the ONLY place a session name is spelled,
+-- so retargeting is a one-line edit and no module keeps its own copy.
+--
+-- SAFETY — why firstmate gets its own session:
+--   firstmate runs one zellij TAB PER CREWMATE TASK inside a single shared
+--   session (default name "firstmate", overridable with FM_ZELLIJ_SESSION).
+--   `zellij --session <name> action write-chars` delivers to whichever pane is
+--   FOCUSED in that session, not to a pane we name. So if we ever targeted the
+--   shared session, a dictated sentence would land in whatever crewmate tab
+--   happened to be focused — feeding speech meant for the captain straight into
+--   a worker's prompt.
+--   The assumption baked in here: the firstmate PRIMARY (captain) runs in its
+--   own dedicated session, FIRSTMATE_PRIMARY_SESSION, whose only pane is the
+--   primary. The shared session is treated as crewmates-only and is listed in
+--   FIRSTMATE_CREW_SESSIONS, which lib/voice_targets.lua refuses to route to.
+local FIRSTMATE_PRIMARY_SESSION = "firstmate-primary"
+local FIRSTMATE_CREW_SESSIONS   = { "firstmate" }   -- never a voice destination
+do
+  local envCrew = os.getenv("FM_ZELLIJ_SESSION")
+  if envCrew and envCrew ~= "" then
+    FIRSTMATE_CREW_SESSIONS[#FIRSTMATE_CREW_SESSIONS + 1] = envCrew
+  end
+end
+
 return {
   AUDIO_DEVICE        = "1",
   WAV                 = "/tmp/hs-dictate.wav",
@@ -13,7 +40,23 @@ return {
   FFMPEG              = "/opt/homebrew/bin/ffmpeg",
   ZELLIJ              = "/opt/homebrew/bin/zellij",
   ZELLIJ_SOCKET_DIR   = "/var/z",
-  SUPERVISOR_SESSION  = "Orchestrator",
+
+  -- Routable supervisors, keyed by route name. Resolve these through
+  -- lib/voice_targets.lua — it enforces the crewmate-session guard above.
+  --   session — zellij session `write-chars` is aimed at
+  --   label   — human name used in HUD/notify text and the ready banner
+  --   chord   — letter that, held with Fn, arms this route for the current take
+  -- "c" is reserved by apps/dictation for cancel-and-recall; voice_targets
+  -- .conflicts() fails the config if a target ever claims it.
+  VOICE_TARGETS = {
+    orchestrator = { session = "Orchestrator",              label = "Orchestrator", chord = "a" },
+    firstmate    = { session = FIRSTMATE_PRIMARY_SESSION,   label = "firstmate",    chord = "p" },
+  },
+  -- Route used when something asks for "the supervisor" without naming one
+  -- (headset MFB, apps/volume_tap, dictate.startSupervisorVoice()).
+  VOICE_TARGET_DEFAULT      = "orchestrator",
+  FIRSTMATE_PRIMARY_SESSION = FIRSTMATE_PRIMARY_SESSION,
+  FIRSTMATE_CREW_SESSIONS   = FIRSTMATE_CREW_SESSIONS,
 
   PARAKEET            = HOME .. "/.local/bin/parakeet-mlx",
   PARAKEET_PY         = HOME .. "/.local/share/uv/tools/parakeet-mlx/bin/python",
@@ -48,7 +91,7 @@ return {
   -- operator can tell state by ear:
   --   START — mic capture just began ("listening")
   --   STOP  — recording ended, transcription dispatched ("processing")
-  --   SENT  — transcript written into the Orchestrator zellij pane ("delivered")
+  --   SENT  — transcript written into a supervisor's zellij pane ("delivered")
   -- Kept LOCAL (hs.sound) so it is instant and does not queue behind the
   -- /speak TTS service on 8790.
   --
@@ -64,7 +107,7 @@ return {
     enabled = true,
     START   = "Tink",       -- high, short — "listening now"
     STOP    = "Pop",        -- subtler, lower — "captured, transcribing"
-    SENT    = "Submarine",  -- distinct, deeper — "delivered to Orchestrator"
+    SENT    = "Submarine",  -- distinct, deeper — "delivered to the supervisor"
     VOLUME  = 0.45,
   },
 

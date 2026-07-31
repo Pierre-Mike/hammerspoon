@@ -16,11 +16,54 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 
 | App | What it does |
 |-----|--------------|
-| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+A` routes the transcript to a zellij `Orchestrator` session instead of pasting; `Fn+C` cancels & recalls the last result. Menu-bar picker switches speech models. |
+| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+A` routes the transcript into the zellij `Orchestrator` session and `Fn+P` into the firstmate primary instead of pasting — see [Voice routing targets](#voice-routing-targets). `Fn+C` cancels & recalls the last result. Menu-bar picker switches speech models. |
 | `apps/brown_noise` | Menu-bar noise machine: play/stop, volume, and color (white/pink/brown/blue/violet). |
-| `apps/volume_tap` | Voice control for the Orchestrator via volume-key taps. |
+| `apps/volume_tap` | Voice control for the default supervisor (Orchestrator) via volume-key taps. |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
+
+## Voice routing targets
+
+A dictated transcript either pastes at the cursor (plain **Fn**) or is written
+straight into a supervisor's zellij pane and submitted (`write-chars` + Enter).
+Every destination lives in one table, `VOICE_TARGETS` in `lib/config.lua`:
+
+| Chord | Route | zellij session |
+|---|---|---|
+| `Fn+A` | `orchestrator` | `Orchestrator` |
+| `Fn+P` | `firstmate` | `firstmate-primary` (`FIRSTMATE_PRIMARY_SESSION`) |
+
+Headset MFB and `apps/volume_tap` use `VOICE_TARGET_DEFAULT`, which is
+`orchestrator`. `Fn+C` is reserved for cancel-and-recall and can't be claimed by
+a target. Adding or retargeting a destination is a `lib/config.lua` edit — no
+module holds a session name of its own, and `lib/voice_targets.lua` (pure, unit
+tested in `tests/spec/voice_targets_spec.lua`) does all the resolution.
+
+### Why firstmate gets its own session
+
+**firstmate runs one zellij tab per crewmate task inside a single shared
+session** (default name `firstmate`, overridable with `FM_ZELLIJ_SESSION`).
+`zellij --session <name> action write-chars` delivers to whichever pane is
+*focused* in that session, with no way to name a pane — so aiming voice at the
+shared session would drop the captain's dictation into whatever worker tab
+happened to be focused.
+
+So the `firstmate` route targets a **dedicated session holding only the
+primary**. This is an assumption the config makes about how you launch things:
+
+```sh
+zellij --session firstmate-primary        # captain / primary lives here, alone
+# crewmate tabs stay in the shared "firstmate" session, which voice never touches
+```
+
+The shared session names are listed in `FIRSTMATE_CREW_SESSIONS` (the default
+`firstmate`, plus `FM_ZELLIJ_SESSION` when it is set in Hammerspoon's
+environment). `lib/voice_targets.lua` refuses to resolve any route pointing at
+one of them — case-insensitively — and the argv builders refuse an unresolved
+target, so no code path can construct a `write-chars` aimed at a crewmate pane
+even if `VOICE_TARGETS` is later edited to point there. A route that fails this
+check arms **no** chord at all and shows "voice route refused" instead of
+guessing a destination.
 
 ## Assets not in git
 
