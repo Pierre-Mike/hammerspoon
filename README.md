@@ -20,6 +20,7 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 | `apps/brown_noise` | Menu-bar noise machine: play/stop, volume, and color (white/pink/brown/blue/violet). |
 | `apps/volume_tap` | Voice control for the Orchestrator via volume-key taps. |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
+| `apps/shokz` | Turns the Shokz OpenComm2's volume buttons into general-purpose triggers. Tapping volume− then volume+ (or the reverse) inside 0.6s fires an action; the two presses cancel out so the volume ends where it started. See [Shokz buttons over Bluetooth](#shokz-buttons-over-bluetooth) for why the other buttons can't be used. |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
 
 ## Assets not in git
@@ -82,6 +83,50 @@ both work; header wins. The menu-bar **Default voice** submenu switches the
 fallback voice used when no selector is given. First use of a voice downloads its
 prompt from HF (cached after). Set the language in `lib/config.lua` (`TTS_LANGUAGE`).
 Logs: `/tmp/hs-tts.log` (queue) and the server's stdout.
+
+## Shokz buttons over Bluetooth
+
+What an OpenComm2 paired straight to the Mac (no Loop dongle) actually exposes,
+measured rather than assumed:
+
+| Button | What reaches macOS | Usable as a trigger |
+|--------|-------------------|---------------------|
+| Multifunction, 1× / 2× / 3× | Play/pause, next, previous — delivered by `mediaremoted` to the now-playing app | **No.** It never becomes a CGEvent, so no event tap sees it |
+| Multifunction, hold | Nothing outside a call | No |
+| Volume + / − , tap | Changes the output device's volume | **Yes** — this is what `apps/shokz` uses |
+| Volume + , hold | Powers the headset off | No |
+| Volume − , hold | One step, same as a tap | No |
+| Mute | Nothing — needs the Loop dongle, and only works mid-call | No |
+
+The multifunction button is the surprising one. Pressing it does control the Mac
+(3/3 presses toggled QuickTime playback in a timed test), but an `hs.eventtap` on
+`systemDefined` running throughout logged nothing at all. AVRCP goes through
+MediaRemote straight to the now-playing app, bypassing the CGEvent layer that
+Hammerspoon, Karabiner and BetterTouchTool all hook. Plugging in the **Loop
+dongle** changes this: the headset then presents as USB HID, media keys become
+real events, and the mute button starts reaching the host.
+
+That leaves the volume buttons, and the level itself says who moved it:
+
+| Source | Scale | Lands on |
+|--------|-------|----------|
+| Headset in A2DP (music) | AVRCP absolute volume, 0–127 | `n/127` — e.g. 85/127 = 66.929% |
+| Headset in HFP (call) | HFP speaker gain, 0–15 | `n/15` — e.g. 8/15 = 53.333% |
+| Mac's own volume keys | 16 steps | `n/16` — e.g. 10/16 = 62.5% |
+
+Both headset grids are live and it switches between them with the Bluetooth
+profile, so checking only the 0–127 grid silently drops every press made during a
+call. The grids overlap only at 0% and 100%.
+
+Gestures are opposite-direction pairs (`volume− then volume+`, or the reverse)
+because the two presses cancel out: the volume ends exactly where it started, so
+nothing has to be written back and there is no feedback loop with the headset's
+own volume state. `down_up` is the one to prefer — it starts on volume−, so a
+slipped press can't turn into the volume+ long-press that powers the headset off.
+Firing only on exactly two presses inside the window is what keeps an ordinary
+overshoot-and-correct (up, up, down) from being read as a gesture.
+
+Remap in `apps/shokz/init.lua` (`M.actions`). Log: `/tmp/hs-shokz.log`.
 
 ## Tests
 
