@@ -1,4 +1,4 @@
-// Hidden-from-capture HANDS DOWN flash.
+// Hidden-from-capture nose-touch flash.
 // Borderless fullscreen red window with sharingType = .none, so macOS excludes
 // it from screen recording / sharing (Zoom, Teams, ScreenCaptureKit, CGWindowList)
 // while it stays visible to the local user. Auto-dismisses after a duration.
@@ -29,17 +29,6 @@ win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 let view = NSView(frame: screen.frame)
 view.wantsLayer = true
 view.layer?.backgroundColor = NSColor(red: 0.9, green: 0.05, blue: 0.18, alpha: 0.82).cgColor
-
-let label = NSTextField(labelWithString: "✋ HANDS DOWN")
-label.font = .systemFont(ofSize: 96, weight: .bold)
-label.textColor = .white
-label.alignment = .center
-label.sizeToFit()
-label.frame.origin = NSPoint(
-    x: (screen.frame.width - label.frame.width) / 2,
-    y: screen.frame.height * 0.45
-)
-view.addSubview(label)
 
 win.contentView = view
 win.makeKeyAndOrderFront(nil)
