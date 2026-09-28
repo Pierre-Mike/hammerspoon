@@ -132,6 +132,11 @@ end
 -- Public: copy the selection and queue it for speech. `sel` overrides the voice
 -- (defaults to the read-aloud profile in cfg.TTS_SELECTION.PROFILE).
 function M.speakSelection(sel)
+  -- One grab at a time: a held Fn+S auto-repeats, and overlapping grabs race on
+  -- the pasteboard, so the restore could put back another grab's copy instead of
+  -- what the user had.
+  if M.selecting then return end
+  M.selecting = true
   local poll    = SEL.POLL or 0.03
   local timeout = SEL.TIMEOUT or 0.45
   local before  = hs.pasteboard.changeCount()
@@ -139,15 +144,17 @@ function M.speakSelection(sel)
 
   -- One tick of delay: we are normally called from inside a keyDown eventtap,
   -- and a synthetic ⌘C posted from within that callback can be swallowed.
-  hs.timer.doAfter(poll, function()
+  -- Timers live on M: an unreferenced hs.timer can be collected mid-poll.
+  M.selStart = hs.timer.doAfter(poll, function()
+    M.selStart = nil
     hs.eventtap.keyStroke({ "cmd" }, "c", 0)
     local waited = 0
-    local timer
-    timer = hs.timer.doEvery(poll, function()
+    M.selPoll = hs.timer.doEvery(poll, function()
       waited = waited + poll
       local landed = hs.pasteboard.changeCount() ~= before
       if not landed and waited < timeout then return end
-      timer:stop()
+      M.selPoll:stop(); M.selPoll = nil
+      M.selecting = false
 
       local text = core.selectionText(landed and hs.pasteboard.getContents() or nil, landed)
       restore()
