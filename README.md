@@ -24,9 +24,11 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 
 ### One menu-bar button
 
-All apps share a single 🔨 menu-bar item (`lib/menuhub.lua`). Each app is a row
-showing its live status, with its own menu as a submenu. A new app gets a row, not a
-new icon:
+All apps share a single 🔨 menu-bar item (`lib/menuhub.lua`). Clicking it opens a
+Control Center-style panel (`lib/menuhub_panel.html`): one tile per app with its live
+icon and status, in light and dark mode. A tile opens that app's menu in the same
+design: grouped lists, ✓ pickers, drill-in submenus, and actions that run in place.
+Option-click 🔨 for the plain dropdown. A new app gets a tile, not a new icon:
 
 ```lua
 M.menu = require("lib.menuhub").item("My app")   -- instead of hs.menubar.new()
