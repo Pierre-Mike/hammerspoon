@@ -66,3 +66,114 @@ describe("menuhub.item", function()
     assert.equals("B", hub.entries[1].name)
   end)
 end)
+
+describe("menuhub.statusOf", function()
+  it("drops a prefix that repeats the app name", function()
+    assert.equals("Ready, microphone off", hub.statusOf("Voice agent", "Voice agent: ready, microphone off\nmodel: x"))
+    assert.equals("Parakeet · 0.6b", hub.statusOf("Dictation", "Dictate · parakeet · 0.6b"))
+  end)
+
+  it("keeps a prefix that is its own label", function()
+    assert.equals("Headset: live", hub.statusOf("Shokz mute", "Headset: live\nTeams: connected"))
+  end)
+
+  it("returns nil without a tooltip", function()
+    assert.is_nil(hub.statusOf("Noise", nil))
+    assert.is_nil(hub.statusOf("Noise", ""))
+  end)
+end)
+
+describe("menuhub.tiles", function()
+  it("prefers the title glyph, falls back to the encoded icon", function()
+    local t = hub.tiles({
+      { name = "Noise", title = "🟤", click = function() end },
+      { name = "Dictation", title = "", icon = "IMG", menu = {} },
+      { name = "Idle" },
+    }, function(img) return "data:" .. img end)
+    assert.same({ "🟤", nil, "click" }, { t[1].glyph, t[1].image, t[1].kind })
+    assert.same({ nil, "data:IMG", "menu" }, { t[2].glyph, t[2].image, t[2].kind })
+    assert.equals("none", t[3].kind)
+    assert.equals(3, t[3].index)
+  end)
+end)
+
+describe("menuhub.items", function()
+  it("classifies each kind of menu row", function()
+    local rows = hub.items({
+      { title = "Touches today: 3", disabled = true },
+      { title = "-" },
+      { title = "Stop watching", fn = function() end },
+      { title = "Tight", checked = true, fn = function() end },
+      { title = "Loose", checked = false, fn = function() end },
+      { title = "Voice", menu = {} },
+      { title = "Later", fn = function() end, disabled = true },
+    })
+    local kinds = {}
+    for _, r in ipairs(rows) do kinds[#kinds + 1] = r.kind end
+    assert.same({ "info", "sep", "act", "check", "check", "sub", "act" }, kinds)
+    assert.is_true(rows[4].checked)
+    assert.is_false(rows[5].checked)
+    assert.is_true(rows[7].disabled)
+    assert.is_nil(rows[1].disabled)
+  end)
+end)
+
+describe("menuhub.resolve / model", function()
+  local entry = { name = "TTS", menu = function()
+    return { { title = "Stop", fn = function() end },
+             { title = "Default voice", menu = { { title = "alba", checked = true, fn = function() end } } } }
+  end }
+
+  it("walks into a submenu and names the path", function()
+    local menu, crumbs = hub.resolve(entry, { 2 })
+    assert.equals("alba", menu[1].title)
+    assert.same({ "Default voice" }, crumbs)
+  end)
+
+  it("returns nil for a path the app no longer has", function()
+    assert.is_nil(hub.resolve(entry, { 1 }))
+    assert.is_nil(hub.resolve(entry, { 9 }))
+  end)
+
+  it("builds a detail model whose back button names the level above", function()
+    local m = hub.model({ entry }, { entry = entry, path = { 2 } })
+    assert.equals("detail", m.view)
+    assert.equals("Default voice", m.title)
+    assert.same({ "TTS" }, m.crumbs)
+    assert.equals(2, m.depth)
+    local top = hub.model({ entry }, { entry = entry, path = {} })
+    assert.same({}, top.crumbs)
+    assert.equals("Stop", top.items[1].title)
+  end)
+
+  it("falls back to the grid when the viewed app is gone", function()
+    local m = hub.model({}, { entry = entry, path = {} })
+    assert.equals("home", m.view)
+  end)
+end)
+
+describe("menuhub.items hand-drawn ticks", function()
+  local fn = function() end
+
+  it("turns a ✓/space-padded run into check rows", function()
+    local rows = hub.items({
+      { title = "Nose zone", disabled = true },
+      { title = "    Tight (13 mm)", fn = fn },
+      { title = "  ✓ Medium (17 mm)", fn = fn },
+      { title = "-" },
+      { title = "Test flash", fn = fn },
+    })
+    assert.same({ "check", "Tight (13 mm)", false }, { rows[2].kind, rows[2].title, rows[2].checked })
+    assert.same({ "check", "Medium (17 mm)", true }, { rows[3].kind, rows[3].title, rows[3].checked })
+    assert.equals("act", rows[5].kind)
+  end)
+
+  it("leaves unpadded neighbours of a lone tick as actions", function()
+    local rows = hub.items({
+      { title = "✓ Log detection detail", fn = fn },
+      { title = "Test flash", fn = fn },
+    })
+    assert.same({ "check", true }, { rows[1].kind, rows[1].checked })
+    assert.equals("act", rows[2].kind)
+  end)
+end)

@@ -1,0 +1,255 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --card: rgba(246, 246, 248, 0.95);
+    --edge: rgba(0, 0, 0, 0.10);
+    --tile: rgba(255, 255, 255, 0.80);
+    --tile-hover: rgba(255, 255, 255, 1);
+    --disc: rgba(0, 0, 0, 0.06);
+    --rule: rgba(0, 0, 0, 0.08);
+    --text: #1d1d1f;
+    --muted: #6e6e73;
+    --accent: #007aff;
+    --pill: rgba(0, 0, 0, 0.06);
+    --pill-hover: rgba(0, 0, 0, 0.11);
+    --glyph-filter: none;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --card: rgba(36, 36, 38, 0.95);
+      --edge: rgba(255, 255, 255, 0.12);
+      --tile: rgba(255, 255, 255, 0.07);
+      --tile-hover: rgba(255, 255, 255, 0.13);
+      --disc: rgba(255, 255, 255, 0.10);
+      --rule: rgba(255, 255, 255, 0.08);
+      --text: #f5f5f7;
+      --muted: #98989d;
+      --accent: #0a84ff;
+      --pill: rgba(255, 255, 255, 0.08);
+      --pill-hover: rgba(255, 255, 255, 0.15);
+      --glyph-filter: invert(1);
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: transparent; overflow: hidden; height: 100%; }
+  body {
+    font: 13px/1.25 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    color: var(--text);
+    -webkit-user-select: none;
+    cursor: default;
+  }
+  .card {
+    margin: 1px;
+    max-height: calc(100vh - 2px);
+    display: flex; flex-direction: column;
+    padding: 14px;
+    border-radius: 18px;
+    background: var(--card);
+    border: 0.5px solid var(--edge);
+  }
+  .scroll { overflow-y: auto; overflow-x: hidden; min-height: 0; flex: 1; margin: 0 -4px; padding: 0 4px; }
+  .scroll::-webkit-scrollbar { width: 0; height: 0; }
+
+  header { display: flex; align-items: center; gap: 10px; padding: 0 4px 12px; min-height: 22px; }
+  header h1 { font-size: 13px; font-weight: 600; letter-spacing: -0.01em; flex: 1; }
+  header .meta { font-size: 11px; color: var(--muted); }
+  .back {
+    border: 0; background: none; padding: 0 2px 0 0;
+    color: var(--accent); font: 500 13px -apple-system, sans-serif;
+  }
+  .back:hover { opacity: .75; }
+  .hero { display: flex; align-items: center; gap: 12px; padding: 0 4px 14px; }
+  .hero .disc { width: 42px; height: 42px; font-size: 21px; }
+  .hero .disc img { width: 22px; height: 22px; }
+  .hero .name { font-size: 15px; }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .tile {
+    display: flex; align-items: center; gap: 10px;
+    height: 58px; padding: 0 10px;
+    border-radius: 14px;
+    background: var(--tile);
+    transition: background .12s, transform .08s;
+    min-width: 0;
+  }
+  .tile:hover { background: var(--tile-hover); }
+  .tile:active { transform: scale(0.97); }
+  .tile.off { opacity: .45; pointer-events: none; }
+  .disc {
+    flex: none; width: 34px; height: 34px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--disc); font-size: 17px;
+  }
+  .disc img { width: 18px; height: 18px; filter: var(--glyph-filter); }
+  .disc b { font-size: 14px; font-weight: 600; }
+  .disc.multi { font-size: 11px; letter-spacing: -1px; }
+  .hero .disc.multi { font-size: 14px; }
+  .label { min-width: 0; flex: 1; }
+  .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .status {
+    margin-top: 2px; font-size: 11px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .chev { flex: none; color: var(--muted); font-size: 15px; opacity: .6; }
+
+  /* Detail view: an app's menu as grouped lists. */
+  .group { background: var(--tile); border-radius: 12px; overflow: hidden; }
+  .group + .group, .caption + .group { margin-top: 10px; }
+  .caption {
+    margin: 12px 10px 5px; font-size: 11px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .03em;
+  }
+  .caption:first-child { margin-top: 0; }
+  .row {
+    display: flex; align-items: center; gap: 8px;
+    min-height: 34px; padding: 7px 12px;
+    position: relative;
+  }
+  .row + .row::before {
+    content: ""; position: absolute; top: 0; left: 12px; right: 0;
+    border-top: 0.5px solid var(--rule);
+  }
+  .row .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row.act:hover, .row.sub:hover, .row.check:hover { background: var(--tile-hover); }
+  .row.act:active, .row.sub:active, .row.check:active { opacity: .7; }
+  .row.act .t { color: var(--accent); }
+  .row.info .t { color: var(--muted); }
+  .row.dim { opacity: .45; pointer-events: none; }
+  .row .tick { flex: none; width: 16px; font-size: 14px; color: var(--accent); font-weight: 600; text-align: center; }
+
+  footer { display: flex; gap: 8px; padding-top: 12px; }
+  footer button {
+    flex: 1; height: 28px; border: 0; border-radius: 8px;
+    font: 500 12px -apple-system, sans-serif; color: var(--text);
+    background: var(--pill);
+  }
+  footer button:hover { background: var(--pill-hover); }
+
+  .view { animation: in .16s ease-out; }
+  .view.back-in { animation-name: back; }
+  @keyframes in   { from { opacity: 0; transform: translateX(14px); } }
+  @keyframes back { from { opacity: 0; transform: translateX(-14px); } }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <header id="header"></header>
+  <div class="scroll" id="scroll"></div>
+  <footer>
+    <button data-cmd="reload">Reload</button>
+    <button data-cmd="console">Console</button>
+  </footer>
+</div>
+<script>
+  const send = (m) => window.webkit.messageHandlers.hub.postMessage(m);
+  const el = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  };
+  let lastKey = null, lastDepth = 0;
+
+  function disc(t) {
+    const d = el("div", "disc");
+    if (t.glyph) {
+      d.textContent = t.glyph;
+      if ([...new Intl.Segmenter().segment(t.glyph)].length > 1) d.classList.add("multi");
+    }
+    else if (t.image) { const i = new Image(); i.src = t.image; d.appendChild(i); }
+    else d.appendChild(el("b", null, t.name.charAt(0)));
+    return d;
+  }
+
+  function label(t) {
+    const l = el("div", "label");
+    l.appendChild(el("div", "name", t.name));
+    if (t.status) l.appendChild(el("div", "status", t.status));
+    return l;
+  }
+
+  function home(m, header, body) {
+    header.appendChild(el("h1", null, "Hammerspoon"));
+    header.appendChild(el("span", "meta", m.tiles.length + (m.tiles.length === 1 ? " app" : " apps")));
+    const grid = el("div", "grid");
+    for (const t of m.tiles) {
+      const tile = el("div", "tile" + (t.kind === "none" ? " off" : ""));
+      if (t.tooltip) tile.title = t.tooltip;
+      tile.appendChild(disc(t));
+      tile.appendChild(label(t));
+      if (t.kind === "menu") tile.appendChild(el("div", "chev", "›"));
+      tile.addEventListener("click", () => send({ cmd: "open", index: t.index }));
+      grid.appendChild(tile);
+    }
+    body.appendChild(grid);
+  }
+
+  // Menu items arrive flat; separators split them into rounded groups and a
+  // disabled item with no action heads the group that follows it.
+  function detail(m, header, body) {
+    const back = el("button", "back", "‹ " + (m.crumbs.length ? m.crumbs[m.crumbs.length - 1] : "All apps"));
+    back.addEventListener("click", () => send({ cmd: "back" }));
+    header.appendChild(back);
+
+    if (!m.crumbs.length) {
+      const hero = el("div", "hero");
+      hero.appendChild(disc(m.app));
+      hero.appendChild(label(m.app));
+      body.appendChild(hero);
+    } else {
+      body.appendChild(el("div", "caption", m.title));
+    }
+
+    let group = null;
+    const flush = () => { group = null; };
+    const ensure = () => { if (!group) { group = el("div", "group"); body.appendChild(group); } return group; };
+    m.items.forEach((it, i) => {
+      if (it.kind === "sep") { flush(); return; }
+      const next = m.items[i + 1];
+      if (it.kind === "info" && (!group || !group.childElementCount) && next && next.kind !== "sep" && next.kind !== "info") {
+        flush(); body.appendChild(el("div", "caption", it.title)); return;
+      }
+      const row = el("div", "row " + it.kind + (it.disabled ? " dim" : ""));
+      row.appendChild(el("span", "t", it.title));
+      if (it.kind === "check") row.appendChild(el("span", "tick", it.checked ? "✓" : ""));
+      if (it.kind === "sub") row.appendChild(el("span", "chev", "›"));
+      if (it.kind !== "info") row.addEventListener("click", () => send({ cmd: "item", i: it.i }));
+      ensure().appendChild(row);
+    });
+  }
+
+  function render(m) {
+    const header = document.getElementById("header");
+    const scroll = document.getElementById("scroll");
+    const key = m.view === "home" ? "home" : m.app.name + "/" + m.depth + "/" + (m.title || "");
+    const moved = key !== lastKey;
+    const top = scroll.scrollTop;
+
+    header.replaceChildren();
+    const body = el("div", "view" + (moved && lastKey && m.depth < lastDepth ? " back-in" : ""));
+    if (!moved) body.style.animation = "none";
+    (m.view === "home" ? home : detail)(m, header, body);
+    scroll.replaceChildren(body);
+    scroll.scrollTop = moved ? 0 : top;
+    lastKey = key; lastDepth = m.depth;
+
+    // Report the natural height so the window fits; the card scrolls past the cap.
+    const card = document.getElementById("card");
+    card.style.maxHeight = "none";
+    const h = Math.ceil(card.getBoundingClientRect().height) + 2;
+    card.style.maxHeight = "";
+    send({ cmd: "size", h });
+  }
+
+  document.querySelectorAll("footer button").forEach((b) =>
+    b.addEventListener("click", () => send({ cmd: b.dataset.cmd })));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") send({ cmd: lastKey === "home" ? "close" : "back" });
+  });
+  send({ cmd: "ready" });
+</script>
+</body>
+</html>
