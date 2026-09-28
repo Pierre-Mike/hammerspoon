@@ -64,7 +64,7 @@ local function logf(fmt, ...) utils.logf(LOG, fmt, ...) end
 -- ── Runtime state ──────────────────────────────────────────────────────────
 local state        = teams.initialState()
 local headsetMuted = nil
-local sock, logTask, bar
+local sock, logTask, logRestart, bar
 local retry, retryTimer, ackTimer = RETRY_MIN, nil, nil
 local reqId, buf = 0, ""
 
@@ -234,12 +234,19 @@ end
 startLogStream = function()
   if not M.enabled then return end
   if logTask and logTask:isRunning() then return end
-  logTask = hs.task.new("/usr/bin/log", function(code)
+  -- The exit callback checks it is still the current task: stop() terminates
+  -- and forgets the task at once, but its callback fires later, and a pause and
+  -- resume in between would otherwise clear the NEW task and schedule a third.
+  -- Two live streams would decode every press twice and toggle Teams twice.
+  local task
+  task = hs.task.new("/usr/bin/log", function(code)
+    if logTask ~= task then return end
     logTask = nil
     if not M.enabled then return end
     logf("log stream exited (%s); restarting in 5s", tostring(code))
-    hs.timer.doAfter(5, startLogStream)
+    logRestart = hs.timer.doAfter(5, function() logRestart = nil; startLogStream() end)
   end, onStream, hfp.logArgs())
+  logTask = task
   logTask:start()
   logf("watching bluetoothd for mic gain events")
 end
@@ -252,9 +259,9 @@ end
 -- keystroke backend cannot read Teams' mute back, so drift is possible).
 local function flipTeams()
   local backend = teams.chooseBackend(M.backend, sock ~= nil)
-  logf("manual flip of Teams mute via %s", backend)
-  if backend == "api" then sendAction("toggle-mute")
-  elseif backend == "keys" then sendKeystroke(headsetMuted) end
+  if backend ~= "keys" then return end
+  logf("manual flip of Teams mute via keystroke")
+  sendKeystroke(headsetMuted)
 end
 
 -- Only offered while disconnected: closing a live socket would fire its own
@@ -287,8 +294,11 @@ buildMenu = function()
         or "not connected"), disabled = true },
     { title = "Sending via: " .. live, disabled = true },
     { title = "-" },
+    -- Keystrokes only: they cannot read Teams back, so they can drift. The API
+    -- path reconciles by itself, and a manual toggle there would race the
+    -- reducer's own (acks carry no request id to tell them apart).
     { title = "Flip Teams mute once", fn = flipTeams,
-      disabled = (not M.enabled) or live == "none" },
+      disabled = (not M.enabled) or live ~= "keys" },
     { title = connected and "Connected to Teams" or (sock and "Connecting to Teams…")
         or "Reconnect to Teams", fn = reconnect,
       disabled = sock ~= nil or not M.enabled },
@@ -315,6 +325,7 @@ function M.stop(keepMenu)
   if retryTimer then retryTimer:stop(); retryTimer = nil end
   if ackTimer then ackTimer:stop(); ackTimer = nil end
   if sock then pcall(function() sock:close() end); sock = nil end
+  if logRestart then logRestart:stop(); logRestart = nil end
   if logTask then pcall(function() logTask:terminate() end); logTask = nil end
   if keepMenu then
     render()
