@@ -177,3 +177,19 @@ describe("menuhub.items hand-drawn ticks", function()
     assert.equals("act", rows[2].kind)
   end)
 end)
+
+describe("menuhub.items switch and slider", function()
+  it("reads a switch row and a clamped slider row", function()
+    local rows = hub.items({
+      { title = "Play", switch = true, checked = true, fn = function() end },
+      { title = "Volume", slider = { value = 140, min = 0, max = 100, unit = "%", fn = function() end } },
+    })
+    assert.same({ "switch", true }, { rows[1].kind, rows[1].checked })
+    assert.same({ "slider", 100, 0, 100, 1, "%" },
+      { rows[2].kind, rows[2].value, rows[2].min, rows[2].max, rows[2].step, rows[2].unit })
+  end)
+
+  it("treats a switch without an action as info", function()
+    assert.equals("info", hub.items({ { title = "Play", switch = true } })[1].kind)
+  end)
+end)

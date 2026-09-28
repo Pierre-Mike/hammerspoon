@@ -17,7 +17,7 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 | App | What it does |
 |-----|--------------|
 | `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+A` routes the transcript to a zellij `Orchestrator` session instead of pasting; `Fn+C` cancels & recalls the last result. Menu-bar picker switches speech models. |
-| `apps/brown_noise` | Menu-bar noise machine: play/stop, volume, and color (white/pink/brown/blue/violet). |
+| `apps/brown_noise` | Noise machine in the hub: a Play switch, volume slider, and color picker (white/pink/brown/blue/violet). |
 | `apps/volume_tap` | Voice control for the Orchestrator via volume-key taps. |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
@@ -27,7 +27,8 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 All apps share a single 🔨 menu-bar item (`lib/menuhub.lua`). Clicking it opens a
 Control Center-style panel (`lib/menuhub_panel.html`): one tile per app with its live
 icon and status, in light and dark mode. A tile opens that app's menu in the same
-design: grouped lists, ✓ pickers, drill-in submenus, and actions that run in place.
+design: grouped lists, ✓ pickers, switches, sliders, drill-in submenus, and actions
+that run in place.
 Option-click 🔨 for the plain dropdown. A new app gets a tile, not a new icon:
 
 ```lua
