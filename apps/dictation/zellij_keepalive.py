@@ -40,8 +40,11 @@ def main() -> None:
     if pid == 0:
         # Child: become the zellij client. `attach` (no -c) so we never spawn a
         # session the user didn't create — just ride an existing one.
-        os.execv(ZELLIJ, [ZELLIJ, "attach", SESSION])
-        os._exit(127)  # unreachable unless execv fails
+        try:
+            os.execv(ZELLIJ, [ZELLIJ, "attach", SESSION])
+        except OSError as e:  # execv raises rather than returning on failure
+            os.write(2, f"keepalive: cannot run {ZELLIJ}: {e}\n".encode())
+        os._exit(127)
 
     # Parent: size the pty large, then drain output forever to hold the client.
     try:
@@ -54,7 +57,11 @@ def main() -> None:
                 break  # client exited: session gone or detached
         except OSError:
             break
-    os._exit(0)
+    # Exit with the client's own status so Hammerspoon's exit callback can tell
+    # "session ended" (0) from "zellij never started" (127) and log the latter.
+    _, status = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(status)
+    os._exit(code if code >= 0 else 128 - code)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ local DEFAULT_ROUTE = configFile.VOICE_TARGET_DEFAULT or "orchestrator"
 local PYTHON3   = "/usr/bin/python3"
 local KEEPALIVE = os.getenv("HOME") .. "/.hammerspoon/apps/dictation/zellij_keepalive.py"
 local KEEPALIVE_CHECK = 20   -- seconds between "is a client still attached?" re-checks
+local KEEPALIVE_ATTACH_WAIT = 0.6  -- seconds a just-launched client gets to attach before a send
 
 -- M.route is the destination armed for the CURRENT take: nil = paste at cursor,
 -- otherwise a VOICE_TARGETS key. Cleared after every finished transcript.
@@ -407,21 +408,27 @@ end
 -- callback clears the handle and the periodic watchdog (see init) respawns it,
 -- e.g. after the session is restarted. Session, binary and environment all come
 -- from lib/voice_targets, like every other transport detail.
-M.keepalives = {}   -- zellij session name -> hs.task
+M.keepalives = {}         -- zellij session name -> hs.task
+M.keepaliveLastCode = {}  -- zellij session name -> last exit code (log de-dup)
 
+-- Returns true when it had to (re)launch the client just now.
 local function ensureClient(target)
-  if not target or target.transport ~= "zellij" or not target.session then return end
+  if not target or target.transport ~= "zellij" or not target.session then return false end
   local session = target.session
   local running = M.keepalives[session]
-  if running and running:isRunning() then return end
+  if running and running:isRunning() then return false end
   local args = { KEEPALIVE, session }
   local bin = voiceTargets.binary(configFile, target)
   if bin then args[#args + 1] = bin end
   local task
   task = hs.task.new(PYTHON3, function(code, _, err)
-    if code ~= 0 and err and err ~= "" then
-      logf("[keepalive] %s exited code=%d err=%s", session, code, tostring(err))
+    -- 127: zellij itself could not be started (bad binary in VOICE_TRANSPORTS).
+    -- Logged once per change: the watchdog retries every KEEPALIVE_CHECK, and a
+    -- session that is simply not running would otherwise log every time.
+    if code ~= 0 and M.keepaliveLastCode[session] ~= code then
+      logf("[keepalive] %s exited code=%d err=%s", session, code, tostring(err or ""))
     end
+    M.keepaliveLastCode[session] = code
     if M.keepalives[session] == task then M.keepalives[session] = nil end
   end, args)
   local env = voiceTargets.environment(configFile, target)
@@ -429,6 +436,7 @@ local function ensureClient(target)
   M.keepalives[session] = task
   task:start()
   logf("[keepalive] launched client for %s", session)
+  return true
 end
 
 local function ensureSupervisorClients()
@@ -469,8 +477,10 @@ local function sendToTarget(routeKey, text)
   if not steps then return end
   local clean = voiceTargets.normalize(text)
   -- Final guard: make sure a zellij target has a client attached before we
-  -- write (idempotent — a no-op while its keepalive is up, as it normally is).
-  ensureClient(target)
+  -- write (a no-op while its keepalive is up, as it normally is). A client
+  -- launched just now needs a moment to attach, and zellij reports success on
+  -- a write it drops, so give it that moment before the first step.
+  local freshClient = ensureClient(target)
 
   -- Run steps[i…] in order. Each step's completion callback starts the next, so
   -- the sequence is serialised without blocking Hammerspoon's main loop.
@@ -499,7 +509,13 @@ local function sendToTarget(routeKey, text)
     if step.stdin then task:setInput(step.stdin) end
     task:start()
   end
-  runStep(1)
+  if freshClient then
+    M.attachWait = hs.timer.doAfter(KEEPALIVE_ATTACH_WAIT, function()
+      M.attachWait = nil; runStep(1)
+    end)
+  else
+    runStep(1)
+  end
 
   logf("[supervisor] voice → %s (%s %s, %d steps) len=%d preview=%q",
        target.label, target.transport, target.address, #steps, #clean, clean:sub(1, 60))
