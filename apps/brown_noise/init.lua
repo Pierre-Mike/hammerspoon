@@ -18,7 +18,7 @@ local B = { playing = false, sound = nil, volume = 0.4, color = COLORS[1].id, pa
 local ICON_OFF = "🟤"   -- stopped
 local ICON_ON  = "🔊"   -- playing
 
-B.menu = hs.menubar.new()
+B.menu = require("lib.menuhub").item("Noise")
 
 local function fileFor(id) return DIR .. "noise_" .. id .. ".wav" end
 

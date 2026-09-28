@@ -22,6 +22,18 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
 
+### One menu-bar button
+
+All apps share a single 🔨 menu-bar item (`lib/menuhub.lua`). Each app is a row
+showing its live status, with its own menu as a submenu. A new app gets a row, not a
+new icon:
+
+```lua
+M.menu = require("lib.menuhub").item("My app")   -- instead of hs.menubar.new()
+M.menu:setTitle("✅")                             -- same setTitle/setIcon/setMenu/
+M.menu:setMenu(function() return { ... } end)     -- setTooltip/setClickCallback API
+```
+
 ## Assets not in git
 
 Large binaries are `.gitignore`d (see `.gitignore`) — they live on disk but aren't versioned:

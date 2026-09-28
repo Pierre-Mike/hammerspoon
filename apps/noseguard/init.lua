@@ -209,7 +209,7 @@ hs.shutdownCallback = function()
 end
 
 -- ── init ───────────────────────────────────────────────────────────────────
-M.menu = hs.menubar.new()
+M.menu = require("lib.menuhub").item("NoseGuard")
 updateMenu()
 -- start OFF; user toggles from the 👃 menu (camera permission prompt fires then)
 
