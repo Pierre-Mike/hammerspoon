@@ -32,6 +32,15 @@ local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button relea
 -- voice_targets refuses to route into firstmate's shared crewmate zellij session
 -- or at an ambient tmux target, so dictation can't land in a worker's prompt.
 local DEFAULT_ROUTE = configFile.VOICE_TARGET_DEFAULT or "orchestrator"
+-- Keepalive: a headless zellij client kept attached to each zellij voice target
+-- so `zellij action write-chars` always has a client to route keystrokes to.
+-- zellij 0.44 silently DROPS writes to a session with zero attached clients —
+-- which is why sends only worked while the Orchestrator was the session on
+-- screen. tmux has no such rule, so tmux targets get no keepalive.
+local PYTHON3   = "/usr/bin/python3"
+local KEEPALIVE = os.getenv("HOME") .. "/.hammerspoon/apps/dictation/zellij_keepalive.py"
+local KEEPALIVE_CHECK = 20   -- seconds between "is a client still attached?" re-checks
+local KEEPALIVE_ATTACH_WAIT = 0.6  -- seconds a just-launched client gets to attach before a send
 
 -- M.route is the destination armed for the CURRENT take: nil = paste at cursor,
 -- otherwise a VOICE_TARGETS key. Cleared after every finished transcript.
@@ -391,6 +400,51 @@ local function paste(text)
   hs.eventtap.keyStroke({"cmd"}, "v", 0)
 end
 
+-- ── zellij keepalive ─────────────────────────────────────────────────────────
+-- Hold a headless zellij client attached to every zellij voice target so
+-- write-chars/write always have a client to land on. zellij_keepalive.py
+-- attaches an OVERSIZED client; zellij sizes a shared session to its smallest
+-- client, so it never shrinks the user's own view. Self-healing: the exit
+-- callback clears the handle and the periodic watchdog (see init) respawns it,
+-- e.g. after the session is restarted. Session, binary and environment all come
+-- from lib/voice_targets, like every other transport detail.
+M.keepalives = {}         -- zellij session name -> hs.task
+M.keepaliveLastCode = {}  -- zellij session name -> last exit code (log de-dup)
+
+-- Returns true when it had to (re)launch the client just now.
+local function ensureClient(target)
+  if not target or target.transport ~= "zellij" or not target.session then return false end
+  local session = target.session
+  local running = M.keepalives[session]
+  if running and running:isRunning() then return false end
+  local args = { KEEPALIVE, session }
+  local bin = voiceTargets.binary(configFile, target)
+  if bin then args[#args + 1] = bin end
+  local task
+  task = hs.task.new(PYTHON3, function(code, _, err)
+    -- 127: zellij itself could not be started (bad binary in VOICE_TRANSPORTS).
+    -- Logged once per change: the watchdog retries every KEEPALIVE_CHECK, and a
+    -- session that is simply not running would otherwise log every time.
+    if code ~= 0 and M.keepaliveLastCode[session] ~= code then
+      logf("[keepalive] %s exited code=%d err=%s", session, code, tostring(err or ""))
+    end
+    M.keepaliveLastCode[session] = code
+    if M.keepalives[session] == task then M.keepalives[session] = nil end
+  end, args)
+  local env = voiceTargets.environment(configFile, target)
+  if env then task:setEnvironment(env) end
+  M.keepalives[session] = task
+  task:start()
+  logf("[keepalive] launched client for %s", session)
+  return true
+end
+
+local function ensureSupervisorClients()
+  for _, key in ipairs(voiceTargets.routeKeys(configFile)) do
+    ensureClient((voiceTargets.resolve(configFile, key)))
+  end
+end
+
 -- Deliver the transcript straight into a supervisor's terminal pane, then submit.
 -- Skips the event queue: text appears in the Claude Code prompt and submits.
 --
@@ -422,6 +476,11 @@ local function sendToTarget(routeKey, text)
   local steps = voiceTargets.deliverySteps(configFile, target, text)
   if not steps then return end
   local clean = voiceTargets.normalize(text)
+  -- Final guard: make sure a zellij target has a client attached before we
+  -- write (a no-op while its keepalive is up, as it normally is). A client
+  -- launched just now needs a moment to attach, and zellij reports success on
+  -- a write it drops, so give it that moment before the first step.
+  local freshClient = ensureClient(target)
 
   -- Run steps[i…] in order. Each step's completion callback starts the next, so
   -- the sequence is serialised without blocking Hammerspoon's main loop.
@@ -450,7 +509,13 @@ local function sendToTarget(routeKey, text)
     if step.stdin then task:setInput(step.stdin) end
     task:start()
   end
-  runStep(1)
+  if freshClient then
+    M.attachWait = hs.timer.doAfter(KEEPALIVE_ATTACH_WAIT, function()
+      M.attachWait = nil; runStep(1)
+    end)
+  else
+    runStep(1)
+  end
 
   logf("[supervisor] voice → %s (%s %s, %d steps) len=%d preview=%q",
        target.label, target.transport, target.address, #steps, #clean, clean:sub(1, 60))
@@ -562,6 +627,10 @@ local function startRecording()
   -- is non-blocking, so this adds no measurable latency to mic capture.
   playEarcon("start")
   os.remove(WAV); os.remove(RAW)
+  -- Pre-warm the zellij clients: if a keepalive is down (e.g. the session was
+  -- just restarted), relaunch it now so a client is attached by the time this
+  -- recording finishes and (maybe) routes there. Idempotent.
+  ensureSupervisorClients()
   M.recording = true
   M.qwenFinish = false
   M.startedAt = hs.timer.secondsSinceEpoch()
@@ -683,6 +752,15 @@ killStale:start()
 local killStaleFfmpeg = hs.task.new("/bin/sh", nil,
   {"-c", "pkill -f 'ffmpeg .*hs-dictate[.]wav' 2>/dev/null; true"})
 killStaleFfmpeg:start()
+
+-- Reap a keepalive client orphaned by a previous HS session, then start a fresh
+-- one. The watchdog re-checks every KEEPALIVE_CHECK seconds and respawns it if
+-- the client ever drops (Orchestrator restarted, session killed, etc.), so a
+-- client is essentially always attached and sends never silently vanish.
+local killStaleKeepalive = hs.task.new("/bin/sh", function() ensureSupervisorClients() end,
+  {"-c", "pkill -f zellij_keepalive[.]py 2>/dev/null; true"})
+killStaleKeepalive:start()
+M.keepaliveTimer = hs.timer.doEvery(KEEPALIVE_CHECK, ensureSupervisorClients)
 
 -- Relaunch the warm server against M.serverModelPath. Frees :8765 first so the new
 -- model loads cleanly into a fresh process (the previous worker held the GPU).
