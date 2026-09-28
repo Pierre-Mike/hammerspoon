@@ -316,10 +316,14 @@ local function launchServer(inst)
   -- without it terminate() kills the shell and leaves Python holding the port.
   local cmd = string.format("mkdir -p %q && exec %q %q >> %q 2>&1",
     inst.out, cfg.POCKET_TTS_PY, cfg.POCKET_TTS_SERVER, inst.log)
-  M[inst.key] = hs.task.new("/bin/sh", function(code, _out, err)
+  -- Only clear the handle if it is still ours: a restart terminates the old
+  -- server, whose callback lands after the new one is stored here.
+  local task
+  task = hs.task.new("/bin/sh", function(code, _out, err)
     logf("[tts] %s server exited code=%s err=%s", inst.name, tostring(code), tostring(err))
-    M[inst.key] = nil
+    if M[inst.key] == task then M[inst.key] = nil end
   end, { "-c", cmd })
+  M[inst.key] = task
   M[inst.key]:setEnvironment({
     HOME = os.getenv("HOME"),
     PATH = "/opt/homebrew/bin:/usr/bin:/bin",
@@ -341,6 +345,8 @@ end
 -- time it posts a chunk of text to be spoken — the same pattern took Hammerspoon
 -- down from apps/voice_agent before it was fixed there.
 local function restartOne(inst)
+  local pending = M.killTasks[inst.key]
+  if pending and pending:isRunning() then return end   -- a restart is already underway
   if M[inst.key] then M[inst.key]:terminate(); M[inst.key] = nil end
   local killCmd = string.format(
     "lsof -tiTCP:%d -sTCP:LISTEN | grep -vx %d | xargs kill -9 2>/dev/null; true",
