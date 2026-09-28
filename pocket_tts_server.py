@@ -83,6 +83,26 @@ def _voice_state(voice):
     return st
 
 
+def _patch_wav_sizes(path):
+    """Rewrite the RIFF and data chunk lengths to match what is on disk.
+
+    stream_audio_chunks writes the header before it knows how much audio there
+    is and stamps a 2GB placeholder it never goes back to fix. afplay reads to
+    EOF so it never noticed, but anything that trusts the header — ffmpeg, and
+    parakeet-mlx through it — waits forever for audio that is not coming.
+    """
+    size = os.path.getsize(path)
+    with open(path, "r+b") as f:
+        idx = f.read(4096).find(b"data")
+        if idx < 0 or size < idx + 8:
+            log(f"warning: no data chunk found in {path}, header left as written")
+            return
+        f.seek(4)
+        f.write((size - 8).to_bytes(4, "little"))            # RIFF chunk size
+        f.seek(idx + 4)
+        f.write((size - idx - 8).to_bytes(4, "little"))      # data chunk size
+
+
 def synth(text, voice):
     """Synthesise text to a WAV file, return its path. Raises on failure."""
     model = _model["m"]
@@ -94,6 +114,7 @@ def synth(text, voice):
         _counter["n"] += 1
     path = os.path.join(OUT_DIR, f"hs-tts-{n}.wav")
     _helpers["stream_audio_chunks"](path, chunks, _model["sr"])   # writes the WAV
+    _patch_wav_sizes(path)
     return path
 
 
