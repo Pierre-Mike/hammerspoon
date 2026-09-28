@@ -4,7 +4,8 @@
 -- on each detected nose touch. We answer with a fullscreen red flash +
 -- alarm + a running counter. Works over any app — no focused browser tab.
 --
--- Menubar 👃 toggles the daemon on/off. Detection runs only while ON.
+-- The NoseGuard tile's Watching switch turns the daemon on/off; detection runs
+-- only while it is ON. The camera choice persists across reloads.
 
 local M = {
   task = nil,        -- hs.task running the python daemon
@@ -15,6 +16,7 @@ local M = {
   sens = 55,         -- 0..100 → nose-zone radius, passed to daemon as NG_SENS
   hold = 0.5,        -- seconds of sustained contact before alert
   camId = "",        -- AVFoundation uniqueID, passed as NG_CAM_ID ("" = auto/builtin)
+  camName = "",      -- its label, so a remembered camera names itself while away
   debug = false,     -- NG_DEBUG: daemon logs distance/ratio/speed once a second
 }
 
@@ -31,11 +33,20 @@ local LOG = "/tmp/hs-noseguard.log"
 -- Single source of truth: the daemon enumerates AVFoundation, we render its list.
 -- Selecting by uniqueID (not index) survives the iPhone Continuity Camera
 -- appearing/disappearing, which used to shift indices and pick the wrong device.
+-- `list` starts the daemon's python and imports AVFoundation, a few hundred ms
+-- each time, and the menu is rebuilt on every open and every redraw behind it.
+-- A few seconds of cache keeps a redraw during a flash cheap; a camera plugged
+-- in meanwhile shows up on the next open.
+local CAM_TTL = 5
+local camList, camListAt = {}, 0
+
 local function cameras()
+  if os.time() - camListAt < CAM_TTL then return camList end
   local out = hs.execute(PY .. " " .. SCRIPT .. " list 2>/dev/null")
   local ok, list = pcall(hs.json.decode, out or "")
-  if ok and type(list) == "table" then return list end
-  return {}
+  camList = (ok and type(list) == "table") and list or {}
+  camListAt = os.time()
+  return camList
 end
 
 local function logf(fmt, ...)
@@ -70,19 +81,37 @@ end
 -- ── Menubar ──────────────────────────────────────────────────────────────────
 local function isOn() return M.task ~= nil and M.task:isRunning() end
 
+-- The camera choice is remembered across reloads: the uniqueID the daemon wants,
+-- plus the name it had. An id that is no longer connected costs nothing — the
+-- daemon falls back to the built-in (pick_device) and picks the camera back up
+-- once it returns, so an iPhone that wanders off does not clear the choice.
+local CAM_ID_KEY, CAM_NAME_KEY = "noseguard.camId", "noseguard.camName"
+
 local function camMenu()
   local items = {
-    { title = (M.camId == "" and "✓ " or "   ") .. "Auto (built-in)",
+    { title = "Auto (built-in)", checked = M.camId == "",
       fn = function() M.setCam("") end },
     { title = "-" },
   }
+  local listed = false
   for _, c in ipairs(cameras()) do
     local tag = c.builtin and "" or " 📱"
     local off = (not c.connected) and " (offline)" or ""
+    if c.id == M.camId then listed = true end
     items[#items + 1] = {
-      title = (M.camId == c.id and "✓ " or "   ") .. c.name .. tag .. off,
+      title = c.name .. tag .. off,
+      checked = (M.camId == c.id),
       disabled = not c.connected,
-      fn = function() M.setCam(c.id) end,
+      fn = function() M.setCam(c.id, c.name) end,
+    }
+  end
+  -- Remembered camera that AVFoundation no longer enumerates at all (unplugged,
+  -- Continuity asleep): show it anyway, so the choice reads as itself instead of
+  -- looking like nothing is selected.
+  if M.camId ~= "" and not listed then
+    items[#items + 1] = {
+      title = (M.camName ~= "" and M.camName or "Remembered camera") .. " (not connected)",
+      checked = true, disabled = true, fn = function() end,
     }
   end
   return items
@@ -96,14 +125,24 @@ local function sensItem(label, v)
   }
 end
 
-local function updateMenu()
+-- Title and tile status only; the menu itself is a function (see buildMenu).
+local function refresh()
   if not M.menu then return end
   M.menu:setTitle(isOn() and "👃" or "👃💤")
-  M.menu:setMenu({
+  M.menu:setTooltip(string.format("%s · %d touch%s today",
+    isOn() and "Watching" or "Off", M.count, M.count == 1 and "" or "es"))
+end
+
+-- Built when the menu opens, not stored: listing cameras spawns the daemon's
+-- `list` helper, and a stored table would pay for that on every redraw —
+-- including once per nose touch, mid-flash.
+local function buildMenu()
+  return {
     { title = string.format("Touches today: %d", M.count), disabled = true },
     { title = "-" },
-    { title = isOn() and "Stop watching" or "Start watching", fn = function() M.toggle() end },
-    { title = "Reset count", fn = function() M.count = 0; updateMenu() end },
+    { title = "Watching", switch = true, checked = isOn(),
+      fn = function() M.toggle() end },
+    { title = "Reset count", fn = function() M.count = 0; refresh() end },
     { title = "-" },
     { title = "Nose zone", disabled = true },
     sensItem("Tight", 35),
@@ -116,7 +155,7 @@ local function updateMenu()
       fn = function() M.setDebug(not M.debug) end },
     { title = "Test flash", fn = flash },
     { title = "Open log", fn = function() hs.execute("open " .. LOG) end },
-  })
+  }
 end
 
 -- ── Daemon control ─────────────────────────────────────────────────────────
@@ -131,7 +170,7 @@ function M.start()
   M.task = hs.task.new(PY, function(code, _, err)
     logf("daemon exited code=%s err=%s", tostring(code), tostring(err))
     M.task = nil
-    updateMenu()
+    refresh()
   -- Stream the daemon's own output into the same log, so "Log detection detail"
   -- is actually readable from "Open log" instead of vanishing with the process.
   end, function(_, out, err)
@@ -150,14 +189,14 @@ function M.start()
   M.task:start()
   logf("daemon started sens=%d hold=%s debug=%s", M.sens, tostring(M.hold),
        tostring(M.debug))
-  updateMenu()
+  refresh()
 end
 
 function M.stop()
   if M.task then M.task:terminate(); M.task = nil end
   if M.canvas then M.canvas:delete(); M.canvas = nil end
   logf("daemon stopped")
-  updateMenu()
+  refresh()
 end
 
 function M.toggle()
@@ -171,19 +210,22 @@ end
 function M.setSens(v)
   M.sens = v
   restart()
-  updateMenu()
+  refresh()
 end
 
 function M.setDebug(v)
   M.debug = v
   restart()
-  updateMenu()
+  refresh()
 end
 
-function M.setCam(v)
-  M.camId = v
+function M.setCam(id, name)
+  M.camId = id or ""
+  M.camName = (M.camId ~= "" and name) or ""
+  hs.settings.set(CAM_ID_KEY, M.camId)
+  hs.settings.set(CAM_NAME_KEY, M.camName)
   restart()
-  updateMenu()
+  refresh()
 end
 
 -- ── urlevent from the daemon ─────────────────────────────────────────────────
@@ -192,7 +234,7 @@ hs.urlevent.bind("noseguard", function(_, params)
   if ev == "touch" then
     M.count = M.count + 1
     flash()
-    updateMenu()
+    refresh()
   elseif ev == "error" then
     hs.notify.new({ title = "Nose Guard", informativeText = "Camera unavailable" }):send()
     M.stop()
@@ -210,7 +252,10 @@ end
 
 -- ── init ───────────────────────────────────────────────────────────────────
 M.menu = require("lib.menuhub").item("NoseGuard")
-updateMenu()
--- start OFF; user toggles from the 👃 menu (camera permission prompt fires then)
+M.camId = hs.settings.get(CAM_ID_KEY) or ""
+M.camName = hs.settings.get(CAM_NAME_KEY) or ""
+M.menu:setMenu(buildMenu)
+refresh()
+-- start OFF; the Watching switch turns it on (camera permission prompt fires then)
 
 return M
