@@ -16,11 +16,11 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 
 | App | What it does |
 |-----|--------------|
-| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+A` routes the transcript to a zellij `Orchestrator` session instead of pasting; `Fn+C` cancels & recalls the last result. Menu-bar picker switches speech models. |
+| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+A` routes the transcript to a zellij `Orchestrator` session instead of pasting; `Fn+C` cancels & recalls the last result; `Fn+S` cancels and reads the current *selection* aloud through `apps/tts` instead. Menu-bar picker switches speech models. |
 | `apps/brown_noise` | Noise machine in the hub: a Play switch, volume slider, and color picker (white/pink/brown/blue/violet). |
 | `apps/volume_tap` | Voice control for the Orchestrator via volume-key taps. |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
-| `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
+| `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. `Fn+S` reads the current selection aloud. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
 
 ### One menu-bar button
 
@@ -74,6 +74,29 @@ curl -s     localhost:8790/voices            # profile → voice map
 hs -c 'speak("or straight from a shell")'
 open 'hammerspoon://speak?text=or%20via%20url&voice=marius'
 ```
+
+### Speak the selection — `Fn+S`
+
+Select text anywhere, press **Fn+S**, and it reads aloud. Same chord family as
+`Fn+A` / `Fn+C`: holding Fn opens the mic as usual, and `Fn+S` cancels that
+capture before handing the selection to the queue, so nothing is recorded.
+
+macOS has no API for "the current selection", so the chord copies it (⌘C), reads
+the pasteboard, and puts your clipboard back — including images and rich text.
+A copy only counts if the pasteboard's change count actually moves, so pressing
+`Fn+S` with nothing selected says *nothing selected* rather than re-reading
+whatever was already on your clipboard.
+
+```sh
+hs -c 'speakSelection()'            # same thing without the chord
+hs -c 'speakSelection("alerts")'    # in another voice
+open 'hammerspoon://speakSelection?profile=code'
+```
+
+Read-aloud uses the `reading` voice (vera) by default — change it, or the copy
+timeout, under `TTS_SELECTION` in `lib/config.lua`. Long selections stream: the
+first sentence starts talking while the rest is still synthesising, and
+`curl -s localhost:8790/stop` (or the menu-bar **Stop**) kills it mid-sentence.
 
 ### Different voices for different work
 

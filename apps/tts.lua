@@ -108,6 +108,68 @@ function M.stop()
   updateMenu()
 end
 
+-- ---- speak the current selection (Fn+S) -----------------------------------
+-- macOS exposes no "give me the selected text" API, so we borrow the clipboard:
+-- press ⌘C, read what landed, put the user's clipboard back. The pasteboard's
+-- changeCount is what tells us a copy actually happened — polling for it is why
+-- an empty selection stays silent instead of re-speaking a stale clipboard.
+local SEL = cfg.TTS_SELECTION or {}
+
+-- Grab everything currently on the pasteboard and return a closure that puts it
+-- back. readAllData keeps non-text flavours (images, rich text) intact; the
+-- getContents path is the fallback for Hammerspoon builds without it.
+local function snapshotPasteboard()
+  local ok, data = pcall(hs.pasteboard.readAllData)
+  if ok and type(data) == "table" and next(data) ~= nil then
+    return function() pcall(hs.pasteboard.writeAllData, data) end
+  end
+  local text = hs.pasteboard.getContents()
+  return function()
+    if text ~= nil then pcall(hs.pasteboard.setContents, text) end
+  end
+end
+
+-- Public: copy the selection and queue it for speech. `sel` overrides the voice
+-- (defaults to the read-aloud profile in cfg.TTS_SELECTION.PROFILE).
+function M.speakSelection(sel)
+  -- One grab at a time: a held Fn+S auto-repeats, and overlapping grabs race on
+  -- the pasteboard, so the restore could put back another grab's copy instead of
+  -- what the user had.
+  if M.selecting then return end
+  M.selecting = true
+  local poll    = SEL.POLL or 0.03
+  local timeout = SEL.TIMEOUT or 0.45
+  local before  = hs.pasteboard.changeCount()
+  local restore = snapshotPasteboard()
+
+  -- One tick of delay: we are normally called from inside a keyDown eventtap,
+  -- and a synthetic ⌘C posted from within that callback can be swallowed.
+  -- Timers live on M: an unreferenced hs.timer can be collected mid-poll.
+  M.selStart = hs.timer.doAfter(poll, function()
+    M.selStart = nil
+    hs.eventtap.keyStroke({ "cmd" }, "c", 0)
+    local waited = 0
+    M.selPoll = hs.timer.doEvery(poll, function()
+      waited = waited + poll
+      local landed = hs.pasteboard.changeCount() ~= before
+      if not landed and waited < timeout then return end
+      M.selPoll:stop(); M.selPoll = nil
+      M.selecting = false
+
+      local text = core.selectionText(landed and hs.pasteboard.getContents() or nil, landed)
+      restore()
+      if not text then
+        logf("[tts] selection: nothing to speak (copy landed=%s)", tostring(landed))
+        hs.alert.show("nothing selected")
+        return
+      end
+      logf("[tts] selection: %d chars", #text)
+      hs.alert.show("🔊 " .. utils.truncate(core.sanitize(text), 60))
+      M.speak(text, sel or SEL.PROFILE)
+    end)
+  end)
+end
+
 -- ---- HTTP intake (the service other apps post to) -------------------------
 -- Kept on M (not a bare local): an unreferenced hs.httpserver gets garbage-
 -- collected after load and silently stops listening on the port.
@@ -160,12 +222,17 @@ logf("[tts] intake listening on http://127.0.0.1:%s", tostring(cfg.TTS_PORT))
 --   hs -c 'speak("build passed", "code")'   hs -c 'speak("hi", "marius")'
 _G.speak = function(text, sel) return M.speak(text, sel) end
 _G.speakStop = function() return M.stop() end
+-- Same thing Fn+S does, without the chord — handy for testing from a shell.
+_G.speakSelection = function(sel) return M.speakSelection(sel) end
 
 -- open 'hammerspoon://speak?text=hi%20there&profile=alerts'  (or &voice=marius)
 hs.urlevent.bind("speak", function(_evt, params)
   M.speak(params.text or "", params.profile or params.voice)
 end)
 hs.urlevent.bind("speakStop", function() M.stop() end)
+hs.urlevent.bind("speakSelection", function(_evt, params)
+  M.speakSelection((params or {}).profile or (params or {}).voice)
+end)
 
 -- ---- menu bar -------------------------------------------------------------
 M.menu = require("lib.menuhub").item("Speech queue")
@@ -191,6 +258,8 @@ if M.menu then
       { title = "Stop", fn = function() M.stop() end },
       { title = M.enabled and "Disable" or "Enable",
         fn = function() M.enabled = not M.enabled; if not M.enabled then M.stop() end; updateMenu() end },
+      { title = "Speak selection  (Fn+S)",
+        fn = function() M.speakSelection() end },
       { title = "Speak clipboard",
         fn = function() M.speak(hs.pasteboard.getContents() or "") end },
       { title = "-" },
