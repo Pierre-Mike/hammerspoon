@@ -118,3 +118,25 @@ describe("utils.countWrappedLines", function()
     assert.equals(3, utils.countWrappedLines("aaaaaa\nb", 5))
   end)
 end)
+
+describe("utils.urlencode", function()
+  it("leaves the unreserved set alone", function()
+    assert.equals("abcXYZ019-._~", utils.urlencode("abcXYZ019-._~"))
+  end)
+
+  it("encodes spaces, slashes and other reserved bytes", function()
+    assert.equals("Shokz%20OpenComm2", utils.urlencode("Shokz OpenComm2"))
+    assert.equals("Logic20%2F20", utils.urlencode("Logic20/20"))
+    assert.equals("a%3Db%26c", utils.urlencode("a=b&c"))
+  end)
+
+  it("returns an empty string for nil", function()
+    assert.equals("", utils.urlencode(nil))
+  end)
+
+  -- urlencode and urldecode are each other's inverse for ASCII payloads.
+  it("round-trips through urldecode", function()
+    local s = "Shokz OpenComm2 / Logic20/20"
+    assert.equals(s, utils.urldecode(utils.urlencode(s)))
+  end)
+end)

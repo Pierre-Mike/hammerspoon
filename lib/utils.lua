@@ -68,4 +68,14 @@ function M.countWrappedLines(text, charsPerLine)
   return lines
 end
 
+-- URL-encode using the RFC 3986 unreserved set. Needed for query strings such
+-- as the Teams local API handshake, where the device name carries spaces and
+-- the manufacturer carries a slash.
+function M.urlencode(s)
+  if s == nil then return "" end
+  return (tostring(s):gsub("[^%w%-%._~]", function(c)
+    return string.format("%%%02X", string.byte(c))
+  end))
+end
+
 return M

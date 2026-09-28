@@ -952,7 +952,8 @@ M.keyWatcher:start()
 -- Keep the mic list fresh even without opening the menu: a headset that
 -- (dis)connects after launch retriggers discovery, and if the *selected* mic
 -- disappears we say so instead of silently recording nothing.
-hs.audiodevice.watcher.setCallback(function()
+-- Through lib/audiowatch: the system watcher has room for one callback only.
+require("lib.audiowatch").on("dictation", function()
   MICS = discoverMics()
   local present = false
   for _, m in ipairs(MICS) do if m.name == M.micName then present = true; break end end
@@ -961,7 +962,6 @@ hs.audiodevice.watcher.setCallback(function()
     notify("Mic '" .. tostring(M.micName) .. "' disconnected — pick another", 2.8)
   end
 end)
-hs.audiodevice.watcher.start()
 
 -- Public API for other apps (e.g. volume_tap) to drive voice → supervisor.
 M.isRecording = function() return M.recording end

@@ -21,6 +21,8 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 | `apps/volume_tap` | Voice control for the default supervisor (Orchestrator) via volume-key taps. |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. `Fn+S` reads the current selection aloud. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
+| `apps/shokz` | Volume-button chords on the Shokz OpenComm2 (e.g. volume− then volume+), read from CoreAudio volume changes. Other apps claim chords from its `actions` table; `apps/voice_agent` uses one. |
+| `apps/shokz_mute` | Keeps Microsoft Teams' mute in step with the headset's hardware mute button, read from the bluetoothd log. Uses the Teams local API when allowed, otherwise sends Cmd+Shift+M to Teams. Hub tile: sync switch, status, re-align, reconnect, backend picker. |
 
 ### One menu-bar button
 
@@ -154,6 +156,11 @@ ship the migration branch then open a draft PR
 quotes 'single' and "double" plus $HOME and a ; semicolon
 unicode déjà vu — em dash and émoji ✅
 ```
+
+`apps/voice_agent` is optional: it lives in
+[pipecat-voice-agent](https://github.com/Pierre-Mike/pipecat-voice-agent), whose
+`hammerspoon/install.sh` symlinks it (and `lib/voice_toggle.lua`) in here. `init.lua`
+loads it only when it is installed.
 
 ## Assets not in git
 
