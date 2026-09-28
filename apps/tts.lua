@@ -168,7 +168,7 @@ end)
 hs.urlevent.bind("speakStop", function() M.stop() end)
 
 -- ---- menu bar -------------------------------------------------------------
-M.menu = hs.menubar.new()
+M.menu = require("lib.menuhub").item("Speech queue")
 if M.menu then
   M.menu:setMenu(function()
     -- Submenu: pick the default voice by profile (sorted, tick the current one).
