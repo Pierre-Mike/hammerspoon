@@ -73,6 +73,20 @@ describe("utils.truncate", function()
   it("exact length is not truncated", function()
     assert.equals("hello", utils.truncate("hello", 5))
   end)
+
+  it("does not slice a multi-byte character in half", function()
+    -- "héllo" is 6 bytes; cutting at 2 would land inside the é.
+    assert.equals("h…", utils.truncate("héllo", 2))
+  end)
+
+  it("keeps a multi-byte character that fits whole", function()
+    assert.equals("hé…", utils.truncate("héllo", 3))
+  end)
+
+  it("backs off past a 4-byte character", function()
+    local s = "ab🔊cd"                     -- 🔊 is 4 bytes → total 8
+    assert.equals("ab…", utils.truncate(s, 4))
+  end)
 end)
 
 describe("utils.countWrappedLines", function()

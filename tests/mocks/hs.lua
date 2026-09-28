@@ -20,7 +20,9 @@ hs.eventtap = {
   event = { types = { flagsChanged = 1, keyDown = 2, systemDefined = 3 } },
 }
 
-hs.keycodes = { map = { c = 8, a = 0 } }
+-- Real macOS virtual keycodes for the letters apps/dictation chords on
+-- (Fn+C cancel, Fn+A → Orchestrator, Fn+P → firstmate).
+hs.keycodes = { map = { a = 0, c = 8, p = 35 } }
 
 hs.screen = {
   mainScreen = function()
@@ -47,7 +49,10 @@ hs.canvas = {
 
 hs.menubar = {
   new = function()
-    return { setTitle = function() end, setMenu = function() end }
+    return {
+      setTitle = function() end, setMenu = function() end, setIcon = function() end,
+      setClickCallback = function() end, setTooltip = function() end,
+    }
   end,
 }
 
@@ -79,6 +84,23 @@ hs.styledtext = {
 
 hs.urlevent = {
   bind = function(_, _) end,
+}
+
+-- hs.sound stub. Tests that care about earcon playback substitute their own
+-- getByName / soundFromFile so they can capture the call and assert on it.
+hs.sound = {
+  getByName = function(_)
+    local s = {}
+    s.volume = function(self, _) return self end
+    s.play   = function(self)    return self end
+    return s
+  end,
+  soundFromFile = function(_)
+    local s = {}
+    s.volume = function(self, _) return self end
+    s.play   = function(self)    return self end
+    return s
+  end,
 }
 
 -- Inject into globals so `require("hs.ipc")` etc. resolve without error.

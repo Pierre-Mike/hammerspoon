@@ -29,7 +29,8 @@ import struct
 import sys
 import termios
 
-ZELLIJ = os.path.expanduser("~/.cargo/bin/zellij")
+# argv: <session> [zellij binary]; dictation passes the binary from lib/voice_targets.
+ZELLIJ = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/.cargo/bin/zellij")
 SESSION = sys.argv[1] if len(sys.argv) > 1 else "Orchestrator"
 ROWS, COLS = 200, 500  # larger than any real terminal so we never constrain size
 

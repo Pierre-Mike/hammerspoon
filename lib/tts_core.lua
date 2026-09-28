@@ -80,6 +80,18 @@ function M.splitSentences(text, maxLen)
   return chunks
 end
 
+-- Decide what a "speak the selection" grab should say. macOS exposes no API for
+-- the current selection, so the caller copies it (⌘C) and hands us the result;
+-- `changed` is whether the pasteboard's changeCount actually moved, the only
+-- honest signal that a copy landed. Gating on it means an empty selection never
+-- re-speaks whatever was already sitting on the clipboard. Returns the raw text
+-- (the caller splits it) or nil for "nothing to say".
+function M.selectionText(copied, changed)
+  if not changed then return nil end
+  if M.sanitize(copied) == "" then return nil end
+  return copied
+end
+
 -- FIFO queue primitives. The queue is a plain array; index 1 is the head.
 -- enqueue appends one or many chunks and returns the new length.
 function M.enqueue(queue, chunks)
