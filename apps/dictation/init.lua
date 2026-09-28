@@ -2,6 +2,7 @@
 -- Pipeline: ffmpeg → parakeet-mlx → pbpaste → ⌘V
 
 local earcon      = require("lib.earcon")
+local voiceTargets = require("lib.voice_targets")
 local configFile  = require("lib.config")
 local EARCONS_CFG = configFile.EARCONS
 
@@ -24,13 +25,19 @@ local MLXA_PY   = os.getenv("HOME") .. "/.local/share/uv/tools/mlx-audio/bin/pyt
 local QWEN3_OUT = "/tmp/hs-qwen3"
 local MIN_DURATION = 0.6            -- avfoundation needs ~300ms to start; below this = no audio
 local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button release is ever missed
-local ZELLIJ = os.getenv("HOME") .. "/.cargo/bin/zellij"
-local SUPERVISOR_SESSION = "Orchestrator"
-local ZELLIJ_ENV = { HOME = os.getenv("HOME"), PATH = "/opt/homebrew/bin:/usr/bin:/bin:/usr/bin:/Users/pierre-mikel/.cargo/bin" }
+-- Every supervisor destination — transport, session/target, label, Fn chord —
+-- comes from lib/config.VOICE_TARGETS via lib/voice_targets, including which CLI
+-- binary and environment each transport needs. This module holds no session name
+-- and no multiplexer path of its own, and never branches on transport.
+-- voice_targets refuses to route into firstmate's shared crewmate zellij session
+-- or at an ambient tmux target, so dictation can't land in a worker's prompt.
+local DEFAULT_ROUTE = configFile.VOICE_TARGET_DEFAULT or "orchestrator"
 
-local M = { recording = false, ffmpegTask = nil, fnDown = false, playDown = false, startedAt = 0, lastResult = nil, cancelled = false, supervisor = false }
+-- M.route is the destination armed for the CURRENT take: nil = paste at cursor,
+-- otherwise a VOICE_TARGETS key. Cleared after every finished transcript.
+local M = { recording = false, ffmpegTask = nil, fnDown = false, playDown = false, startedAt = 0, lastResult = nil, cancelled = false, route = nil }
 
--- File logger so we can debug Fn+O routing without staring at the HS console.
+-- File logger so we can debug supervisor routing without staring at the HS console.
 local LOG = "/tmp/hs-dictate.log"
 local function logf(fmt, ...)
   local line = string.format(fmt, ...)
@@ -78,7 +85,7 @@ local _earconPlayer = {
   end,
 }
 -- kind: "start" (mic just began), "stop" (recording ended, transcribing),
--- "sent" (transcript delivered to Orchestrator).
+-- "sent" (transcript delivered to a supervisor pane).
 local function playEarcon(kind)
   local ok, err = pcall(earcon.play, EARCONS_CFG, kind, _earconPlayer)
   if not ok then logf("[earcon] play(%s) failed: %s", tostring(kind), tostring(err)) end
@@ -384,44 +391,73 @@ local function paste(text)
   hs.eventtap.keyStroke({"cmd"}, "v", 0)
 end
 
--- Write the transcript straight into the Orchestrator zellij pane, then Enter.
+-- Deliver the transcript straight into a supervisor's terminal pane, then submit.
 -- Skips the event queue: text appears in the Claude Code prompt and submits.
-local function sendToSupervisor(text)
-  if not text or text == "" then return end
-  text = text:gsub("^%s+", ""):gsub("%s+$", "")
-  if text == "" then return end
+--
+-- lib/voice_targets hands back an ordered list of steps — two for zellij (type,
+-- submit), three for tmux (stage a paste buffer, paste it, submit) — and this
+-- runs them strictly in sequence, stopping at the first failure. The transcript
+-- is therefore typed exactly once and the newline only follows a confirmed type;
+-- a failed submit never retypes, because a duplicated instruction is worse than
+-- an unsubmitted one. Nothing here knows which transport it is driving, so a new
+-- multiplexer (or a different step count) needs no change in this file.
+--
+-- `routeKey` is a lib/config.VOICE_TARGETS key. An unresolvable route — unknown
+-- key, a zellij session holding crewmate tabs, an ambient tmux target — sends
+-- NOTHING: dropping the take is safer than guessing a destination.
+local function sendToTarget(routeKey, text)
+  local target, why = voiceTargets.resolve(configFile, routeKey)
+  if not target then
+    logf("[supervisor] route refused: %s", tostring(why))
+    notify("voice route refused: " .. tostring(why), 2.8)
+    return
+  end
+  local bin = voiceTargets.binary(configFile, target)
+  if not bin then
+    logf("[supervisor] no binary configured for transport %s", target.transport)
+    notify("no " .. target.transport .. " binary configured", 2.8)
+    return
+  end
+  local env   = voiceTargets.environment(configFile, target)
+  local steps = voiceTargets.deliverySteps(configFile, target, text)
+  if not steps then return end
+  local clean = voiceTargets.normalize(text)
 
-  local writeTask = hs.task.new(ZELLIJ,
-    function(code, _, err)
+  -- Run steps[i…] in order. Each step's completion callback starts the next, so
+  -- the sequence is serialised without blocking Hammerspoon's main loop.
+  local runStep
+  runStep = function(i)
+    local step = steps[i]
+    local task = hs.task.new(bin, function(code, _, err)
       if code ~= 0 then
-        logf("[supervisor] zellij write-chars exit=%d err=%s", code, tostring(err))
-        notify("zellij write-chars failed", 2.4)
-        return
+        logf("[supervisor] %s %s exit=%d err=%s",
+             target.transport, step.name, code, tostring(err))
+        notify(target.transport .. " " .. step.name .. " failed", 2.4)
+        return   -- stop the chain; never retry, never retype
       end
-      local enterTask = hs.task.new(ZELLIJ,
-        function(c2, _, e2)
-          if c2 ~= 0 then
-            logf("[supervisor] zellij write 13 exit=%d err=%s", c2, tostring(e2))
-            return
-          end
-          -- Transcript is now committed in the Orchestrator prompt: fire the
-          -- "delivered" cue so a headset-only operator hears the handoff.
-          playEarcon("sent")
-        end,
-        {"--session", SUPERVISOR_SESSION, "action", "write", "13"})
-      enterTask:setEnvironment(ZELLIJ_ENV)
-      enterTask:start()
-    end,
-    {"--session", SUPERVISOR_SESSION, "action", "write-chars", text})
-  writeTask:setEnvironment(ZELLIJ_ENV)
-  writeTask:start()
+      if i < #steps then
+        runStep(i + 1)
+      else
+        -- Transcript is now committed in the supervisor's prompt: fire the
+        -- "delivered" cue so a headset-only operator hears the handoff.
+        playEarcon("sent")
+      end
+    end, step.argv)
+    if env then task:setEnvironment(env) end
+    -- Steps carrying `stdin` keep the transcript out of argv entirely. For a
+    -- non-streaming task hs.task closes stdin once this data is written, so the
+    -- child sees EOF and does not hang.
+    if step.stdin then task:setInput(step.stdin) end
+    task:start()
+  end
+  runStep(1)
 
-  logf("[supervisor] voice → zellij len=%d preview=%q", #text, text:sub(1, 60))
-  local preview = text:sub(1, 60); if #text > 60 then preview = preview .. "…" end
-  notify("→ Orchestrator (voice): " .. preview, 1.8)
+  logf("[supervisor] voice → %s (%s %s, %d steps) len=%d preview=%q",
+       target.label, target.transport, target.address, #steps, #clean, clean:sub(1, 60))
+  notify(voiceTargets.notifyText(target, clean, 60), 1.8)
 end
 
--- Shared tail: reset UI, then paste or route to the Orchestrator.
+-- Shared tail: reset UI, then paste or route to the armed supervisor.
 local function finishTranscript(out)
   setIcon("○"); hideHUD(); hideLivePreview(); M.recording = false
   -- Restore system volume after recording.
@@ -435,15 +471,16 @@ local function finishTranscript(out)
   if out and out ~= "" then
     out = out:gsub("^%s+", ""):gsub("%s+$", "")
     M.lastResult = out
-    logf("[dictate] route: %s", M.supervisor and "supervisor" or "paste")
-    if M.supervisor then
-      M.supervisor = false
-      sendToSupervisor(out)
+    logf("[dictate] route: %s", M.route or "paste")
+    if M.route then
+      local routeKey = M.route
+      M.route = nil
+      sendToTarget(routeKey, out)
     else
       paste(out)
     end
   else
-    M.supervisor = false
+    M.route = nil
     notify("no transcription (see console)", 1.6)
   end
 end
@@ -766,9 +803,11 @@ M.playWatcher = hs.eventtap.new({hs.eventtap.event.types.systemDefined}, functio
   if not d or d.key ~= "PLAY" then return false end
   if d.down and not M.playDown then
     M.playDown = true
-    -- AirPods/MFB is the headset's talk-to-Orchestrator button: route via
-    -- zellij write-chars (focus-independent), not paste-at-cursor.
-    if not M.recording then M.supervisor = true; startRecording() end
+    -- AirPods/MFB is the headset's talk-to-supervisor button: route via zellij
+    -- write-chars (focus-independent), not paste-at-cursor. Always the DEFAULT
+    -- route (Orchestrator) — the headset has one button, so it keeps the
+    -- destination it always had; pick another with an Fn chord instead.
+    if not M.recording then M.route = DEFAULT_ROUTE; startRecording() end
     return true
   elseif d.down == false and M.playDown then
     M.playDown = false
@@ -781,8 +820,16 @@ M.playWatcher:start()
 
 -- Chord detection while holding Fn:
 --   Fn+C  cancel current recording and recall last
---   Fn+A  send this recording's transcript to the Orchestrator zellij session (instead of paste)
+--   Fn+<chord>  send this recording's transcript to that supervisor's zellij
+--               session instead of pasting. One chord per lib/config
+--               .VOICE_TARGETS entry — Fn+A → Orchestrator, Fn+P → firstmate.
 --   Fn+S  speak the current selection through the TTS queue (no dictation)
+-- Built once at load: keycode → route key, so adding a destination is a config
+-- edit only. Any config mistake (duplicate chord, "c" stolen, a session that is
+-- really a firstmate crewmate session) is logged here and the chord is dropped.
+local CHORD_ROUTES, CHORD_PROBLEMS = voiceTargets.chordKeycodeMap(configFile, hs.keycodes.map)
+for _, p in ipairs(CHORD_PROBLEMS) do logf("[chord] VOICE_TARGETS problem: %s", p) end
+
 M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
   if not M.fnDown then return false end
   -- Bare Fn+<key> only. Without this guard the synthetic ⌘C that Fn+S fires to
@@ -796,10 +843,13 @@ M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
     recallLast()
     return true
   end
-  if kc == hs.keycodes.map["a"] then
-    M.supervisor = true
-    logf("[chord] Fn+A — Orchestrator mode armed")
-    notify("→ Orchestrator mode (release Fn to send)", 1.6)
+  local route = CHORD_ROUTES[kc]
+  if route then
+    local target = voiceTargets.resolve(configFile, route)
+    M.route = route
+    logf("[chord] Fn+%s — %s mode armed (session=%s)",
+         target.chord:upper(), target.label, target.session)
+    notify("→ " .. target.label .. " mode (release Fn to send)", 1.6)
     return true
   end
   if kc == hs.keycodes.map["s"] then
@@ -835,23 +885,35 @@ hs.audiodevice.watcher.setCallback(function()
 end)
 hs.audiodevice.watcher.start()
 
--- Public API for other apps (e.g. volume_tap) to drive voice → Orchestrator.
+-- Public API for other apps (e.g. volume_tap) to drive voice → supervisor.
 M.isRecording = function() return M.recording end
--- Start a recording already routed to the Orchestrator (no Fn / no paste).
-M.startSupervisorVoice = function()
+-- Start a recording already routed to `routeKey` (a lib/config.VOICE_TARGETS
+-- key). Returns false and sends nothing if the route can't be resolved.
+M.startVoiceTo = function(routeKey)
   if M.recording then return false end
-  M.supervisor = true
+  local target, why = voiceTargets.resolve(configFile, routeKey)
+  if not target then
+    logf("[dictate] startVoiceTo refused: %s", tostring(why))
+    return false
+  end
+  M.route = target.key
   startRecording()
   return true
 end
--- Stop the current recording; finishTranscript routes per M.supervisor.
+-- Start a recording routed to the DEFAULT supervisor (Orchestrator). Kept for
+-- apps/volume_tap and anything else that predates named routes.
+M.startSupervisorVoice = function()
+  return M.startVoiceTo(DEFAULT_ROUTE)
+end
+-- Stop the current recording; finishTranscript routes per M.route.
 M.stopVoice = function()
   if not M.recording then return false end
   stopRecording()
   return true
 end
 
-notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+A → " .. SUPERVISOR_SESSION .. " · Fn+S speak selection", 2.0)
+notify("Dictate ready · hold Fn or MFB · Fn+C recall · "
+       .. voiceTargets.chordSummary(configFile) .. " · Fn+S speak selection", 2.0)
 logf("[dictate] init complete")
 
 return M
