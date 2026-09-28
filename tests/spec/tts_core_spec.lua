@@ -72,6 +72,28 @@ describe("tts_core.splitSentences", function()
   end)
 end)
 
+describe("tts_core.selectionText", function()
+  it("returns the copied text when the copy landed", function()
+    assert.equals("hello there", tts.selectionText("hello there", true))
+  end)
+
+  it("returns nil when the pasteboard never changed", function()
+    -- Nothing was selected: ⌘C did nothing, so the clipboard still holds old text.
+    assert.is_nil(tts.selectionText("stale clipboard contents", false))
+  end)
+
+  it("returns nil for a blank copy", function()
+    assert.is_nil(tts.selectionText("", true))
+    assert.is_nil(tts.selectionText("  \n\t ", true))
+    assert.is_nil(tts.selectionText(nil, true))
+  end)
+
+  it("hands back raw text so the caller can split it", function()
+    local raw = "First line.\n\nSecond   line."
+    assert.equals(raw, tts.selectionText(raw, true))
+  end)
+end)
+
 describe("tts_core queue primitives", function()
   it("enqueue appends a single string and returns length", function()
     local q = {}

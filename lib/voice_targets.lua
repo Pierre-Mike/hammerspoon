@@ -50,7 +50,7 @@ local M = {}
 
 -- Reserved chord letters that a voice target may not claim, because
 -- apps/dictation already binds them while Fn is held.
-M.RESERVED_CHORDS = { "c" }   -- Fn+C = cancel recording & recall last result
+M.RESERVED_CHORDS = { "c", "s" }   -- Fn+C = cancel & recall last result, Fn+S = speak selection
 
 -- zellij-only delivery methods. Unknown/absent values fall back to the pair
 -- apps/dictation has always used, so an older target naming neither still works.

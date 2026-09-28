@@ -91,7 +91,7 @@ local function playEarcon(kind)
   if not ok then logf("[earcon] play(%s) failed: %s", tostring(kind), tostring(err)) end
 end
 
-M.menu = hs.menubar.new()
+M.menu = require("lib.menuhub").item("Dictation")
 -- Native template image (monochrome, auto-tints to the menubar colour).
 local ICON_MIC = hs.image.imageFromName("NSTouchBarAudioInputTemplate")
 local function setIcon(s)
@@ -823,6 +823,7 @@ M.playWatcher:start()
 --   Fn+<chord>  send this recording's transcript to that supervisor's zellij
 --               session instead of pasting. One chord per lib/config
 --               .VOICE_TARGETS entry — Fn+A → Orchestrator, Fn+P → firstmate.
+--   Fn+S  speak the current selection through the TTS queue (no dictation)
 -- Built once at load: keycode → route key, so adding a destination is a config
 -- edit only. Any config mistake (duplicate chord, "c" stolen, a session that is
 -- really a firstmate crewmate session) is logged here and the chord is dropped.
@@ -831,6 +832,11 @@ for _, p in ipairs(CHORD_PROBLEMS) do logf("[chord] VOICE_TARGETS problem: %s", 
 
 M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
   if not M.fnDown then return false end
+  -- Bare Fn+<key> only. Without this guard the synthetic ⌘C that Fn+S fires to
+  -- grab the selection comes straight back through this tap as Fn+C, cancelling
+  -- the chord that just sent it — and Fn+⌘C would never reach the focused app.
+  local f = e:getFlags()
+  if f.cmd or f.alt or f.ctrl or f.shift then return false end
   local kc = e:getKeyCode()
   if kc == hs.keycodes.map["c"] then
     M.cancelled = true
@@ -844,6 +850,21 @@ M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
     logf("[chord] Fn+%s — %s mode armed (session=%s)",
          target.chord:upper(), target.label, target.session)
     notify("→ " .. target.label .. " mode (release Fn to send)", 1.6)
+    return true
+  end
+  if kc == hs.keycodes.map["s"] then
+    -- Reading out, not dictating in. Fn-down already opened the mic, so mark the
+    -- capture cancelled (release drops the clip and unducks) and hand off to the
+    -- TTS queue. Required lazily: init.lua loads dictation before apps.tts.
+    M.cancelled = true
+    logf("[chord] Fn+S — speak selection")
+    local ok, tts = pcall(require, "apps.tts")
+    if ok and type(tts) == "table" and tts.speakSelection then
+      tts.speakSelection()
+    else
+      logf("[chord] Fn+S — apps.tts unavailable: %s", tostring(tts))
+      notify("TTS service not loaded", 1.8)
+    end
     return true
   end
   return false
@@ -892,7 +913,7 @@ M.stopVoice = function()
 end
 
 notify("Dictate ready · hold Fn or MFB · Fn+C recall · "
-       .. voiceTargets.chordSummary(configFile), 2.0)
+       .. voiceTargets.chordSummary(configFile) .. " · Fn+S speak selection", 2.0)
 logf("[dictate] init complete")
 
 return M

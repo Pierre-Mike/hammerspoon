@@ -49,7 +49,10 @@ hs.canvas = {
 
 hs.menubar = {
   new = function()
-    return { setTitle = function() end, setMenu = function() end }
+    return {
+      setTitle = function() end, setMenu = function() end, setIcon = function() end,
+      setClickCallback = function() end, setTooltip = function() end,
+    }
   end,
 }
 

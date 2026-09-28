@@ -285,6 +285,12 @@ describe("voice_targets.chordRoute", function()
     c.VOICE_TARGETS.sneaky = { session = "Sneaky", chord = "c" }
     assert.is_nil(vt.chordRoute(c, "c"))
   end)
+
+  it("never yields a route for the reserved speak-selection chord", function()
+    local c = cfg()
+    c.VOICE_TARGETS.sneaky = { session = "Sneaky", chord = "s" }
+    assert.is_nil(vt.chordRoute(c, "s"))
+  end)
 end)
 
 describe("voice_targets.chordKeycodeMap", function()
