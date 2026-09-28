@@ -16,6 +16,9 @@
     --pill: rgba(0, 0, 0, 0.06);
     --pill-hover: rgba(0, 0, 0, 0.11);
     --glyph-filter: none;
+    --switch-off: rgba(0, 0, 0, 0.12);
+    --switch-on: #34c759;
+    --track: rgba(0, 0, 0, 0.10);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -31,6 +34,9 @@
       --pill: rgba(255, 255, 255, 0.08);
       --pill-hover: rgba(255, 255, 255, 0.15);
       --glyph-filter: invert(1);
+      --switch-off: rgba(255, 255, 255, 0.16);
+      --switch-on: #30d158;
+      --track: rgba(255, 255, 255, 0.14);
     }
   }
   * { box-sizing: border-box; margin: 0; }
@@ -118,6 +124,29 @@
   .row.act .t { color: var(--accent); }
   .row.info .t { color: var(--muted); }
   .row.dim { opacity: .45; pointer-events: none; }
+  .row.switch:hover { background: var(--tile-hover); }
+  .sw {
+    flex: none; width: 38px; height: 22px; border-radius: 11px;
+    background: var(--switch-off); position: relative; transition: background .18s;
+  }
+  .sw::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: #fff; transition: transform .18s;
+  }
+  .sw.on { background: var(--switch-on); }
+  .sw.on::after { transform: translateX(16px); }
+  .row.slider { flex-wrap: wrap; row-gap: 6px; padding-bottom: 10px; }
+  .row.slider .v { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .row.slider input {
+    -webkit-appearance: none; flex-basis: 100%; height: 22px; margin: 0;
+    border-radius: 11px; background: var(--track); overflow: hidden; outline: none;
+  }
+  .row.slider input::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%;
+    background: #fff; border: 0.5px solid rgba(0, 0, 0, 0.12);
+    box-shadow: -400px 0 0 389px var(--accent);
+  }
   .row .tick { flex: none; width: 16px; font-size: 14px; color: var(--accent); font-weight: 600; text-align: center; }
 
   footer { display: flex; gap: 8px; padding-top: 12px; }
@@ -214,6 +243,24 @@
       }
       const row = el("div", "row " + it.kind + (it.disabled ? " dim" : ""));
       row.appendChild(el("span", "t", it.title));
+      if (it.kind === "slider") {
+        const fmt = (v) => v + it.unit;
+        const val = el("span", "v", fmt(it.value));
+        const input = el("input");
+        Object.assign(input, { type: "range", min: it.min, max: it.max, step: it.step, value: it.value });
+        let last = 0;
+        input.addEventListener("input", () => {
+          val.textContent = fmt(input.value);
+          const now = Date.now();
+          if (now - last > 40) { last = now; send({ cmd: "slide", i: it.i, v: +input.value }); }
+        });
+        input.addEventListener("change", () => send({ cmd: "slide", i: it.i, v: +input.value }));
+        row.appendChild(val);
+        row.appendChild(input);
+        ensure().appendChild(row);
+        return;
+      }
+      if (it.kind === "switch") row.appendChild(el("span", "sw" + (it.checked ? " on" : "")));
       if (it.kind === "check") row.appendChild(el("span", "tick", it.checked ? "✓" : ""));
       if (it.kind === "sub") row.appendChild(el("span", "chev", "›"));
       if (it.kind !== "info") row.addEventListener("click", () => send({ cmd: "item", i: it.i }));

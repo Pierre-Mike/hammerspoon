@@ -90,13 +90,18 @@ function M.text(t)
 end
 
 -- Pure: an hs.menubar menu table as flat rows for the detail view.
--- kind: sep | sub (has a submenu) | check (checked is set) | act | info
+-- kind: sep | sub (has a submenu) | check (checked is set) | act | info, plus
+-- two the panel understands and a plain dropdown ignores:
+--   switch  { title, switch = true, checked, fn }   an on/off toggle
+--   slider  { title, slider = { value, min, max, step, unit, fn(v) } }
 function M.items(menu)
   local out = {}
   for i, it in ipairs(menu or {}) do
     local title = M.text(it.title)
     local kind
     if title == "-" then kind = "sep"
+    elseif type(it.slider) == "table" then kind = "slider"
+    elseif it.switch and it.fn then kind = "switch"
     elseif it.menu then kind = "sub"
     elseif it.fn and it.checked ~= nil then kind = "check"
     elseif it.fn then kind = "act"
@@ -106,6 +111,12 @@ function M.items(menu)
       checked = it.checked and true or false,
       disabled = (kind ~= "info" and it.disabled) and true or nil,
     }
+    if kind == "slider" then
+      local sl, row = it.slider, out[#out]
+      row.min, row.max = sl.min or 0, sl.max or 100
+      row.step, row.unit = sl.step or 1, sl.unit or ""
+      row.value = math.max(row.min, math.min(row.max, tonumber(sl.value) or row.min))
+    end
   end
   -- Some apps draw their own ticks: "✓ Medium" beside "   Tight", space-padded
   -- to line up. Within a run of such rows, the tick and the padding both mean
@@ -261,6 +272,14 @@ local function onMessage(msg)
       M.view = nil
     end
     pushTiles()
+  elseif b.cmd == "slide" then
+    -- Live while dragging, so no redraw: that would reset the thumb mid-drag.
+    local menu = M.view and M.resolve(M.view.entry, M.view.path)
+    local it = menu and menu[b.i]
+    if it and type(it.slider) == "table" and it.slider.fn then
+      local ok, err = pcall(it.slider.fn, tonumber(b.v))
+      if not ok then print("[menuhub] " .. M.text(it.title) .. ": " .. tostring(err)) end
+    end
   elseif b.cmd == "item" then
     if not M.view then return end
     local menu = M.resolve(M.view.entry, M.view.path)
