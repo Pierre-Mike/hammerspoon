@@ -84,7 +84,7 @@ local function playEarcon(kind)
   if not ok then logf("[earcon] play(%s) failed: %s", tostring(kind), tostring(err)) end
 end
 
-M.menu = hs.menubar.new()
+M.menu = require("lib.menuhub").item("Dictation")
 -- Native template image (monochrome, auto-tints to the menubar colour).
 local ICON_MIC = hs.image.imageFromName("NSTouchBarAudioInputTemplate")
 local function setIcon(s)
