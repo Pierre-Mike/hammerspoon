@@ -134,6 +134,31 @@ return {
   POCKET_TTS_PY       = HOME .. "/.hammerspoon/.venv-tts/bin/python",   -- venv with pocket-tts installed
   TTS_VOICE           = "alba",                     -- default pocket-tts voice
   TTS_LANGUAGE        = "english",
+
+  -- A second instance of the same server, running the French model.
+  --
+  -- One pocket-tts process holds exactly one model, and the model decides the
+  -- phonetics — not the voice name. Reading French through the English model gets
+  -- every word right and every sound wrong, and no choice of voice fixes it. So
+  -- French gets its own process. Notifications (apps/tts.lua) keep using the
+  -- English one on 8791; the voice agent sends French replies to 8793.
+  --
+  -- "french_24l" is the only French identifier pocket-tts accepts: load_model
+  -- rejects "french" outright and says so. It is a 24-layer model where English
+  -- is 6, which costs 672 MB on disk, ~2.4 GB resident, and roughly 3.7x the
+  -- synthesis time (still faster than real time: ~1.3s for a 7-word sentence).
+  --
+  -- Each instance needs its OWN output directory. The server rotates through
+  -- /tmp/hs-tts-0..7.wav, and two processes sharing that set overwrite each
+  -- other's audio: a French reply came back as an English notification clip
+  -- during testing, because the other server had reused the slot between the
+  -- write and the read.
+  POCKET_TTS_OUT      = "/tmp",
+  POCKET_TTS_FR_PORT  = 8793,
+  POCKET_TTS_FR_BASE  = "http://127.0.0.1:8793",
+  POCKET_TTS_FR_OUT   = "/tmp/pocket-tts-fr",
+  TTS_LANGUAGE_FR     = "french_24l",
+  TTS_VOICE_FR        = "estelle",                  -- pocket-tts' own French default
   AFPLAY              = "/usr/bin/afplay",
   -- Named voice profiles: map a "kind of work" to a voice so different callers
   -- get different voices. A /speak request may pass a profile key OR any raw

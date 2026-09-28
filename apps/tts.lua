@@ -11,6 +11,10 @@
 -- separate chunks, so playback starts after the first sentence instead of after
 -- the whole blob synthesises. Voice/quality come from Kyutai pocket-tts running
 -- on CPU; this module is just the queue, the intake, and the playback plumbing.
+--
+-- This module also owns the lifecycle of a *second* pocket-tts server, on 8793,
+-- running the French model for apps/voice_agent. Nothing spoken here goes to it:
+-- notifications are English and stay on 8791. See the bottom of the file.
 
 local core  = require("lib.tts_core")
 local utils = require("lib.utils")
@@ -264,35 +268,96 @@ if M.menu then
         fn = function() M.speak(hs.pasteboard.getContents() or "") end },
       { title = "-" },
       { title = "Default voice: " .. M.voice, menu = voiceItems },
-      { title = "Restart voice server", fn = function() M.restartServer() end },
+      { title = "Restart voice servers", fn = function() M.restartServer() end },
     }
   end)
   updateMenu()
 end
 
 -- ---- warm pocket-tts server lifecycle -------------------------------------
-local function launchServer()
-  M.server = hs.task.new(cfg.POCKET_TTS_PY, function(code, _out, err)
-    logf("[tts] server exited code=%s err=%s", tostring(code), tostring(err))
-    M.server = nil
-  end, { cfg.POCKET_TTS_SERVER })
-  M.server:setEnvironment({
+-- Two instances of one script, because a pocket-tts process holds exactly one
+-- model and the model — not the voice name — decides the phonetics. French read
+-- by the English model gets every word right and every sound wrong, whichever of
+-- the 26 voices you pick. So the French model runs beside the English one rather
+-- than replacing it, and notifications keep the voice they have always had.
+--
+-- The French instance exists for apps/voice_agent, which posts French replies to
+-- it directly. It is optional by design: if it never comes up, the agent
+-- synthesises on the English server instead and logs that once.
+local INSTANCES = {
+  {
+    key      = "server",
+    name     = "english",
+    port     = cfg.POCKET_TTS_PORT,
+    language = cfg.TTS_LANGUAGE,
+    out      = cfg.POCKET_TTS_OUT,
+    log      = "/tmp/hs-pocket-tts.log",
+    voice    = function() return M.voice end,          -- follows the menu bar picker
+  },
+  {
+    key      = "frServer",
+    name     = "french",
+    port     = cfg.POCKET_TTS_FR_PORT,
+    language = cfg.TTS_LANGUAGE_FR,
+    out      = cfg.POCKET_TTS_FR_OUT,
+    log      = "/tmp/hs-pocket-tts-fr.log",
+    voice    = function() return cfg.TTS_VOICE_FR end,
+  },
+}
+
+-- Held on M: an unreferenced hs.task can be collected before its callback runs.
+M.killTasks = {}
+
+local function launchServer(inst)
+  local voice = inst.voice()
+  -- Routed through sh so model-load progress lands in a file. The first run of a
+  -- new language downloads several hundred megabytes, and without a log
+  -- "still downloading" is indistinguishable from "broken". `exec` matters:
+  -- without it terminate() kills the shell and leaves Python holding the port.
+  local cmd = string.format("mkdir -p %q && exec %q %q >> %q 2>&1",
+    inst.out, cfg.POCKET_TTS_PY, cfg.POCKET_TTS_SERVER, inst.log)
+  -- Only clear the handle if it is still ours: a restart terminates the old
+  -- server, whose callback lands after the new one is stored here.
+  local task
+  task = hs.task.new("/bin/sh", function(code, _out, err)
+    logf("[tts] %s server exited code=%s err=%s", inst.name, tostring(code), tostring(err))
+    if M[inst.key] == task then M[inst.key] = nil end
+  end, { "-c", cmd })
+  M[inst.key] = task
+  M[inst.key]:setEnvironment({
     HOME = os.getenv("HOME"),
     PATH = "/opt/homebrew/bin:/usr/bin:/bin",
-    POCKET_TTS_PORT     = tostring(cfg.POCKET_TTS_PORT),
-    POCKET_TTS_VOICE    = M.voice,
-    POCKET_TTS_LANGUAGE = cfg.TTS_LANGUAGE,
+    PYTHONUNBUFFERED    = "1",
+    POCKET_TTS_PORT     = tostring(inst.port),
+    POCKET_TTS_VOICE    = voice,
+    POCKET_TTS_LANGUAGE = inst.language,
+    POCKET_TTS_OUT      = inst.out,
   })
-  M.server:start()
-  logf("[tts] launching warm pocket-tts server (voice=%s, lang=%s)", M.voice, cfg.TTS_LANGUAGE)
+  M[inst.key]:start()
+  logf("[tts] launching pocket-tts %s server (port=%d, voice=%s, lang=%s, log=%s)",
+    inst.name, inst.port, voice, inst.language, inst.log)
 end
 
 -- Free the port first so a reload doesn't stack a second worker on it.
+--
+-- Kill the listener, never ourselves. A bare `lsof -ti :PORT` also matches
+-- sockets whose *remote* port is PORT, and Hammerspoon holds one of those every
+-- time it posts a chunk of text to be spoken — the same pattern took Hammerspoon
+-- down from apps/voice_agent before it was fixed there.
+local function restartOne(inst)
+  local pending = M.killTasks[inst.key]
+  if pending and pending:isRunning() then return end   -- a restart is already underway
+  if M[inst.key] then M[inst.key]:terminate(); M[inst.key] = nil end
+  local killCmd = string.format(
+    "lsof -tiTCP:%d -sTCP:LISTEN | grep -vx %d | xargs kill -9 2>/dev/null; true",
+    inst.port, hs.processInfo.processID)
+  M.killTasks[inst.key] = hs.task.new("/bin/sh", function() launchServer(inst) end,
+    { "-c", killCmd })
+  M.killTasks[inst.key]:start()
+end
+
 function M.restartServer()
-  if M.server then M.server:terminate(); M.server = nil end
-  local k = hs.task.new("/bin/sh", function() launchServer() end,
-    { "-c", string.format("lsof -ti :%d | xargs kill -9 2>/dev/null; true", cfg.POCKET_TTS_PORT) })
-  k:start()
+  for _, inst in ipairs(INSTANCES) do restartOne(inst) end
 end
 
 M.restartServer()
