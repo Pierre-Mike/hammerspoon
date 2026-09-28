@@ -62,6 +62,13 @@ function Proxy:setTooltip(t)        self._e.tooltip = t; return self end
 function Proxy:setClickCallback(fn) self._e.click = fn;  return self end
 function Proxy:title()              return self._e.title end
 
+-- Drop this app's row (hs.menubar's delete). The hub button itself stays.
+function Proxy:delete()
+  for i, e in ipairs(M.entries) do
+    if e == self._e then table.remove(M.entries, i); return end
+  end
+end
+
 -- Register an app in the hub. Rows appear in registration (require) order.
 function M.item(name)
   local e = { name = name }

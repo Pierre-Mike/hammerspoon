@@ -56,4 +56,13 @@ describe("menuhub.item", function()
     assert.equals("tip", hub.entries[2].tooltip)
     hs.menubar.new = realNew
   end)
+
+  it("delete removes only that app's row", function()
+    hub.entries, hub.bar = {}, nil
+    local a = hub.item("A")
+    hub.item("B")
+    a:delete()
+    assert.equals(1, #hub.entries)
+    assert.equals("B", hub.entries[1].name)
+  end)
 end)
