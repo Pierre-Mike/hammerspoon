@@ -6,9 +6,17 @@
 --
 -- The NoseGuard tile's Watching switch turns the daemon on/off; detection runs
 -- only while it is ON. The camera choice persists across reloads.
+--
+-- Everything this plugin registers belongs to its context, including the two
+-- things that are global and cannot simply be dropped: the hammerspoon://
+-- handler the daemon calls back on, and the quit hook that reaps the daemon.
+-- M.dispose() gives both back and puts the camera light out.
+
+local ctx = require("lib.context").new("NoseGuard")
 
 local M = {
   task = nil,        -- hs.task running the python daemon
+  release = nil,     -- ctx handle on it: terminates the daemon and forgets it
   menu = nil,        -- hs.menubar
   canvas = nil,      -- fullscreen overlay
   flashTimer = nil,
@@ -49,6 +57,14 @@ local function cameras()
   return camList
 end
 
+-- Exactly one daemon means exactly one camera light. A config reload destroys
+-- our hs.task but orphans the child python, which keeps its AVCaptureSession
+-- open; overlapping start/stop leaks the same way. Anchored on "noseguard.py$"
+-- so it never hits the "noseguard.py list" helper.
+local function reap()
+  hs.execute("/usr/bin/pkill -f 'noseguard\\.py$'")
+end
+
 local function logf(fmt, ...)
   local f = io.open(LOG, "a")
   if f then f:write(os.date("%H:%M:%S "), string.format(fmt, ...), "\n"); f:close() end
@@ -69,11 +85,13 @@ local OVERLAY = DIR .. "/overlay/overlay"
 
 local function flash()
   -- hidden-from-capture red flash (self-dismisses after 1.2s)
-  hs.task.new(OVERLAY, nil, { "1.2" }):start()
+  local overlay, done
+  overlay, done = ctx:task(OVERLAY, function() done() end, { "1.2" })
+  overlay:start()
 
   -- alarm: two system beeps
   hs.sound.getByName("Sosumi"):play()
-  hs.timer.doAfter(0.35, function()
+  ctx:after(0.35, function()
     local s = hs.sound.getByName("Sosumi"); if s then s:play() end
   end)
 end
@@ -161,15 +179,13 @@ end
 -- ── Daemon control ─────────────────────────────────────────────────────────
 function M.start()
   if isOn() then return end
-  -- Reap stray daemons before spawning. A Hammerspoon config reload destroys
-  -- our hs.task but orphans the child python process — it keeps its
-  -- AVCaptureSession open and the camera light on. Overlapping start/stop can
-  -- leak the same way. pkill enforces exactly one daemon = one camera light.
-  -- Anchored on "noseguard.py$" so it never hits the "noseguard.py list" helper.
-  hs.execute("/usr/bin/pkill -f 'noseguard\\.py$'")
-  M.task = hs.task.new(PY, function(code, _, err)
+  reap()   -- stray daemons before spawning, so one tile means one camera light
+  local task, release
+  task, release = ctx:task(PY, function(code, _, err)
     logf("daemon exited code=%s err=%s", tostring(code), tostring(err))
-    M.task = nil
+    if M.task ~= task then return end   -- superseded by a stop or a restart
+    release()                           -- it is gone; stop holding it
+    M.task, M.release = nil, nil
     refresh()
   -- Stream the daemon's own output into the same log, so "Log detection detail"
   -- is actually readable from "Open log" instead of vanishing with the process.
@@ -178,6 +194,7 @@ function M.start()
     if err and err ~= "" then logRaw(err) end
     return true
   end, { SCRIPT })
+  M.task, M.release = task, release
   M.task:setEnvironment({
     HOME = os.getenv("HOME"),
     PATH = "/opt/homebrew/bin:/usr/bin:/bin",
@@ -193,7 +210,8 @@ function M.start()
 end
 
 function M.stop()
-  if M.task then M.task:terminate(); M.task = nil end
+  if M.release then M.release() end    -- terminates the daemon, drops the effect
+  M.task, M.release = nil, nil
   if M.canvas then M.canvas:delete(); M.canvas = nil end
   logf("daemon stopped")
   refresh()
@@ -204,7 +222,7 @@ function M.toggle()
 end
 
 local function restart()
-  if isOn() then M.stop(); hs.timer.doAfter(0.3, M.start) end  -- reload env
+  if isOn() then M.stop(); ctx:after(0.3, M.start) end  -- reload env
 end
 
 function M.setSens(v)
@@ -229,7 +247,7 @@ function M.setCam(id, name)
 end
 
 -- ── urlevent from the daemon ─────────────────────────────────────────────────
-hs.urlevent.bind("noseguard", function(_, params)
+ctx:url("noseguard", function(_, params)
   local ev = params.event or "touch"
   if ev == "touch" then
     M.count = M.count + 1
@@ -243,19 +261,29 @@ hs.urlevent.bind("noseguard", function(_, params)
   end
 end)
 
--- Kill the daemon on config reload / Hammerspoon quit, otherwise it orphans
--- and keeps the camera light on while the menu shows 💤 (off). pkill-on-start
--- is the backstop; this closes the window between reload and the next start.
-hs.shutdownCallback = function()
-  hs.execute("/usr/bin/pkill -f 'noseguard\\.py$'")
-end
+-- Kill the daemon on config reload / Hammerspoon quit, otherwise it orphans and
+-- keeps the camera light on while the menu shows 💤 (off). pkill-on-start is the
+-- backstop; this closes the window between reload and the next start.
+--
+-- Through the context rather than hs.shutdownCallback directly: that is one
+-- global slot, and taking it would have silently stopped whichever other plugin
+-- had claimed it first.
+ctx:atExit(reap)
 
 -- ── init ───────────────────────────────────────────────────────────────────
-M.menu = require("lib.menuhub").item("NoseGuard")
+M.menu = ctx:tile("NoseGuard")
 M.camId = hs.settings.get(CAM_ID_KEY) or ""
 M.camName = hs.settings.get(CAM_NAME_KEY) or ""
 M.menu:setMenu(buildMenu)
 refresh()
 -- start OFF; the Watching switch turns it on (camera permission prompt fires then)
+
+-- Switching the plugin off has to put the camera light out, so the context is
+-- unwound first — tile, daemon, flash timers, URL handler, quit hook — and then
+-- the orphan a terminate can still leave behind is reaped.
+function M.dispose()
+  ctx:dispose()
+  reap()
+end
 
 return M

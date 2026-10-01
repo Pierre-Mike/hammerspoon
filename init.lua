@@ -1,13 +1,30 @@
 require("hs.ipc")  -- enables `hs -c '<lua>'` from a shell
 
-require("apps.dictation")
-require("apps.brown_noise")
-require("apps.volume_tap")
-require("apps.noseguard")
-require("apps.tts")
-require("apps.shokz")        -- before voice_agent, which claims one of its chords
-require("apps.shokz_mute")
+-- Plugins find themselves: anything under apps/ with an init.lua, and any single
+-- .lua file there, is loaded. Dropping a folder in is enough — this file does not
+-- name it — and a plugin that throws on require now fails alone instead of taking
+-- down everything after it in a require list.
+--
+-- The list below is only the ones whose sequence matters. It is also tile order,
+-- because menuhub draws in load order, so it keeps the hub reading the way it
+-- always has. Anything not named here loads after them, alphabetically.
+local plugins = require("lib.plugins")
 
--- Symlinked in by ~/Github/pipecat-voice-agent/hammerspoon/install.sh; absent on
--- a fresh clone of this repo, so only loaded when installed.
-if hs.fs.attributes(hs.configdir .. "/apps/voice_agent/init.lua") then require("apps.voice_agent") end
+plugins.loadAll({
+  "dictation",
+  "brown_noise",
+  "volume_tap",
+  "noseguard",
+  "tts",
+  "lmstudio",
+  "dsh",
+  "shokz",        -- before voice_agent, which claims one of its chords
+  "shokz_mute",
+  -- Symlinked in by ~/Github/pipecat-voice-agent/hammerspoon/install.sh. On a
+  -- fresh clone of this repo it is simply not there, and discovery skips it
+  -- rather than this file having to ask.
+  "voice_agent",
+})
+
+-- The Plugins tile: switch one off, or see which failed, without editing a file.
+plugins.install()

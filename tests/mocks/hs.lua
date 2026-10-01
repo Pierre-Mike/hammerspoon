@@ -3,11 +3,23 @@
 
 local hs = {}
 
+-- doAfter/doEvery hand back a handle whose .start IS the callback, so a spec
+-- fires the timer by calling it. Nothing runs on its own: a test that wants a
+-- tick says so.
 hs.timer = {
   secondsSinceEpoch = function() return os.time() end,
   doAfter = function(_, fn) return { start = fn, stop = function() end } end,
+  doEvery = function(_, fn) return { start = fn, stop = function() end, fn = fn } end,
   new = function(_, fn) return { start = function() end, stop = function() end, fn = fn } end,
 }
+
+hs.hotkey = {
+  bind = function(_, _, pressed)
+    return { delete = function() end, enable = function(s) return s end,
+             disable = function(s) return s end, fn = pressed }
+  end,
+}
+hs.hotkey.new = hs.hotkey.bind
 
 hs.pasteboard = {
   _contents = "",
@@ -52,6 +64,7 @@ hs.menubar = {
     return {
       setTitle = function() end, setMenu = function() end, setIcon = function() end,
       setClickCallback = function() end, setTooltip = function() end,
+      delete = function() end,
     }
   end,
 }
@@ -84,6 +97,7 @@ hs.styledtext = {
 
 hs.urlevent = {
   bind = function(_, _) end,
+  openURL = function(_) end,
 }
 
 -- hs.sound stub. Tests that care about earcon playback substitute their own
@@ -102,6 +116,42 @@ hs.sound = {
     return s
   end,
 }
+
+-- Settings live in memory for the run. A spec that cares seeds hs.settings._v
+-- directly rather than going through set().
+hs.settings = {
+  _v = {},
+  get = function(k) return hs.settings._v[k] end,
+  set = function(k, v) hs.settings._v[k] = v end,
+  clear = function(k) hs.settings._v[k] = nil end,
+}
+
+-- A fake tree: hs.fs._tree maps a directory to its entries, and anything listed
+-- as a path in hs.fs._files answers attributes(). Specs that walk apps/ set both.
+hs.fs = {
+  _tree = {},
+  _files = {},
+  -- Two return values, and an iterator that genuinely needs the second, because
+  -- the real hs.fs.dir works that way: a caller that keeps only the function
+  -- gets a stateless iterator and fails. A mock that closed over its own index
+  -- hid exactly that bug.
+  dir = function(path)
+    local entries = hs.fs._tree[path]
+    if not entries then error("no such directory: " .. tostring(path)) end
+    return function(state)
+      state.i = state.i + 1
+      return state.entries[state.i]
+    end, { i = 0, entries = entries }
+  end,
+  attributes = function(path) return hs.fs._files[path] or nil end,
+}
+
+hs.configdir = "/fake/.hammerspoon"
+
+hs.execute = function(_) return "", true, "exit", 0 end
+hs.json = { decode = function(s) return {} end, encode = function(_) return "{}" end }
+hs.notify = { new = function(_) return { send = function() end } end }
+hs.processInfo = { processID = 4242 }
 
 -- Inject into globals so `require("hs.ipc")` etc. resolve without error.
 hs.ipc = {}
