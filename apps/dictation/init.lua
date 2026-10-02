@@ -19,10 +19,12 @@ local PARAKEET_PY     = os.getenv("HOME") .. "/.local/share/uv/tools/parakeet-ml
 local PARAKEET_SERVER = os.getenv("HOME") .. "/.hammerspoon/parakeet_server.py"
 local PARAKEET_BASE   = "http://127.0.0.1:8765"
 local PARAKEET_URL    = PARAKEET_BASE .. "/transcribe"  -- batch (fallback only)
--- mlx-audio runtime for non-streaming engines (Qwen3-ASR). Separate from the
--- parakeet server: it cold-loads per call and has no live-preview streaming.
+-- mlx-audio runtime: the batch backend behind every non-streaming model
+-- (Qwen3-ASR, Whisper, Granite, Cohere Transcribe, Mega-ASR — see ENGINES).
+-- Separate from the parakeet server: it cold-loads per call, one model at a
+-- time, and has no live-preview streaming.
 local MLXA_PY   = os.getenv("HOME") .. "/.local/share/uv/tools/mlx-audio/bin/python"
-local QWEN3_OUT = "/tmp/hs-qwen3"
+local BATCH_OUT = "/tmp/hs-stt-batch"
 local MIN_DURATION = 0.6            -- avfoundation needs ~300ms to start; below this = no audio
 local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button release is ever missed
 -- Every supervisor destination — transport, session/target, label, Fn chord —
@@ -118,9 +120,77 @@ end
 setIcon("○")
 
 -- ── Model selection ─────────────────────────────────────────────────────────
--- Discover every parakeet model cached under the HF hub. The menubar picks one;
--- switching just relaunches the warm server against the chosen snapshot (~3.5s).
+-- Every speech model cached under the HF hub is offered in the menubar. One
+-- appears the moment its snapshot is fully on disk (`hf download <repo>`) and
+-- goes when the cache directory goes — gaining or losing a model is a download,
+-- not an edit here.
+--
+-- Which backend runs a model is read off the model's own config.json, never its
+-- name:
+--   • a NeMo `target` (the parakeet family) → parakeet-mlx, the only backend
+--     that streams, so these are the only models with a live preview
+--   • a `model_type` mlx-audio implements → mlx-audio's batch CLI, which
+--     cold-loads per call and returns the text on release
 local HF_HUB = os.getenv("HOME") .. "/.cache/huggingface/hub"
+
+-- config.json model_type → backend. "parakeet" is synthesised by the scan below
+-- for any NeMo-target config; every other key is an mlx-audio STT architecture
+-- (one directory each under mlx_audio/stt/models/). A cached model whose type is
+-- absent here is skipped rather than guessed at, which is also what keeps the
+-- non-speech models in the same cache — LLMs, pocket-tts — out of the menu.
+local ENGINES = {
+  parakeet           = "parakeet",
+  qwen3_asr          = "mlxa",
+  mega_asr           = "mlxa",
+  cohere_asr         = "mlxa",
+  granite_speech     = "mlxa",
+  granite_speech_nar = "mlxa",
+  whisper            = "mlxa",
+  glm                = "mlxa",
+  glmasr             = "mlxa",
+  voxtral            = "mlxa",
+  voxtral_realtime   = "mlxa",
+  nemotron_asr       = "mlxa",
+  fun_asr_nano       = "mlxa",
+  fireredasr2        = "mlxa",
+  sensevoice         = "mlxa",
+  canary             = "mlxa",
+  moonshine          = "mlxa",
+  vibevoice          = "mlxa",
+}
+
+-- Label and accuracy for the models worth naming. `wer` is measured HERE, on
+-- this machine, against the exact quantised snapshot the menu loads: 73
+-- LibriSpeech test-clean clips, 481s of audio, 1169 reference words, each clip
+-- transcribed on its own the way a dictation is. Published leaderboard figures
+-- describe the full-precision originals, and the gap is not small — the 4-bit
+-- Qwen3-ASR build measures 3.93 where the original leads the leaderboard at
+-- 4.31 avg, so a quantised snapshot has to be measured, not assumed.
+--
+-- What the number does not cover: clean read speech only. A model that is
+-- mediocre here can still be the one that survives a noisy room, and Whisper in
+-- particular is built for messy input this corpus never presents.
+--
+-- A cached model absent from this table still appears, under its bare repo name
+-- and with no number, because a guessed WER would be worse than none.
+local CATALOG = {
+  ["mlx-community/parakeet-tdt-0.6b-v2"]               = { name = "parakeet v2 · English",        wer = 2.74 },
+  ["mlx-community/parakeet-tdt-0.6b-v3"]               = { name = "parakeet v3 · 25 langs",       wer = 3.17 },
+  ["mlx-community/parakeet-tdt-1.1b"]                  = { name = "parakeet 1.1b · English"                  },
+  ["lyzgeorge/cohere-transcribe-03-2026-mlx-4bit"]     = { name = "Cohere Transcribe · 14 langs", wer = 1.97 },
+  ["mlx-community/granite-speech-4.1-2b-nar-mlx-5bit"] = { name = "Granite 4.1 NAR · 5 langs",    wer = 2.57 },
+  ["mlx-community/Qwen3-ASR-1.7B-4bit"]                = { name = "Qwen3-ASR 1.7B · 52 langs",    wer = 3.93 },
+  -- Whisper earns its place on robustness and 99 languages, not on this corpus:
+  -- it is both the least accurate and, at 68s for 481s of audio, six times
+  -- slower than parakeet. Reach for it when the audio is messy, not by default.
+  ["mlx-community/whisper-large-v3-asr-8bit"]          = { name = "Whisper large-v3 · 99 langs",  wer = 7.36 },
+  -- Qwen3-ASR with a quality router in front: on noisy or far-field audio a LoRA
+  -- path cuts WER by roughly a fifth (7.53 vs 9.31 on NOIZEUS), on clean speech
+  -- it is plain Qwen3-ASR. CAUTION: mlx-audio 0.5.7 raises a broadcast_shapes
+  -- error on anything past ~30s, and MAX_RECORD allows 90, so a long dictation
+  -- on this model comes back empty. Short takes only until that is fixed.
+  ["mlx-community/Mega-ASR-bf16"]                      = { name = "Mega-ASR · noisy, ≤30s",       wer = 3.76 },
+}
 
 -- Disk footprint of a cached snapshot ≈ resident memory the model needs once
 -- loaded (weights dominate; tokenizer/config are KB). Shown in the menu so a
@@ -132,45 +202,54 @@ local function humanSize(kb)
   return string.format("%d MB", math.floor(kb / 1024 + 0.5))
 end
 
-local function prettyName(id)
-  local map = {
-    ["parakeet-tdt-0.6b-v3"] = "v3 · multilingual",
-    ["parakeet-tdt-0.6b-v2"] = "v2 · English",
-    ["parakeet-tdt-1.1b"]    = "1.1b · English (larger)",
-    ["Qwen3-ASR-1.7B-4bit"]  = "Qwen3-ASR · multilingual",
-  }
-  local base = id:match("([^/]+)$") or id
-  return map[base] or base
-end
+-- One pass over the hub. Per snapshot it emits every model_type in the config —
+-- there are usually several, since nested encoder configs carry their own — plus
+-- a "parakeet" marker for NeMo configs. Lua then takes the first type ENGINES
+-- recognises, so a nested `qwen3_asr_audio_encoder` can never decide a backend.
+-- A repo with `.incomplete` blobs is a download still in flight: listing it would
+-- put a model in the menu that fails the moment it is picked.
+local HUB_SCAN = [==[
+for d in "$HF_HUB"/models--*; do
+  [ -d "$d" ] || continue
+  ls "$d"/blobs/*.incomplete >/dev/null 2>&1 && continue
+  s=$(ls -d "$d"/snapshots/*/ 2>/dev/null | head -1); [ -n "$s" ] || continue; s=${s%/}
+  [ -f "$s/config.json" ] || continue
+  [ -e "$s/model.safetensors" ] || [ -e "$s/model.safetensors.index.json" ] || continue
+  ty=$(grep -o '"model_type"[^,}]*' "$s/config.json" | grep -o '"[A-Za-z0-9_]*"$' | tr -d '"' | tr '\n' ' ')
+  grep -q 'nemo\.collections\.asr\.models' "$s/config.json" && ty="parakeet $ty"
+  printf '%s\t%s\t%s\t%s\n' "$(basename "$d")" "$s" "$(du -sL -k "$s" 2>/dev/null | cut -f1)" "$ty"
+done
+]==]
 
--- Returns { {id=, path=, name=, engine=, stream=}, ... } for cached models.
--- engine "parakeet" → warm streaming server (live preview); "qwen3" → mlx-audio
--- batch (transcribe on release, no preview).
+-- Returns { {id=, path=, name=, wer=, engine=, stream=, sizeKB=, sizeStr=}, … }
+-- for every cached model whose config names a backend we can run.
 local function discoverModels()
-  local cmd = 'for d in "' .. HF_HUB .. '"/models--mlx-community--parakeet-* '
-    .. '"' .. HF_HUB .. '"/models--mlx-community--Qwen3-ASR*; do '
-    .. '[ -d "$d" ] || continue; '
-    .. 's=$(ls -d "$d"/snapshots/*/ 2>/dev/null | head -1); '
-    .. '[ -e "${s%/}/model.safetensors" ] || continue; '
-    .. 'sz=$(du -sL -k "${s%/}" 2>/dev/null | cut -f1); '
-    .. 'printf "%s\\t%s\\t%s\\n" "$(basename "$d")" "${s%/}" "${sz:-0}"; '
-    .. 'done'
-  local out = hs.execute(cmd) or ""
+  local out = hs.execute('HF_HUB="' .. HF_HUB .. '"\n' .. HUB_SCAN) or ""
   local models = {}
-  for dir, path, kb in out:gmatch("([^\t\n]+)\t([^\t\n]+)\t([^\t\n]+)") do
-    local id = dir:gsub("^models%-%-", ""):gsub("%-%-", "/")  -- → mlx-community/…
-    local isParakeet = id:find("parakeet", 1, true) ~= nil
-    local sizeKB = tonumber(kb) or 0
-    models[#models + 1] = {
-      id = id, path = path, name = prettyName(id),
-      engine = isParakeet and "parakeet" or "qwen3",
-      stream = isParakeet,
-      sizeKB = sizeKB, sizeStr = humanSize(sizeKB),
-    }
+  for dir, path, kb, types in out:gmatch("([^\t\n]+)\t([^\t\n]+)\t([^\t\n]+)\t([^\n]*)") do
+    local engine
+    for t in types:gmatch("%S+") do engine = engine or ENGINES[t] end
+    if engine then
+      local id = dir:gsub("^models%-%-", ""):gsub("%-%-", "/")   -- → mlx-community/…
+      local meta = CATALOG[id] or {}
+      local sizeKB = tonumber(kb) or 0
+      models[#models + 1] = {
+        id = id, path = path,
+        name = meta.name or (id:match("([^/]+)$") or id),
+        wer = meta.wer,
+        engine = engine, stream = (engine == "parakeet"),
+        sizeKB = sizeKB, sizeStr = humanSize(sizeKB),
+      }
+    end
   end
-  table.sort(models, function(a, b)       -- streaming models first, then v3 before v2
+  -- Streaming models first — they are the only ones that show a live preview, so
+  -- they are a different kind of choice, not just a more accurate one. Within a
+  -- group, most accurate first; ties and unranked models fall back to the id so
+  -- the menu order never shifts between reloads.
+  table.sort(models, function(a, b)
     if a.stream ~= b.stream then return a.stream end
-    return a.id > b.id
+    if (a.wer or 99) ~= (b.wer or 99) then return (a.wer or 99) < (b.wer or 99) end
+    return a.id < b.id
   end)
   return models
 end
@@ -220,7 +299,7 @@ local function initModel()
 end
 
 -- The warm parakeet server always runs a *parakeet* model (used when a streaming
--- model is selected, and kept ready for when you switch back from Qwen3).
+-- model is selected, and kept ready for when you switch back from a batch one).
 local function defaultParakeet()
   for _, m in ipairs(MODELS) do if m.engine == "parakeet" and m.path == MODEL_PATH then return m end end
   for _, m in ipairs(MODELS) do if m.engine == "parakeet" then return m end end
@@ -228,12 +307,12 @@ local function defaultParakeet()
 end
 
 local _sel = initModel()
-M.engine     = _sel.engine            -- "parakeet" | "qwen3"
+M.engine     = _sel.engine            -- "parakeet" (streams) | "mlxa" (batch)
 M.stream     = _sel.stream            -- live preview?
 M.selectedId = _sel.id                -- for the menu checkmark
 M.modelName  = _sel.name
 M.modelSize  = _sel.sizeStr           -- resident-memory footprint (e.g. "2.3 GB")
-M.modelRepo  = _sel.id                -- mlx-audio --model arg (qwen3)
+M.modelRepo  = _sel.id                -- mlx-audio --model arg (batch engine)
 if _sel.engine == "parakeet" then
   M.serverModelPath, M.serverModelName = _sel.path, _sel.name
 else
@@ -604,17 +683,18 @@ local function unduckNoise()
   end
 end
 
--- Batch path for non-streaming engines (Qwen3-ASR via mlx-audio). No live
+-- Batch path for every non-streaming model, run through mlx-audio. No live
 -- preview: the finished WAV is transcribed after release. No --language flag, so
--- the model auto-detects (English/French). Cold-loads the model each call.
-local function transcribeQwen3()
-  os.remove(QWEN3_OUT .. ".txt")
-  logf("[dictate] qwen3 batch transcribe (%s)", M.modelRepo)
+-- the model auto-detects (English/French). Cold-loads the model each call, which
+-- is why these entries cost seconds where a warm parakeet costs ~0.2s.
+local function transcribeBatch()
+  os.remove(BATCH_OUT .. ".txt")
+  logf("[dictate] batch transcribe (%s)", M.modelRepo)
   local t = hs.task.new(MLXA_PY, function(code, _, err)
-    if code ~= 0 and err and err ~= "" then logf("[dictate] qwen3 stderr: %s", err) end
-    finishTranscript(readFile(QWEN3_OUT .. ".txt"))
+    if code ~= 0 and err and err ~= "" then logf("[dictate] batch stderr: %s", err) end
+    finishTranscript(readFile(BATCH_OUT .. ".txt"))
   end, {"-m", "mlx_audio.stt.generate", "--model", M.modelRepo,
-        "--audio", WAV, "--output-path", QWEN3_OUT, "--format", "txt"})
+        "--audio", WAV, "--output-path", BATCH_OUT, "--format", "txt"})
   t:setEnvironment({ HOME = os.getenv("HOME"), PATH = "/opt/homebrew/bin:/usr/bin:/bin" })
   t:start()
 end
@@ -632,20 +712,20 @@ local function startRecording()
   -- recording finishes and (maybe) routes there. Idempotent.
   ensureSupervisorClients()
   M.recording = true
-  M.qwenFinish = false
+  M.batchFinish = false
   M.startedAt = hs.timer.secondsSinceEpoch()
   setIcon("●")
   hideLivePreview()
   showLivePreview(nil)   -- "Listening…" (stays put for batch engines: no partials)
   duckNoise()
   logf("[dictate] recording start (mic=%q, engine=%s)", M.micName, M.engine)
-  -- Two outputs from one capture: WAV for batch transcription (CLI / Qwen3),
+  -- Two outputs from one capture: WAV for batch transcription (CLI / mlx-audio),
   -- plus a headerless s16le PCM file the parakeet server tails live.
   M.ffmpegTask = hs.task.new(FFMPEG, function(code, _, err)
     logf("[dictate] ffmpeg exit=%d", code)
     if code ~= 0 and err and err ~= "" then logf("[dictate] ffmpeg stderr: %s", err) end
     -- Non-streaming engine: WAV is finalized now, so kick off the batch transcribe.
-    if M.qwenFinish then M.qwenFinish = false; transcribeQwen3() end
+    if M.batchFinish then M.batchFinish = false; transcribeBatch() end
   end,
     {"-y", "-f", "avfoundation", "-i", ":" .. M.micName,
      "-ar", "16000", "-ac", "1", WAV,
@@ -690,8 +770,8 @@ function stopRecording()
   if M.watchdog then M.watchdog:stop(); M.watchdog = nil end
   local dur = hs.timer.secondsSinceEpoch() - M.startedAt
   -- For batch engines, flag the finish BEFORE terminating ffmpeg so its exit
-  -- callback (which fires once the WAV is finalized) runs transcribeQwen3.
-  M.qwenFinish = (not M.stream) and (not M.cancelled) and (dur >= MIN_DURATION)
+  -- callback (which fires once the WAV is finalized) runs transcribeBatch.
+  M.batchFinish = (not M.stream) and (not M.cancelled) and (dur >= MIN_DURATION)
   if M.ffmpegTask then M.ffmpegTask:terminate(); M.ffmpegTask = nil end
   if M.previewTimer then M.previewTimer:stop(); M.previewTimer = nil end
   if M.cancelled then
@@ -721,7 +801,7 @@ function stopRecording()
       end
     end)
   end
-  -- Batch engine: handled by the ffmpeg exit callback (M.qwenFinish) once WAV is finalized.
+  -- Batch engine: handled by the ffmpeg exit callback (M.batchFinish) once WAV is finalized.
 end
 
 -- Kill any stale process on port 8765, then launch the warm parakeet server.
@@ -796,8 +876,9 @@ end
 
 -- Dynamic menu: rebuilt each open so the active model keeps its checkmark.
 -- 🟢 = streaming parakeet (live preview) · 🟡 = batch engine (transcribe on release).
--- 5-cell bar scaled to the largest cached model, so relative RAM cost is
--- legible at a glance (█ = filled, ░ = empty).
+-- Each row carries the two numbers a switch actually trades off: published
+-- English WER and RAM. The 5-cell bar scales to the largest cached model, so the
+-- relative memory cost is legible at a glance (█ = filled, ░ = empty).
 local function sizeBar(kb, maxKB)
   if not kb or kb <= 0 or not maxKB or maxKB <= 0 then return "" end
   local cells = 5
@@ -818,15 +899,17 @@ local function buildMenu()
   MICS = discoverMics()   -- refresh so the picker reflects currently-connected inputs
   local maxKB = 0
   for _, m in ipairs(MODELS) do if m.sizeKB and m.sizeKB > maxKB then maxKB = m.sizeKB end end
-  local items = { { title = "Speech model · RAM footprint", disabled = true } }
+  local items = { { title = "Speech model · English WER · RAM footprint", disabled = true } }
   for _, m in ipairs(MODELS) do
     local icon = m.stream and "🟢" or "🟡"
-    items[#items + 1] = { title = string.format("%s  %s   %s  %s",
-                            icon, m.name, sizeBar(m.sizeKB, maxKB), m.sizeStr),
+    local wer  = m.wer and string.format("%.2f", m.wer) or "  — "
+    items[#items + 1] = { title = string.format("%s  %s   %s   %s  %s",
+                            icon, m.name, wer, sizeBar(m.sizeKB, maxKB), m.sizeStr),
                           checked = (m.id == M.selectedId),
                           fn = function() setModel(m) end }
   end
   items[#items + 1] = { title = "-" }
+  items[#items + 1] = { title = "WER: measured on LibriSpeech test-clean, lower is better", disabled = true }
   items[#items + 1] = { title = "█ RAM resident   🟢 live preview   🟡 batch (on release)", disabled = true }
   items[#items + 1] = { title = "-" }
   -- Microphone picker: select by name so it survives avfoundation reshuffles.

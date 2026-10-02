@@ -12,7 +12,8 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 # then reload Hammerspoon:  hs -c 'hs.reload()'
 ```
 
-`init.lua` requires each app under `apps/`:
+Apps load themselves: anything under `apps/` with an `init.lua`, and any single
+`.lua` file there, is picked up at startup — see [Plugins](#plugins).
 
 | App | What it does |
 |-----|--------------|
@@ -21,6 +22,8 @@ ln -s ~/Github/hammerspoon ~/.hammerspoon
 | `apps/volume_tap` | Voice control for the default supervisor (Orchestrator) via volume-key taps. |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. `Fn+S` reads the current selection aloud. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
+| `apps/lmstudio` | Runs the local [LM Studio](https://lmstudio.ai) MLX server from the hub: a Server switch, a ✓ picker that switches the loaded model, and a memory panel showing what every model on disk costs and what the Mac has free. Switching unloads the resident model of the same kind first, so an embedding model keeps serving while the chat model changes. `--ttl` gives an idle model's memory back on its own. See [LM Studio](#lm-studio). |
+| `apps/dsh` | Runs the [DeepSeek Harness](https://github.com/deepseek-ai) web profile from the hub: a Server switch, Restart, and "Open the web UI" — which starts the server first when it is off, then opens the browser once it answers. See [DeepSeek Harness](#deepseek-harness). |
 | `apps/shokz` | Volume-button chords on the Shokz OpenComm2 (e.g. volume− then volume+), read from CoreAudio volume changes. Other apps claim chords from its `actions` table; `apps/voice_agent` uses one. |
 | `apps/shokz_mute` | Keeps Microsoft Teams' mute in step with the headset's hardware mute button, read from the bluetoothd log. Uses the Teams local API when allowed, otherwise sends Cmd+Shift+M to Teams. Hub tile: sync switch, status, re-align, reconnect, backend picker. |
 
@@ -34,10 +37,71 @@ that run in place.
 Option-click 🔨 for the plain dropdown. A new app gets a tile, not a new icon:
 
 ```lua
-M.menu = require("lib.menuhub").item("My app")   -- instead of hs.menubar.new()
+local ctx = require("lib.context").new("My app")
+
+M.menu = ctx:tile("My app")                       -- instead of hs.menubar.new()
 M.menu:setTitle("✅")                             -- same setTitle/setIcon/setMenu/
 M.menu:setMenu(function() return { ... } end)     -- setTooltip/setClickCallback API
 ```
+
+## Plugins
+
+Each app is a plugin: a folder `apps/<name>/init.lua`, or a single
+`apps/<name>.lua`. Dropping one in is enough, no file lists it, and one that
+throws on require fails alone instead of taking down everything after it.
+`init.lua` names only the few whose load order matters, which is also the tile
+order in the hub.
+
+An app builds everything through its own context (`lib/context.lua`), which
+remembers how to undo it:
+
+```lua
+local ctx = require("lib.context").new("My app")
+
+ctx:tile("My app")                      -- a hub tile, removed on dispose
+ctx:timer(15, poll)                     -- doEvery, stopped on dispose
+ctx:after(2, once)                      -- doAfter, and it forgets itself as it fires
+ctx:task(bin, onExit, args)             -- hs.task, terminated on dispose
+ctx:hotkey({ "cmd" }, "d", fn)          -- deleted on dispose
+ctx:url("myapp", fn)                    -- hammerspoon://myapp, unbound on dispose
+ctx:atExit(cleanup)                     -- instead of hs.shutdownCallback
+
+function M.dispose() ctx:dispose() end  -- what makes the app switchable
+```
+
+Every constructor returns `handle, release`. The handle is the real `hs` object,
+so calling code reads as it always did; `release()` tears that one effect down
+early and forgets it, which is what an app calls when it kills its own task
+instead of `task:terminate()`.
+
+`ctx:atExit` exists because `hs.shutdownCallback` is a single global slot: the
+last app to set it wins and the one it replaced silently stops running at quit.
+Contexts share one callback that fans out.
+
+The 🧩 **Plugins** tile carries a switch per app, and what is switched off
+persists across reloads. Switching off is only as good as the app: one with a
+`dispose()` genuinely goes away, while one without can only be stopped from
+loading next time, and its row says `(reload to remove)` rather than pretending
+otherwise.
+
+### Spoons
+
+[Spoons](https://www.hammerspoon.org/Spoons/) load into a context too, so one
+written by anyone else gets a tile and a teardown:
+
+```lua
+local ctx = require("lib.spoon").load("Caffeine", {
+  hotkeys = { toggleWhileLocked = { { "cmd", "alt" }, "c" } },
+  icon    = "☕️",
+})
+```
+
+`:stop()` is registered as the teardown, and the `hs.*` constructors are swapped
+for recording ones while `:bindHotkeys()` and `:start()` run, so handles a
+careless `:stop()` forgets are tracked anyway. That capture only sees
+constructors called during those two calls — a Spoon that arms a timer later
+from its own callback escapes it — so it makes a careless Spoon survivable, not
+safe.
 
 ## Voice routing targets
 
@@ -159,8 +223,8 @@ unicode déjà vu — em dash and émoji ✅
 
 `apps/voice_agent` is optional: it lives in
 [pipecat-voice-agent](https://github.com/Pierre-Mike/pipecat-voice-agent), whose
-`hammerspoon/install.sh` symlinks it (and `lib/voice_toggle.lua`) in here. `init.lua`
-loads it only when it is installed.
+`hammerspoon/install.sh` symlinks it (and `lib/voice_toggle.lua`) in here. On a
+fresh clone it is simply not there, and discovery skips it.
 
 ## Assets not in git
 
@@ -176,6 +240,43 @@ Large binaries are `.gitignore`d (see `.gitignore`) — they live on disk but ar
 - **noseguard venv** (`apps/noseguard/.venv/`) — recreate with
   `python3 -m venv apps/noseguard/.venv && apps/noseguard/.venv/bin/pip install pyobjc`.
   Detection runs on Apple Vision, so `pyobjc` is the only requirement.
+
+## Speech models
+
+The dictation menubar lists every speech model cached under
+`~/.cache/huggingface/hub`, with its published English WER and its RAM footprint.
+A model joins the list by being downloaded and leaves it by being deleted —
+`apps/dictation` reads each model's `config.json` to decide which backend runs it,
+so nothing in the code needs editing:
+
+- a **NeMo** config (the parakeet family) runs on the warm `parakeet_server.py`,
+  the only backend that streams, so these are the only models with a live preview
+  (🟢) and the only ones that cost ~0.2s per dictation rather than seconds
+- any other `model_type` mlx-audio implements runs through its batch CLI (🟡):
+  the WAV is transcribed on release, with no preview and a cold model load
+
+```sh
+hf download mlx-community/parakeet-tdt-0.6b-v2      # streaming, English
+hf download mlx-community/whisper-large-v3-asr-8bit # batch, 99 languages
+hs -c 'hs.reload()'                                 # the menu picks them up
+```
+
+Add the model to `CATALOG` in `apps/dictation/init.lua` to give it a readable
+name and a WER; without an entry it still appears, under its bare repo name. The
+WER there is measured locally against the exact quantised snapshot, not copied
+from a leaderboard, because quantisation moves it: the 4-bit Qwen3-ASR build
+measures 3.93 where the full-precision original tops the Open ASR Leaderboard.
+`ENGINES` in the same file is the list of architectures the picker will run — an
+mlx-audio release that adds an architecture needs a key here too, and
+`test_stt.sh` keeps its own copy in step.
+
+The batch backend needs `soundfile` and `sentencepiece`, which mlx-audio does not
+pull in itself: `uv tool install mlx-audio --with soundfile --with sentencepiece`.
+Without them Granite fails on load and Cohere Transcribe fails on its tokenizer.
+
+`./test_stt.sh` transcribes one clip (`/tmp/hs-dictate.wav` by default — dictate
+once and it is there) with every cached model in turn, so accuracy and speed can
+be compared on your own voice and microphone rather than on a benchmark corpus.
 
 ## TTS service setup
 
@@ -245,6 +346,82 @@ both work; header wins. The menu-bar **Default voice** submenu switches the
 fallback voice used when no selector is given. First use of a voice downloads its
 prompt from HF (cached after). Set the language in `lib/config.lua` (`TTS_LANGUAGE`).
 Logs: `/tmp/hs-tts.log` (queue) and the server's stdout.
+
+## LM Studio
+
+`apps/lmstudio` drives the local LM Studio server from the 🧠 tile: start and
+stop it, switch the loaded model, and read what each model costs in memory
+before you load it.
+
+Needs LM Studio's CLI at `~/.lmstudio/bin/lms` (LM Studio → Developer → Install
+CLI). Without it the tile says so and offers nothing else.
+
+Clicking a model switches to it — the loaded model of the **same kind** is
+unloaded first, then the new one loads. Two 15 GB chat models do not fit in
+32 GB, so a switch has to be a swap; an embedding model is a different kind and
+keeps serving while the chat model changes under it.
+
+The memory section reads the machine the way Activity Monitor does (app + wired
++ compressed pages; see `lib/lmstudio.memory`). A model whose weights plus
+2 GB of working headroom would not fit, even counting the memory the swap gives
+back, is marked ⚠︎ — a warning, not a block.
+
+"Auto-unload when idle" passes `--ttl` to the next load, so an idle 15 GB model
+gives its memory back on its own. It is a load-time flag: it binds the model you
+load next, not the one already resident.
+
+Three sources feed the tile, because none of them has everything:
+
+| source | gives | cost |
+|---|---|---|
+| `GET /api/v0/models` | which models are loaded, at what context | ~8 ms |
+| `lms ls --json` | every model on disk, and the only byte counts | ~250 ms |
+| `lms ps --json` | models loaded with the server off, and unload identifiers | ~160 ms |
+
+`lib/lmstudio.catalog` joins them on the model key. Nothing is queried while the
+menu is being built — menuhub rebuilds an app's menu on every open and every
+redraw behind it, and a 250 ms spawn on that path would be felt. A 15 s poll
+keeps the state current and the menu renders what is already cached. Only the
+cheap HTTP call runs at that rate; the disk catalog refreshes every 5 minutes,
+and the down-state probe (which costs two spawns) no more than every 45 s.
+
+When the HTTP call goes unanswered the tile asks `lms server status` for the
+real port before concluding the server is off, so a server restarted on another
+port is picked back up instead of showing as dead.
+
+## DeepSeek Harness
+
+`apps/dsh` drives the harness's web profile from the 🐋 tile: start it, stop it,
+restart it, and open its browser UI.
+
+Needs the `dsh` launcher on `/opt/homebrew/bin`, `/usr/local/bin` or
+`~/.local/bin` (`npm i -g @deepseek-ai/dsh`). Without it the tile says so.
+
+The tile runs `dsh --profile web --no-open --port 3080` and holds the process
+itself, so Stop is a SIGTERM the node server shuts down cleanly on. `--no-open`
+matters: starting a server from the menu bar should not pull a browser window to
+the front. "Open the web UI" is the item that opens one, and from a cold start it
+starts the server first and waits for it to answer, so the browser never loads a
+dead address.
+
+Two things can hold port 3080 without the tile knowing — a server started in a
+terminal, and one this tile started before a Hammerspoon reload threw away the
+handle. So every start frees the port first, and the running state comes from
+asking the address rather than from our own bookkeeping:
+
+| question | answer |
+|---|---|
+| is it up? | a 15 s `GET` on the bound address; any status means something answered |
+| where is it? | the `dsh web: http://…` line the server prints on stdout |
+| what still holds the port? | `lsof -tiTCP:3080 -sTCP:LISTEN` |
+
+`-sTCP:LISTEN` is what makes that last one safe. A bare `lsof -ti :3080` also
+matches sockets whose *remote* port is 3080, and Hammerspoon holds one of those
+every time the tile polls — the same pattern took Hammerspoon down from
+`apps/voice_agent` before it was fixed there.
+
+Nothing starts on a config reload. The Server switch and "Open the web UI" are
+the only things that turn it on.
 
 ## Tests
 
