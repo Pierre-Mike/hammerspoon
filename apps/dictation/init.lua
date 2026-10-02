@@ -863,6 +863,11 @@ require("lib.audiowatch").on("dictation", function()
 end)
 
 M.isRecording = function() return M.recording end
+-- Start or stop a take from something other than Fn (e.g. a Shokz chord). The
+-- transcript pastes at the cursor, the same as a Fn take.
+M.toggle = function()
+  if M.recording then stopRecording() else startRecording() end
+end
 
 notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+S speak selection", 2.0)
 logf("[dictate] init complete")
