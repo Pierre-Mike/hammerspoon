@@ -13,7 +13,6 @@ local plugins = require("lib.plugins")
 plugins.loadAll({
   "dictation",
   "brown_noise",
-  "volume_tap",
   "noseguard",
   "tts",
   "lmstudio",

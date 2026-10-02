@@ -33,8 +33,8 @@ hs.eventtap = {
 }
 
 -- Real macOS virtual keycodes for the letters apps/dictation chords on
--- (Fn+C cancel, Fn+A → Orchestrator, Fn+P → firstmate).
-hs.keycodes = { map = { a = 0, c = 8, p = 35 } }
+-- (Fn+C cancel, Fn+S speak selection).
+hs.keycodes = { map = { c = 8, s = 1 } }
 
 hs.screen = {
   mainScreen = function()
