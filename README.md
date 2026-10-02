@@ -17,9 +17,8 @@ Apps load themselves: anything under `apps/` with an `init.lua`, and any single
 
 | App | What it does |
 |-----|--------------|
-| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+A` routes the transcript into the zellij `Orchestrator` session and `Fn+P` into the firstmate primary's tmux pane instead of pasting — see [Voice routing targets](#voice-routing-targets). `Fn+C` cancels & recalls the last result. `Fn+S` cancels and reads the current *selection* aloud through `apps/tts`. Menu-bar picker switches speech models. |
+| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+C` cancels & recalls the last result. `Fn+S` cancels and reads the current *selection* aloud through `apps/tts`. Menu-bar picker switches speech models. |
 | `apps/brown_noise` | Noise machine in the hub: a Play switch, volume slider, and color picker (white/pink/brown/blue/violet). |
-| `apps/volume_tap` | Voice control for the default supervisor (Orchestrator) via volume-key taps. |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. `Fn+S` reads the current selection aloud. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
 | `apps/lmstudio` | Runs the local [LM Studio](https://lmstudio.ai) MLX server from the hub: a Server switch, a ✓ picker that switches the loaded model, and a memory panel showing what every model on disk costs and what the Mac has free. Switching unloads the resident model of the same kind first, so an embedding model keeps serving while the chat model changes. `--ttl` gives an idle model's memory back on its own. See [LM Studio](#lm-studio). |
@@ -102,124 +101,6 @@ careless `:stop()` forgets are tracked anyway. That capture only sees
 constructors called during those two calls — a Spoon that arms a timer later
 from its own callback escapes it — so it makes a careless Spoon survivable, not
 safe.
-
-## Voice routing targets
-
-A dictated transcript either pastes at the cursor (plain **Fn**) or is delivered
-straight into a supervisor's terminal pane and submitted. Every destination lives
-in one table, `VOICE_TARGETS` in `lib/config.lua`, and each one names its own
-**transport** — which multiplexer owns the pane:
-
-| Chord | Route | Transport | Address | Delivered by |
-|---|---|---|---|---|
-| `Fn+A` | `orchestrator` | zellij | session `Orchestrator` | `action write-chars` → `action write 13` |
-| `Fn+P` | `firstmate` | tmux | `firstmate:0.0` (`FIRSTMATE_PRIMARY_TMUX_TARGET`) | `load-buffer -` → `paste-buffer -p -d` → `send-keys Enter` |
-
-Headset MFB and `apps/volume_tap` use `VOICE_TARGET_DEFAULT`, which is
-`orchestrator`. `Fn+C` is reserved for cancel-and-recall and can't be claimed by
-a target. `lib/voice_targets.lua` (pure, unit tested in
-`tests/spec/voice_targets_spec.lua`) does all resolution and command
-construction — no module holds a session name or a multiplexer path of its own.
-
-Each transport returns an ordered **step list**, so the step *count* differs by
-transport (two for zellij, three for tmux) and `apps/dictation` simply runs
-whatever list it is handed, stopping at the first failure. It never branches on
-transport. Adding a destination is one `VOICE_TARGETS` entry; adding a third
-multiplexer is one entry in `voice_targets.TRANSPORTS` plus one in
-`config.VOICE_TRANSPORTS` — and no change in `apps/dictation` either way.
-
-No multiplexer here has an atomic type-and-submit, so the text is typed **once**
-and the newline follows only after the type is confirmed. A failed submit never
-retypes: a duplicated instruction is worse than an unsubmitted one.
-
-### Why firstmate is reached over tmux, not zellij
-
-firstmate runs a **hybrid**: the captain/primary sits in a **tmux** pane while
-crewmate tasks spawn as **zellij** tabs. That's forced, not chosen — firstmate's
-away-mode supervisor daemon refuses at startup for any supervisor backend other
-than `tmux` or `herdr` (`bin/fm-supervise-daemon.sh`, `docs/configuration.md`
-"Away-mode supervisor backend"), and it resolves the supervisor pane's backend
-independently of the runtime backend that spawns crewmates. So voice-in speaks
-tmux to reach the captain and zellij only for the Orchestrator.
-
-Launch the captain so that target resolves:
-
-```sh
-tmux new-session -s firstmate -c ~/Github/firstmate   # primary in window 0, pane 0
-# crewmate tabs stay in the shared "firstmate" ZELLIJ session — a different
-# namespace entirely, which the tmux route cannot reach
-```
-
-### Why both routes paste rather than type
-
-`zellij action paste` and `tmux paste-buffer -p` both use **bracketed paste
-mode**, and neither auto-submits. That's the point: the pane receives one paste
-rather than N keystrokes, so a Claude Code completion or slash-command popup can't
-open mid-transcript and swallow the Enter that follows. Verified against the
-installed tmux 3.7b — with the pane's program having enabled bracketed paste
-(`DECSET 2004`), the payload arrives wrapped:
-
-```
-033 [ 2 0 0 ~   p o p u p   s a f e   p a y l o a d   033 [ 2 0 1 ~
-```
-
-When the program hasn't enabled it (a bare shell), tmux sends the text plain, so
-`-p` is safe to pass unconditionally.
-
-On tmux the transcript is staged with `load-buffer -b <buf> -`, i.e. **on stdin**,
-so it never appears in argv at all. That matters: `tmux send-keys` has no `--`
-option terminator (verified — `send-keys -l "-x…"` fails with "unknown flag -x"),
-so an argv-carried transcript starting with a dash would be parsed as flags.
-Nothing needs escaping if nothing is passed as an argument. `paste-buffer -d` then
-deletes the buffer so spoken text doesn't linger in tmux's buffer stack.
-
-This deliberately diverges from firstmate's own tmux adapter, which uses
-`send-keys -l` (`bin/fm-tmux-lib.sh:426`) — bracketed paste is the safer
-primitive, for the same reason firstmate itself chose `action paste` over
-`write-chars` on the zellij side.
-
-`orchestrator` deliberately stays on zellij `write-chars` + `write 13`,
-byte-for-byte the pair it has always used, so this addition changes no working
-live path. Switching it to `paste` + `enter` later is a one-word config edit
-(`input` / `submit` on that target).
-
-### Safety: never deliver into a crewmate pane
-
-Both transports address "whatever the target resolves to", so an ambient or
-under-specified target could land dictation in a worker's prompt. Each transport
-is guarded in `lib/voice_targets.lua`, and a refusal drops the take rather than
-guessing a destination:
-
-- **tmux** — the target must be an explicit `session:window[.pane]`. A bare
-  `firstmate` would go to that session's *current* window, so it is refused.
-  (Crewmates are zellij tabs, so a tmux target can't reach one at all; the
-  explicit target is what stops delivery reaching the wrong tmux pane.)
-- **zellij** — without an explicit `--pane-id`, `zellij --session <name> action …`
-  delivers to whichever pane is *focused*. firstmate's crewmates share one
-  session (default `firstmate`, overridable with `FM_ZELLIJ_SESSION`), so any
-  zellij-transport route pointing at a name in `FIRSTMATE_CREW_SESSIONS` is
-  refused — case-insensitively. zellij 0.44 *can* name a pane (`--pane-id
-  terminal_3`, checked against 0.44.3) and a target may set `paneId`, but the
-  primary's pane id isn't known when a chord is pressed and changes across
-  restarts, so pane-id can't be the primary defence.
-
-`deliverySteps` also refuses an unresolved target, so no code path can construct
-a delivery aimed at a crewmate even if `VOICE_TARGETS` is later edited to point
-there. Any config conflict — a duplicate chord, a stolen `Fn+C`, an unknown
-transport, an ambient target, a misspelled `input`/`submit` — arms **no** chord at
-all and shows "voice route refused".
-
-Because `hs.task` passes argv directly with no shell, quotes, `$VAR`, and `;`
-arrive literally on both transports. Verified end-to-end against a real tmux pane,
-running the exact steps the module builds:
-
-```
-ship the migration branch then open a draft PR
--- a transcript that starts with dashes
--t looks like a tmux flag
-quotes 'single' and "double" plus $HOME and a ; semicolon
-unicode déjà vu — em dash and émoji ✅
-```
 
 `apps/voice_agent` is optional: it lives in
 [pipecat-voice-agent](https://github.com/Pierre-Mike/pipecat-voice-agent), whose
@@ -304,7 +185,7 @@ open 'hammerspoon://speak?text=or%20via%20url&voice=marius'
 ### Speak the selection — `Fn+S`
 
 Select text anywhere, press **Fn+S**, and it reads aloud. Same chord family as
-`Fn+A` / `Fn+C`: holding Fn opens the mic as usual, and `Fn+S` cancels that
+`Fn+C`: holding Fn opens the mic as usual, and `Fn+S` cancels that
 capture before handing the selection to the queue, so nothing is recorded.
 
 macOS has no API for "the current selection", so the chord copies it (⌘C), reads

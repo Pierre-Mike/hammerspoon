@@ -13,10 +13,6 @@
 --   * Volume+ long press — this is the power button. It turns the headset off.
 --   * Volume-/+ short press — changes the output device's volume, which IS
 --     observable. That is what this module is built on.
---
--- This does not conflict with apps/volume_tap: that taps systemDefined media
--- keys (which the Logitech Zone's USB dongle emits), while the Shokz never
--- produces any, so the two never see the same event.
 
 local gestures = require("lib.shokz_gestures")
 local utils = require("lib.utils")
@@ -36,12 +32,6 @@ local function logf(fmt, ...) utils.logf(LOG, fmt, ...) end
 --             volume-, so a slip cannot become a volume+ long press, which is
 --             the headset's power-off)
 --   up_down : tap volume+ then immediately volume-
---
--- To wire one to dictation the way apps/volume_tap does:
---   local dictate = require("apps.dictation")
---   shokz.actions.down_up = function()
---     if dictate.isRecording() then dictate.stopVoice() else dictate.startSupervisorVoice() end
---   end
 M.actions = {
   up_down = function() hs.alert.show("⬆⬇  Shokz: up→down", 1.2) end,
   down_up = function() hs.alert.show("⬇⬆  Shokz: down→up", 1.2) end,
