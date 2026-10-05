@@ -29,10 +29,6 @@
 -- Reading Teams' mute another way was tried and does not work: the meeting
 -- window exposes 61 accessibility nodes and no mute control, even with
 -- AXManualAccessibility forced on. Blind toggling really is the only fallback.
---
--- Relationship to apps/shokz: that module reads the VOLUME buttons by watching
--- CoreAudio levels. This one reads the MUTE button from the bluetoothd log.
--- Different buttons, different transports, no shared state.
 
 local hfp   = require("lib.hfp_mute")
 local teams = require("lib.teams_api")
@@ -317,8 +313,8 @@ buildMenu = function()
 end
 
 -- ── Lifecycle ──────────────────────────────────────────────────────────────
--- Unlike the CoreAudio watcher in apps/shokz, both resources here can really be
--- released, so a reload tears the old instance down instead of running two.
+-- Both resources here can really be released, so a reload tears the old
+-- instance down instead of running two.
 -- keepMenu: pause from the hub switch, leaving the tile in place to resume.
 function M.stop(keepMenu)
   M.enabled = false

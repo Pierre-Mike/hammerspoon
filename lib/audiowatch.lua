@@ -1,9 +1,9 @@
 -- One hs.audiodevice.watcher for every app.
 --
 -- hs.audiodevice.watcher holds a single callback: a second setCallback silently
--- replaces the first. apps/shokz loads after apps/dictation, so it used to
--- unhook dictation's mic-list refresh and "selected mic disconnected" warning.
--- Apps register here instead and each gets every event.
+-- replaces the first, so a later app would unhook dictation's mic-list refresh
+-- and "selected mic disconnected" warning. Apps register here instead and each
+-- gets every event.
 
 local M = { handlers = {}, order = {} }
 

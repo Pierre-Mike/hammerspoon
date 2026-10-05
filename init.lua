@@ -17,7 +17,6 @@ plugins.loadAll({
   "tts",
   "lmstudio",
   "dsh",
-  "shokz",        -- before voice_agent, which claims one of its chords
   "shokz_mute",
   -- Symlinked in by ~/Github/pipecat-voice-agent/hammerspoon/install.sh. On a
   -- fresh clone of this repo it is simply not there, and discovery skips it

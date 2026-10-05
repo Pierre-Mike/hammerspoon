@@ -1,7 +1,7 @@
 -- Read a Bluetooth headset's mute button. Pure parsing, no hs.* dependency;
 -- the wiring lives in apps/shokz_mute.
 --
--- This corrects an assumption recorded in apps/shokz and lib/shokz_gestures:
+-- This corrects an assumption once recorded in the since-removed apps/shokz:
 -- that the OpenComm2 mute button "is not transmitted to a computer at all
 -- without the Loop dongle". It is. It travels over plain Bluetooth as an HFP
 -- microphone-gain command (AT+VGM) on the service-level connection, and
@@ -11,8 +11,8 @@
 --       from device A0:0C:E2:A1:75:75 - new gain is 0
 --
 -- Gain 0 is muted, anything above 0 is unmuted. Measured over 12 presses in
--- two runs: 12 events, no misses, no duplicates, exact alternation. Unlike the
--- volume-grid trick in lib/shokz_gestures this needs no classification at all,
+-- two runs: 12 events, no misses, no duplicates, exact alternation. Unlike reading
+-- the volume buttons through volume changes, this needs no classification,
 -- because the button reports absolute state rather than a nudge.
 --
 -- The headset also mutes in hardware: with the button down the input device
