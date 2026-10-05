@@ -57,6 +57,7 @@ local function row(key, m, l, p)
   local loaded = (l.state == "loaded") or (p.modelKey ~= nil)
   return {
     key        = key,
+    path       = m.path,     -- where the weights live under ~/.lmstudio/models
     name       = m.displayName or key,
     kind       = ((m.type or l.type) == "embedding" or l.type == "embeddings")
                  and "embedding" or "llm",
@@ -159,6 +160,96 @@ function M.label(r)
   if r.quant and r.quant ~= "" then shape[#shape + 1] = r.quant end
   shape[#shape + 1] = M.humanBytes(r.bytes)
   return string.format("%s · %s", r.name, table.concat(shape, " "))
+end
+
+-- ── Thinking ───────────────────────────────────────────────────────────────
+-- Qwen-style chat templates read an `enable_thinking` variable, but LM Studio
+-- only offers a switch for it when a hub model.yaml declares one (the Gemma
+-- models do; a plain Hugging Face download like Qwen3.8 does not), and `lms load`
+-- has no flag for it. What LM Studio does honour is a prompt-template override
+-- in the model's per-model defaults, which apply to the chat window and the
+-- server alike. So "thinking off" is the model's own template with the variable
+-- pinned to false in front of it, and "on" takes that line back out.
+
+M.NO_THINK = "{%- set enable_thinking = false -%}{#- hammerspoon: thinking off -#}\n"
+local NO_THINK = M.NO_THINK
+local TEMPLATE_KEY = "llm.prediction.promptTemplate"
+
+-- Only templates that branch on the variable can be switched; pinning it in any
+-- other template would change nothing.
+function M.thinkingSwitchable(template)
+  return type(template) == "string" and template:find("enable_thinking", 1, true) ~= nil
+end
+
+local function deepCopy(v)
+  if type(v) ~= "table" then return v end
+  local t = {}
+  for k, x in pairs(v) do t[k] = deepCopy(x) end
+  return t
+end
+
+local function templateField(config)
+  local fields = type(config) == "table" and type(config.operation) == "table"
+                 and config.operation.fields
+  if type(fields) ~= "table" then return nil end
+  for i, f in ipairs(fields) do
+    if f.key == TEMPLATE_KEY then return f, i end
+  end
+end
+
+local function jinjaOf(field)
+  local v = field and field.value
+  local j = type(v) == "table" and v.jinjaPromptTemplate
+  return type(j) == "table" and j.template or nil
+end
+
+local function pinned(t)
+  return t ~= nil and t:sub(1, #NO_THINK) == NO_THINK
+end
+
+function M.thinkingOff(config)
+  return pinned(jinjaOf(templateField(config)))
+end
+
+-- Returns a copy of the per-model config with thinking on or off. `template` is
+-- the model's own chat template, used when there is no override to build on.
+-- An override someone set by hand is kept: off prefixes it, on unprefixes it.
+-- An override that is just the model's template again is dropped, so turning
+-- thinking back on leaves the config the way LM Studio wrote it.
+function M.withThinking(config, on, template)
+  local out = type(config) == "table" and deepCopy(config) or {}
+  out.preset = out.preset or ""
+  out.operation = type(out.operation) == "table" and out.operation or {}
+  out.operation.fields = type(out.operation.fields) == "table" and out.operation.fields or {}
+  out.load = type(out.load) == "table" and out.load or { fields = {} }
+
+  local fields = out.operation.fields
+  local field, i = templateField(out)
+  local current = jinjaOf(field)
+  local wasOff = pinned(current)
+
+  if on then
+    if not wasOff then return out end
+    local base = current:sub(#NO_THINK + 1)
+    if base == template then
+      table.remove(fields, i)
+    else
+      field.value.jinjaPromptTemplate.template = base
+    end
+    return out
+  end
+
+  if wasOff then return out end
+  if current then
+    field.value.jinjaPromptTemplate.template = NO_THINK .. current
+  elseif type(template) == "string" then
+    fields[#fields + 1] = {
+      key = TEMPLATE_KEY,
+      value = { type = "jinja", jinjaPromptTemplate = { template = NO_THINK .. template },
+                stopStrings = {} },
+    }
+  end
+  return out
 end
 
 -- ── Tile ───────────────────────────────────────────────────────────────────

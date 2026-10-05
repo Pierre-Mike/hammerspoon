@@ -239,3 +239,75 @@ describe("lmstudio.tooltip", function()
     assert.equals("Loading Gemma 4 E4B…", L.tooltip({ busy = "Loading Gemma 4 E4B…" }))
   end)
 end)
+
+describe("lmstudio thinking", function()
+  local QWEN = "{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}"
+  local function stock()
+    return {
+      preset = "",
+      operation = { fields = {} },
+      load = { fields = { { key = "llm.load.contextLength", value = 32768 } } },
+    }
+  end
+  local function template(cfg)
+    return cfg.operation.fields[1].value.jinjaPromptTemplate.template
+  end
+
+  it("switches only templates that read enable_thinking", function()
+    assert.is_true(L.thinkingSwitchable(QWEN))
+    assert.is_false(L.thinkingSwitchable("{{ messages }}"))
+    assert.is_false(L.thinkingSwitchable(nil))
+  end)
+
+  it("reads a stock config as thinking on", function()
+    assert.is_false(L.thinkingOff(stock()))
+    assert.is_false(L.thinkingOff(nil))
+  end)
+
+  it("off pins enable_thinking in front of the model's template", function()
+    local cfg = L.withThinking(stock(), false, QWEN)
+    assert.is_true(L.thinkingOff(cfg))
+    assert.equals(L.NO_THINK .. QWEN, template(cfg))
+    assert.equals("jinja", cfg.operation.fields[1].value.type)
+    assert.same(stock().load, cfg.load)
+  end)
+
+  it("does not touch the config it was given", function()
+    local before = stock()
+    L.withThinking(before, false, QWEN)
+    assert.same(stock(), before)
+  end)
+
+  it("on after off gives back the config LM Studio wrote", function()
+    local cfg = L.withThinking(L.withThinking(stock(), false, QWEN), true, QWEN)
+    assert.same(stock(), cfg)
+  end)
+
+  it("off twice pins once", function()
+    local cfg = L.withThinking(L.withThinking(stock(), false, QWEN), false, QWEN)
+    assert.equals(L.NO_THINK .. QWEN, template(cfg))
+  end)
+
+  it("keeps a hand-set template override across off and on", function()
+    local custom = stock()
+    custom.operation.fields[1] = { key = "llm.prediction.promptTemplate",
+      value = { type = "jinja", jinjaPromptTemplate = { template = "mine enable_thinking" },
+                stopStrings = {} } }
+    local off = L.withThinking(custom, false, QWEN)
+    assert.equals(L.NO_THINK .. "mine enable_thinking", template(off))
+    local on = L.withThinking(off, true, QWEN)
+    assert.equals("mine enable_thinking", template(on))
+  end)
+
+  it("builds a config from nothing", function()
+    local cfg = L.withThinking(nil, false, QWEN)
+    assert.is_true(L.thinkingOff(cfg))
+    assert.equals("", cfg.preset)
+  end)
+
+  it("carries the model path through the catalog", function()
+    local rows = L.catalog({ { type = "llm", modelKey = "qwen3.8-27b-mlx",
+      path = "lmstudio-community/Qwen3.8-27B-MLX-4bit", sizeBytes = 1 } }, nil, nil)
+    assert.equals("lmstudio-community/Qwen3.8-27B-MLX-4bit", rows[1].path)
+  end)
+end)

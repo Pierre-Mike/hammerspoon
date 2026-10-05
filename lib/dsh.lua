@@ -23,6 +23,24 @@ function M.args(profile, port)
            "--no-open", "--port", tostring(port or M.DEFAULT_PORT) }
 end
 
+local function quote(s)
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+-- A shell line that starts the server detached from Hammerspoon. As an hs.task
+-- child the server died with every reload: the Lua state goes, the task handle
+-- is collected, and collection terminates it; a server that outlived that
+-- still wrote into a pipe nobody read. Backgrounded under nohup, with its
+-- output in a file, the shell exits at once, launchd adopts the server, and a
+-- reload or a Hammerspoon crash leaves it serving. The file is truncated per
+-- launch, so the address it holds belongs to the server that last started.
+function M.detachCmd(bin, argv, out)
+  local parts = { quote(bin) }
+  for _, a in ipairs(argv or {}) do parts[#parts + 1] = quote(a) end
+  return string.format("nohup %s >%s 2>&1 </dev/null &",
+                       table.concat(parts, " "), quote(out))
+end
+
 -- Pull the bound address out of a chunk of the server's stdout. A streaming
 -- read hands over arbitrary slices, so this matches anywhere in the chunk
 -- instead of anchoring, and trims the punctuation a sentence would end on.
@@ -32,6 +50,16 @@ function M.parseUrl(chunk)
   if not url then return nil end
   url = url:gsub("[%.,;%)%]]+$", "")
   return url ~= "" and url or nil
+end
+
+-- The address in the detached server's output file. The `dsh web:` line wins
+-- over any other URL the server prints first; it carries the token the UI
+-- needs, so a tile rebuilt by a reload can still open the right page.
+function M.addressFrom(text)
+  if type(text) ~= "string" then return nil end
+  local line = text:match("dsh web:%s*(https?://[^%s]+)")
+  if line then return M.parseUrl(line) end
+  return M.parseUrl(text)
 end
 
 -- Free the port before starting, so a server left over from a terminal — or

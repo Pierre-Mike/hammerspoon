@@ -107,3 +107,37 @@ describe("dsh.tooltip", function()
                   D.tooltip({ running = false, busy = "Starting the server…" }))
   end)
 end)
+
+describe("dsh.detachCmd", function()
+  local cmd = D.detachCmd("/opt/homebrew/bin/dsh", D.args("web", 3080), "/tmp/out.log")
+
+  it("backgrounds the server so it outlives Hammerspoon", function()
+    assert.truthy(cmd:find("^nohup "))
+    assert.truthy(cmd:find("&$"))
+  end)
+
+  it("sends its output to the file, never back through a pipe", function()
+    assert.truthy(cmd:find(">'/tmp/out.log' 2>&1 </dev/null", 1, true))
+  end)
+
+  it("quotes every word", function()
+    assert.truthy(cmd:find("'/opt/homebrew/bin/dsh' '--profile' 'web'", 1, true))
+    assert.truthy(D.detachCmd("/a b/it's", {}, "/o"):find([['/a b/it'\''s']], 1, true))
+  end)
+end)
+
+describe("dsh.addressFrom", function()
+  it("prefers the dsh web line over an earlier URL", function()
+    assert.equals("http://127.0.0.1:3080/?token=abc",
+                  D.addressFrom("see https://example.com/docs\ndsh web: http://127.0.0.1:3080/?token=abc\n"))
+  end)
+
+  it("falls back to any URL", function()
+    assert.equals("http://127.0.0.1:3081", D.addressFrom("up at http://127.0.0.1:3081."))
+  end)
+
+  it("is nil for no file or no address", function()
+    assert.is_nil(D.addressFrom(nil))
+    assert.is_nil(D.addressFrom("booting\n"))
+  end)
+end)

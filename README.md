@@ -277,22 +277,25 @@ restart it, and open its browser UI.
 Needs the `dsh` launcher on `/opt/homebrew/bin`, `/usr/local/bin` or
 `~/.local/bin` (`npm i -g @deepseek-ai/dsh`). Without it the tile says so.
 
-The tile runs `dsh --profile web --no-open --port 3080` and holds the process
-itself, so Stop is a SIGTERM the node server shuts down cleanly on. `--no-open`
+The tile runs `dsh --profile web --no-open --port 3080` detached from
+Hammerspoon (`nohup … &`, output in `/tmp/hs-dsh-server.log`), so a reload, a
+restart or a Hammerspoon crash leaves the server running. The next poll finds it
+again and reads its address back from that file. Stop is a SIGTERM to whatever
+listens on the port, which the node server shuts down cleanly on, and switching
+the plugin off removes the tile but leaves the server up. `--no-open`
 matters: starting a server from the menu bar should not pull a browser window to
 the front. "Open the web UI" is the item that opens one, and from a cold start it
 starts the server first and waits for it to answer, so the browser never loads a
 dead address.
 
-Two things can hold port 3080 without the tile knowing — a server started in a
-terminal, and one this tile started before a Hammerspoon reload threw away the
-handle. So every start frees the port first, and the running state comes from
-asking the address rather than from our own bookkeeping:
+The tile holds no handle on the server, and a server started in a terminal can
+hold port 3080 too. So every start frees the port first, and the running state
+comes from asking the address rather than from our own bookkeeping:
 
 | question | answer |
 |---|---|
 | is it up? | a 15 s `GET` on the bound address; any status means something answered |
-| where is it? | the `dsh web: http://…` line the server prints on stdout |
+| where is it? | the `dsh web: http://…` line in `/tmp/hs-dsh-server.log` |
 | what still holds the port? | `lsof -tiTCP:3080 -sTCP:LISTEN` |
 
 `-sTCP:LISTEN` is what makes that last one safe. A bare `lsof -ti :3080` also
