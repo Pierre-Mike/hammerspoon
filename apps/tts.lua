@@ -12,6 +12,11 @@
 -- the whole blob synthesises. Voice/quality come from Kyutai pocket-tts running
 -- on CPU; this module is just the queue, the intake, and the playback plumbing.
 --
+-- The server's default is to stream the audio as it is generated, which is how
+-- apps/voice_agent hears its first syllable about a second sooner. Notifications
+-- stay on files: afplay wants a path, and a notification nobody is waiting on
+-- does not need the second back.
+--
 -- This module also owns the lifecycle of a *second* pocket-tts server, on 8793,
 -- running the French model for apps/voice_agent. Nothing spoken here goes to it:
 -- notifications are English and stay on 8791. See the bottom of the file.
@@ -70,8 +75,13 @@ function drain()
   local item  = core.dequeue(M.queue)      -- { text = <chunk>, voice = <resolved voice> }
   local myGen = M.gen
   updateMenu()
+  -- X-Format: path asks the server for a finished WAV on disk instead of its
+  -- default audio stream. afplay cannot read a growing file, and hs.http hands
+  -- back a whole response rather than chunks, so there is nothing here that
+  -- could consume the stream. The voice agent takes the streaming path.
   hs.http.asyncPost(cfg.POCKET_TTS_BASE .. "/speak", item.text,
-    { ["X-Voice"] = item.voice or M.voice, ["Content-Type"] = "text/plain; charset=utf-8" },
+    { ["X-Voice"] = item.voice or M.voice, ["X-Format"] = "path",
+      ["Content-Type"] = "text/plain; charset=utf-8" },
     function(status, body, _headers)
       if myGen ~= M.gen then M.speaking = false; return end   -- stopped mid-synth
       body = utils.trim(body)
