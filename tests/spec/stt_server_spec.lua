@@ -85,6 +85,21 @@ describe("stt_server.launch", function()
   it("refuses a missing model", function()
     assert.is_nil((stt.launch(nil, RT)))
   end)
+
+  -- No language pinned: the server leaves the choice to the model, so Whisper
+  -- detects it per take instead of decoding French as English.
+  it("pins no language by default", function()
+    local l = assert(stt.launch(COHERE, RT))
+    assert.is_nil(l.env.STT_LANGUAGE)
+  end)
+
+  it("passes a pinned language to the server", function()
+    local rt = {}
+    for k, v in pairs(RT) do rt[k] = v end
+    rt.language = "fr"
+    local l = assert(stt.launch(COHERE, rt))
+    assert.equals("fr", l.env.STT_LANGUAGE)
+  end)
 end)
 
 describe("stt_server.freePortCommand", function()

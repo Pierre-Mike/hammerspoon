@@ -4,12 +4,19 @@
 local earcon      = require("lib.earcon")
 local sttServer   = require("lib.stt_server")
 local configFile  = require("lib.config")
+local clipboard   = require("lib.clipboard")
+local tfilter     = require("lib.transcript_filter")
+local llm         = require("lib.llm_cleanup")
+local takes       = require("lib.dictation_takes")
+local tapGuard    = require("lib.tap_guard")
 local EARCONS_CFG = configFile.EARCONS
 
 local DEFAULT_MIC = "MacBook Pro Microphone"  -- selected by NAME; avfoundation indices reshuffle when devices change
 local WAV  = "/tmp/hs-dictate.wav"
 local RAW  = "/tmp/hs-dictate.raw"   -- headerless s16le PCM, streamed live to the server
 local TXT  = "/tmp/hs-dictate.txt"
+-- The last takes' audio, so one can be run again through another model.
+local TAKES_DIR = os.getenv("HOME") .. "/.cache/hs-dictation/takes"
 local FFMPEG   = "/opt/homebrew/bin/ffmpeg"
 local PARAKEET = os.getenv("HOME") .. "/.local/bin/parakeet-mlx"
 local MODEL_PATH = os.getenv("HOME") .. "/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3/snapshots/ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15"
@@ -28,6 +35,15 @@ local MIN_DURATION = 0.6            -- avfoundation needs ~300ms to start; below
 local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button release is ever missed
 
 local M = { recording = false, ffmpegTask = nil, fnDown = false, startedAt = 0, lastResult = nil, cancelled = false, ducked = false, preDuckVolume = nil }
+-- Where a take is recorded and kept. On M so a spec can point them at a
+-- scratch directory instead of the live files.
+M.paths = { WAV = WAV, RAW = RAW, TAKES = TAKES_DIR }
+-- "starting" from Fn-down until the first audio bytes land, then "listening".
+M.micState = "idle"
+-- Optional LM Studio pass over each transcript before it pastes. Off by default.
+M.llmCleanup = hs.settings.get("dictate.llmCleanup") == true
+-- Pins mlx-audio models to one language ("fr"); nil lets each model decide.
+M.language = hs.settings.get("dictate.language")
 
 -- File logger so we can debug dictation without staring at the HS console.
 local LOG = "/tmp/hs-dictate.log"
@@ -385,10 +401,12 @@ local function showLivePreview(text)
     { type = "rectangle", action = "fill",
       fillColor = { red = 0, green = 0, blue = 0, alpha = 0.85 },
       roundedRectRadii = { xRadius = 16, yRadius = 16 } },
-    { type = "circle", action = "fill", fillColor = COLOR_REC,
+    -- Amber until the mic delivers audio, red once it is really recording.
+    { type = "circle", action = "fill",
+      fillColor = (M.micState == "starting") and COLOR_PROC or COLOR_REC,
       center = { x = 30, y = 30 }, radius = 9 },
     { type = "text",
-      text = shown and previewStyled(shown) or "Listening…",
+      text = shown and previewStyled(shown) or ((M.micState == "starting") and "Starting…" or "Listening…"),
       textColor = COLOR_SETTLED, textSize = PREVIEW_SIZE,
       frame = { x = PREVIEW_PAD, y = PREVIEW_TOP, w = innerW, h = h - PREVIEW_TOP - 8 } }
   )
@@ -414,12 +432,18 @@ local function readFile(p)
   local s = f:read("*a"); f:close(); return s
 end
 
+local function fileSize(p)
+  local f = io.open(p, "rb"); if not f then return 0 end
+  local n = f:seek("end"); f:close(); return n or 0
+end
+
+-- ⌘V the text at the cursor, then give the user their clipboard back once the
+-- paste has landed (lib/clipboard).
 local function paste(text)
   if not text or text == "" then return end
   text = text:gsub("^%s+", ""):gsub("%s+$", "")
   if text == "" then return end
-  hs.pasteboard.setContents(text)
-  hs.eventtap.keyStroke({"cmd"}, "v", 0)
+  M.restoreTimer = clipboard.pasteAndRestore(text)
 end
 
 -- Duck system audio while the mic is open; unduckNoise puts it back. One duck,
@@ -452,18 +476,67 @@ local function unduckNoise()
   logf("[duck] restored %.1f", vol)
 end
 
--- Shared tail: reset UI, then paste at the cursor.
+-- Optional clean-up through LM Studio's OpenAI-compatible server. Calls
+-- done(text) exactly once: with the cleaned text, or with the raw text on any
+-- miss — LM Studio down, no model loaded, a bad reply, or no answer within
+-- llm.TIMEOUT seconds. A reply that lands after the timeout is ignored.
+local function polish(text, done)
+  local finished = false
+  local function finish(result, why)
+    if finished then return end
+    finished = true
+    if M.polishTimer then M.polishTimer:stop(); M.polishTimer = nil end
+    if why then logf("[llm] %s; pasting the raw transcript", why) end
+    if not M.recording then hideHUD() end
+    done(result or text)
+  end
+  showHUD("Cleaning up…", COLOR_PROC)
+  M.polishTimer = hs.timer.doAfter(llm.TIMEOUT, function()
+    M.polishTimer = nil
+    finish(nil, "no reply in " .. llm.TIMEOUT .. "s")
+  end)
+  hs.http.asyncGet(llm.BASE .. "/api/v0/models", nil, function(status, body, _)
+    if finished then return end
+    local ok, decoded = pcall(hs.json.decode, body or "")
+    local model = (status == 200 and ok) and llm.pickModel(decoded) or nil
+    if not model then return finish(nil, "no LM Studio model loaded (status " .. tostring(status) .. ")") end
+    hs.http.asyncPost(llm.BASE .. "/v1/chat/completions", hs.json.encode(llm.request(text, model)),
+      { ["Content-Type"] = "application/json" },
+      function(st, b, _)
+        if finished then return end
+        local ok2, dec = pcall(hs.json.decode, b or "")
+        local cleaned = (st == 200 and ok2) and llm.parse(dec, text) or nil
+        if not cleaned then return finish(nil, "unusable reply from " .. model .. " (status " .. tostring(st) .. ")") end
+        logf("[llm] %s: %d → %d chars", model, #text, #cleaned)
+        finish(cleaned)
+      end)
+  end)
+end
+
+-- Shared tail: reset UI, clean the transcript, then paste at the cursor.
 local function finishTranscript(out)
   setIcon("○"); hideHUD(); hideLivePreview(); M.recording = false
   unduckNoise()
   logf("[dictate] result: %s", tostring(out))
-  if out and out ~= "" then
-    out = out:gsub("^%s+", ""):gsub("%s+$", "")
-    M.lastResult = out
-    paste(out)
-  else
+  if not out or out == "" then
     notify("no transcription (see console)", 1.6)
+    return
   end
+  -- Stock subtitle lines that stand for silence (Whisper-style batch models
+  -- only; Parakeet doesn't invent them), and a sentence looped on trailing
+  -- silence (lib/transcript_filter).
+  local text = tfilter.clean(out, { stockLines = M.engine ~= "parakeet" })
+  if text == "" then
+    logf("[dictate] dropped as a silence hallucination: %q", out)
+    notify("nothing heard", 1.4)
+    return
+  end
+  M.lastResult = text
+  if not M.llmCleanup then paste(text); return end
+  polish(text, function(final)
+    M.lastResult = final
+    paste(final)
+  end)
 end
 
 -- Cold fallback for parakeet models only: spawn the parakeet-mlx CLI on the same
@@ -476,7 +549,7 @@ local function transcribeCLI()
       if stdErr and stdErr ~= "" then logf("[dictate] stderr: %s", stdErr) end
       finishTranscript(readFile(TXT) or readFile("/private/tmp/hs-dictate.txt"))
     end,
-    {"--model", M.serverModel.path, "--output-dir", "/tmp", "--output-format", "txt", WAV}
+    {"--model", M.serverModel.path, "--output-dir", "/tmp", "--output-format", "txt", M.paths.WAV}
   )
   task:setEnvironment({ HOME = os.getenv("HOME"), PATH = "/opt/homebrew/bin:/usr/bin:/bin" })
   task:start()
@@ -484,14 +557,14 @@ end
 
 -- Batch path: POST the finished WAV's path to the warm server, which holds the
 -- selected model whatever its engine. This is every take on an mlx-audio model
--- (no live preview: transcribed after release, the CLI's defaults incl.
--- language "en") and the fallback for a parakeet stream that missed. On a miss
+-- (no live preview: transcribed after release; the language is the model's
+-- own default unless pinned in the menu) and the fallback for a parakeet stream that missed. On a miss
 -- a parakeet model falls back to its CLI; an mlx-audio model reports the error
 -- rather than cold-loading a second copy of itself.
 local function transcribe()
   setIcon("…")
   showHUD("Transcribing…", COLOR_PROC)
-  hs.http.asyncPost(STT_URL, WAV, { ["Content-Type"] = "text/plain" },
+  hs.http.asyncPost(STT_URL, M.paths.WAV, { ["Content-Type"] = "text/plain" },
     function(status, body, _)
       if status == 200 and body and body ~= "" and not body:match("^__ERROR__") then
         logf("[dictate] server ok len=%d", #body)
@@ -506,6 +579,57 @@ local function transcribe()
     end)
 end
 
+-- ── Recent takes ────────────────────────────────────────────────────────────
+-- Every take that reaches transcription is copied into TAKES, newest takes.KEEP
+-- kept, so the menu can run one again through another model.
+local function takeNames()
+  local names = {}
+  pcall(function()
+    for f in hs.fs.dir(M.paths.TAKES) do names[#names + 1] = f end
+  end)
+  return names
+end
+
+local function saveTake()
+  local data = readFile(M.paths.WAV)
+  if not data or data == "" then logf("[takes] no WAV to keep"); return end
+  if hs.fs.mkdir then
+    pcall(hs.fs.mkdir, M.paths.TAKES:match("^(.*)/[^/]+$"))
+    pcall(hs.fs.mkdir, M.paths.TAKES)
+  end
+  local name = takes.name(os.time())
+  local f = io.open(M.paths.TAKES .. "/" .. name, "wb")
+  if not f then logf("[takes] cannot write %s", M.paths.TAKES); return end
+  f:write(data); f:close()
+  local _, remove = takes.prune(takeNames(), takes.KEEP)
+  for _, old in ipairs(remove) do os.remove(M.paths.TAKES .. "/" .. old) end
+  logf("[takes] kept %s (%d bytes), rotated out %d", name, #data, #remove)
+end
+
+-- ── Mic-ready indicator ─────────────────────────────────────────────────────
+-- avfoundation takes ~300ms to open the mic, and words spoken before that are
+-- lost. The preview says "Starting…" (amber dot) from Fn-down and turns to
+-- "Listening…" (red dot) only once ffmpeg has written audio bytes.
+local MIC_POLL = 0.05
+
+local function stopReadyPoll()
+  if M.readyTimer then M.readyTimer:stop(); M.readyTimer = nil end
+end
+
+local function startReadyPoll()
+  stopReadyPoll()
+  M.micState = "starting"
+  M.readyTimer = hs.timer.doEvery(MIC_POLL, function()
+    if not M.recording then stopReadyPoll(); return end
+    if fileSize(M.paths.RAW) > 0 then
+      stopReadyPoll()
+      M.micState = "listening"
+      logf("[dictate] mic live after %.2fs", hs.timer.secondsSinceEpoch() - M.startedAt)
+      showLivePreview(M.lastPartial)
+    end
+  end)
+end
+
 -- Forward decl so startRecording's watchdog can call stopRecording (defined below).
 local stopRecording
 
@@ -513,13 +637,16 @@ local function startRecording()
   -- Fire the "listening" cue FIRST so it lands before ffmpeg spins up. hs.sound
   -- is non-blocking, so this adds no measurable latency to mic capture.
   playEarcon("start")
-  os.remove(WAV); os.remove(RAW)
+  os.remove(M.paths.WAV); os.remove(M.paths.RAW)
   M.recording = true
   M.batchFinish = false
+  M.keepTake = false
+  M.lastPartial = nil
   M.startedAt = hs.timer.secondsSinceEpoch()
   setIcon("●")
   hideLivePreview()
-  showLivePreview(nil)   -- "Listening…" (stays put for batch engines: no partials)
+  startReadyPoll()
+  showLivePreview(nil)   -- "Starting…" until audio arrives, then "Listening…"
   duckNoise()
   logf("[dictate] recording start (mic=%q, engine=%s)", M.micName, M.engine)
   -- Two outputs from one capture: WAV for batch transcription (server /transcribe),
@@ -527,12 +654,14 @@ local function startRecording()
   M.ffmpegTask = hs.task.new(FFMPEG, function(code, _, err)
     logf("[dictate] ffmpeg exit=%d", code)
     if code ~= 0 and err and err ~= "" then logf("[dictate] ffmpeg stderr: %s", err) end
+    -- The WAV is finalized now: keep a copy before anything reads or replaces it.
+    if M.keepTake then M.keepTake = false; saveTake() end
     -- Non-streaming engine: WAV is finalized now, so kick off the batch transcribe.
     if M.batchFinish then M.batchFinish = false; transcribe() end
   end,
     {"-y", "-f", "avfoundation", "-i", ":" .. M.micName,
-     "-ar", "16000", "-ac", "1", WAV,
-     "-ar", "16000", "-ac", "1", "-f", "s16le", "-flush_packets", "1", RAW})
+     "-ar", "16000", "-ac", "1", M.paths.WAV,
+     "-ar", "16000", "-ac", "1", "-f", "s16le", "-flush_packets", "1", M.paths.RAW})
   M.ffmpegTask:start()
   -- Watchdog: never hold the mic open forever if a release event is missed
   -- (e.g. a spurious headset PLAY press, or a swallowed Fn key-up).
@@ -547,13 +676,14 @@ local function startRecording()
   end)
   if M.stream then
     -- Begin streaming this recording into the warm model as it's captured.
-    hs.http.asyncPost(STT_BASE .. "/start", RAW, {}, function(status, _, _)
+    hs.http.asyncPost(STT_BASE .. "/start", M.paths.RAW, {}, function(status, _, _)
       if status ~= 200 then logf("[dictate] /start status=%s (will batch-fallback)", tostring(status)) end
     end)
     -- Poll the live hypothesis and show it growing in the preview panel.
     M.previewTimer = hs.timer.new(0.2, function()
       hs.http.asyncGet(STT_BASE .. "/partial", nil, function(status, body, _)
         if M.recording and status == 200 and body and body ~= "" then
+          M.lastPartial = body
           showLivePreview(body)
         end
       end)
@@ -575,6 +705,9 @@ function stopRecording()
   -- For batch engines, flag the finish BEFORE terminating ffmpeg so its exit
   -- callback (which fires once the WAV is finalized) runs transcribe().
   M.batchFinish = (not M.stream) and (not M.cancelled) and (dur >= MIN_DURATION)
+  M.keepTake = (not M.cancelled) and (dur >= MIN_DURATION)
+  stopReadyPoll()
+  M.micState = "idle"
   if M.ffmpegTask then M.ffmpegTask:terminate(); M.ffmpegTask = nil end
   if M.previewTimer then M.previewTimer:stop(); M.previewTimer = nil end
   if M.cancelled then
@@ -614,7 +747,7 @@ local function launchServer()
   local m = M.serverModel
   local l, why = sttServer.launch(m, {
     parakeetPy = PARAKEET_PY, mlxaPy = MLXA_PY, server = STT_SERVER,
-    home = os.getenv("HOME"), port = STT_PORT,
+    home = os.getenv("HOME"), port = STT_PORT, language = M.language,
   })
   if not l then
     logf("[server] cannot launch: %s", tostring(why))
@@ -694,6 +827,59 @@ local function setMic(name)
   notify("Mic: " .. name, 1.6)
 end
 
+-- Language for mlx-audio models. "Auto" leaves it to the model (Whisper detects
+-- it per take); parakeet ignores it. A change restarts the server, because the
+-- language is fixed when the model loads.
+local LANGUAGES = { { code = nil, name = "Auto" }, { code = "en", name = "English" }, { code = "fr", name = "French" } }
+
+local function setLanguage(code)
+  if M.recording then notify("stop recording before switching language", 1.8); return end
+  if code == M.language then return end
+  M.language = code
+  hs.settings.set("dictate.language", code)
+  logf("[lang] → %s", tostring(code or "auto"))
+  notify("Language: " .. (code or "auto") .. " — reloading model…", 2.2)
+  restartServer()
+end
+
+local function setLlmCleanup(on)
+  M.llmCleanup = on and true or false
+  hs.settings.set("dictate.llmCleanup", M.llmCleanup)
+  logf("[llm] clean-up %s", M.llmCleanup and "on" or "off")
+end
+
+-- Run a kept take through whatever model is loaded now, and put the result on
+-- the clipboard rather than pasting it: the cursor has moved on since.
+local function retranscribe(name)
+  local path = M.paths.TAKES .. "/" .. name
+  logf("[takes] retranscribe %s with %s", name, tostring(M.modelName))
+  notify("Retranscribing with " .. tostring(M.modelName) .. "…", 1.6)
+  hs.http.asyncPost(STT_URL, path, { ["Content-Type"] = "text/plain" }, function(status, body, _)
+    if status ~= 200 or not body or body:match("^__ERROR__") then
+      logf("[takes] retranscribe miss (status=%s): %s", tostring(status), tostring(body))
+      notify("retranscribe failed (see console)", 2.0)
+      return
+    end
+    local text = tfilter.clean(body, { stockLines = M.engine ~= "parakeet" })
+    if text == "" then notify("nothing heard in that take", 1.6); return end
+    M.lastResult = text
+    hs.pasteboard.setContents(text)
+    local preview = text:sub(1, 60)
+    if #text > 60 then preview = preview .. "…" end
+    notify("copied: " .. preview, 2.0)
+  end)
+end
+
+local function takesMenu()
+  local kept = takes.prune(takeNames(), takes.KEEP)
+  if #kept == 0 then return { { title = "No takes kept yet", disabled = true } } end
+  local items = {}
+  for _, name in ipairs(kept) do
+    items[#items + 1] = { title = takes.label(name), fn = function() retranscribe(name) end }
+  end
+  return items
+end
+
 local function buildMenu()
   MICS = discoverMics()   -- refresh so the picker reflects currently-connected inputs
   local maxKB = 0
@@ -726,6 +912,16 @@ local function buildMenu()
   end
   items[#items + 1] = { title = "Rescan microphones",
     fn = function() MICS = discoverMics(); notify("Rescanned mics (" .. #MICS .. ")", 1.6) end }
+  items[#items + 1] = { title = "-" }
+  local langItems = {}
+  for _, l in ipairs(LANGUAGES) do
+    langItems[#langItems + 1] = { title = l.name, checked = (l.code == M.language),
+      fn = function() setLanguage(l.code) end }
+  end
+  items[#items + 1] = { title = "Language (batch models): " .. (M.language or "auto"), menu = langItems }
+  items[#items + 1] = { title = "Clean up with LM Studio", switch = true, checked = M.llmCleanup,
+    fn = function() setLlmCleanup(not M.llmCleanup) end }
+  items[#items + 1] = { title = "Retranscribe recent take", menu = takesMenu() }
   items[#items + 1] = { title = "-" }
   items[#items + 1] = { title = "Restart server",
     fn = function() notify("Restarting STT server…", 1.6); restartServer() end }
@@ -790,6 +986,36 @@ M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
   return false
 end)
 M.keyWatcher:start()
+
+-- Tap watchdog. macOS switches a global event tap off without notice — after
+-- sleep, when a callback runs slow under load, or while secure input is on —
+-- and Fn then does nothing until a reload. Check every TAP_CHECK seconds and on
+-- wake, restart whichever tap is off (lib/tap_guard), and if Fn's release was
+-- lost while it was off, end the take the user already let go of.
+local TAP_CHECK = 2
+
+local function rearmTaps(why)
+  local names = tapGuard.rearm({ flags = M.flagWatcher, keys = M.keyWatcher })
+  if #names == 0 then return end
+  logf("[tap] re-armed %s (%s)", table.concat(names, ", "), why)
+  local ok, mods = pcall(hs.eventtap.checkKeyboardModifiers)
+  if ok and tapGuard.missedRelease(M.fnDown, mods) then
+    logf("[tap] Fn was released while the tap was off; ending the take")
+    M.fnDown = false
+    if M.recording then stopRecording() end
+  end
+end
+M.rearmTaps = rearmTaps
+
+M.tapTimer = hs.timer.doEvery(TAP_CHECK, function() rearmTaps("check") end)
+
+if hs.caffeinate and hs.caffeinate.watcher then
+  local W = hs.caffeinate.watcher
+  M.wakeWatcher = W.new(function(event)
+    if event == W.systemDidWake or event == W.screensDidUnlock then rearmTaps("wake") end
+  end)
+  M.wakeWatcher:start()
+end
 
 -- Keep the mic list fresh even without opening the menu: a headset that
 -- (dis)connects after launch retriggers discovery, and if the *selected* mic

@@ -48,7 +48,7 @@ end
 
 -- How the server is started for model `m` (an entry from the menu's model list:
 -- { id, path, engine }). `rt` names the runtime: { parakeetPy, mlxaPy, server,
--- home, port }. Each engine needs its own interpreter, since parakeet-mlx and
+-- home, port, language }. Each engine needs its own interpreter, since parakeet-mlx and
 -- mlx-audio live in separate uv tool environments.
 --
 -- Returns { python, args, env, streams } or nil, reason.
@@ -63,6 +63,9 @@ function M.launch(m, rt)
     -- Every model in the menu is already in the hub cache; offline mode keeps a
     -- launch from waiting on the network to confirm it.
     HF_HUB_OFFLINE = "1",
+    -- A language code ("fr") pins mlx-audio models to it. Unset, each model
+    -- uses its own default, which for Whisper means detecting it per take.
+    STT_LANGUAGE = (rt.language and rt.language ~= "") and rt.language or nil,
   }
   local python
   if m.engine == "parakeet" then

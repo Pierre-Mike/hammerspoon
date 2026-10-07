@@ -48,6 +48,9 @@ MODEL_ID = os.environ.get("STT_MODEL_ID") or MODEL
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("STT_PORT") or os.environ.get("PARAKEET_PORT", "8765"))
 STREAMS = ENGINE == "parakeet"
+# mlx-audio only. Empty = each model's own default (Whisper detects the language
+# per take); a code such as "fr" pins it.
+LANGUAGE = os.environ.get("STT_LANGUAGE", "").strip()
 
 SR = 16000
 BLOCK = SR          # 1.0s feed blocks: smaller first chunks drop the leading word
@@ -188,6 +191,27 @@ class ParakeetBackend:
         return (self.model.transcribe(wav).text or "").strip()
 
 
+def decode_kwargs(defaults, params, language=""):
+    """generate() kwargs for one mlx-audio model.
+
+    Starts from the batch CLI's defaults, filtered to what this model's
+    generate() names, as generate_transcription does. Two departures:
+      - language: the CLI forces "en", which makes Whisper decode French as
+        English. Unpinned, it is left out so the model's own default applies
+        (Whisper: detect per take). Pinned, it is passed through.
+      - condition_on_previous_text=False where accepted: conditioning on its own
+        output is what sends Whisper into repeating a sentence on trailing
+        silence.
+    """
+    kw = {k: v for k, v in defaults.items()
+          if k in params and k not in ("audio", "verbose", "stream", "language")}
+    if language and "language" in params:
+        kw["language"] = language
+    if "condition_on_previous_text" in params:
+        kw["condition_on_previous_text"] = False
+    return kw
+
+
 class MlxAudioBackend:
     """Any mlx-audio STT architecture, called the way its batch CLI calls it."""
 
@@ -197,13 +221,11 @@ class MlxAudioBackend:
         from mlx_audio.stt.generate import parse_args
         from mlx_audio.stt.utils import load_model
         self.model = load_model(repo)
-        # The CLI's own defaults (language="en", max_tokens=8192, …), filtered to
-        # what this model's generate() names, exactly as generate_transcription
-        # does — so a dictation reads the same here as it did through the CLI.
         defaults = vars(parse_args(["--audio", "-", "--output-path", "-"]))
         params = inspect.signature(self.model.generate).parameters
-        self.kwargs = {k: v for k, v in defaults.items()
-                       if k in params and k not in ("audio", "verbose", "stream")}
+        self.kwargs = decode_kwargs(defaults, params, LANGUAGE)
+        log(f"decode kwargs: {sorted(k for k in self.kwargs if k != 'generation_stream')} "
+            f"language={self.kwargs.get('language', 'model default')}")
         if "generation_stream" in params:
             # Created on this (the worker) thread, which owns the MLX stream.
             self.kwargs["generation_stream"] = mx.new_stream(mx.default_device())

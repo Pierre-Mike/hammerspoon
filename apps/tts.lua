@@ -129,19 +129,9 @@ end
 -- an empty selection stays silent instead of re-speaking a stale clipboard.
 local SEL = cfg.TTS_SELECTION or {}
 
--- Grab everything currently on the pasteboard and return a closure that puts it
--- back. readAllData keeps non-text flavours (images, rich text) intact; the
--- getContents path is the fallback for Hammerspoon builds without it.
-local function snapshotPasteboard()
-  local ok, data = pcall(hs.pasteboard.readAllData)
-  if ok and type(data) == "table" and next(data) ~= nil then
-    return function() pcall(hs.pasteboard.writeAllData, data) end
-  end
-  local text = hs.pasteboard.getContents()
-  return function()
-    if text ~= nil then pcall(hs.pasteboard.setContents, text) end
-  end
-end
+-- Every flavour on the pasteboard, put back after the grab (lib/clipboard).
+local clipboard = require("lib.clipboard")
+local function snapshotPasteboard() return clipboard.snapshot(hs.pasteboard) end
 
 -- Public: copy the selection and queue it for speech. `sel` overrides the voice
 -- (defaults to the read-aloud profile in cfg.TTS_SELECTION.PROFILE).
