@@ -17,7 +17,7 @@ Apps load themselves: anything under `apps/` with an `init.lua`, and any single
 
 | App | What it does |
 |-----|--------------|
-| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with [parakeet-mlx](https://github.com/senstella/parakeet-mlx) and paste at the cursor. A warm server (`parakeet_server.py`, port 8765) keeps the model resident for live-preview streaming. `Fn+C` cancels & recalls the last result. `Fn+S` cancels and reads the current *selection* aloud through `apps/tts`. Menu-bar picker switches speech models. |
+| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with the speech model picked in the menu and paste at the cursor. One warm server (`parakeet_server.py`, port 8765) holds that model and nothing else; the voice agent transcribes through the same server. Parakeet models stream a live preview. `Fn+C` cancels & recalls the last result. `Fn+S` cancels and reads the current *selection* aloud through `apps/tts`. Menu-bar picker switches speech models. |
 | `apps/brown_noise` | Noise machine in the hub: a Play switch, volume slider, and color picker (white/pink/brown/blue/violet). |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. `Fn+S` reads the current selection aloud. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
@@ -129,11 +129,28 @@ A model joins the list by being downloaded and leaves it by being deleted —
 `apps/dictation` reads each model's `config.json` to decide which backend runs it,
 so nothing in the code needs editing:
 
-- a **NeMo** config (the parakeet family) runs on the warm `parakeet_server.py`,
-  the only backend that streams, so these are the only models with a live preview
-  (🟢) and the only ones that cost ~0.2s per dictation rather than seconds
-- any other `model_type` mlx-audio implements runs through its batch CLI (🟡):
-  the WAV is transcribed on release, with no preview and a cold model load
+- a **NeMo** config (the parakeet family) runs on parakeet-mlx, the only backend
+  that streams, so these are the only models with a live preview (🟢)
+- any other `model_type` mlx-audio implements runs on mlx-audio (🟡): the WAV is
+  transcribed on release, with no preview
+
+Either way exactly one model is loaded. `parakeet_server.py` on port 8765 loads
+the selected model once and keeps it warm, so a dictation costs inference only
+(about 0.1–0.2s for a short take on both engines). Picking another model in the
+menu kills that server, waits for the port to free, and starts a new one on the
+new model under its engine's interpreter (`STT_ENGINE=parakeet|mlxa`,
+`STT_MODEL=<snapshot dir or repo id>`). After a reload it starts on the saved
+selection. The voice agent posts to the same `/transcribe`, so it switches with
+you. To see what is loaded:
+
+```sh
+curl -s localhost:8765/health   # {"engine": "mlxa", "model": "lyzgeorge/…", "ready": true, …}
+```
+
+On an mlx-audio model `/start` and `/finish` answer 501 at once, which sends
+dictation straight to `/transcribe`. The server passes mlx-audio's CLI defaults
+to `generate()`, including `language="en"`; Cohere Transcribe still returns
+French as French.
 
 ```sh
 hf download mlx-community/parakeet-tdt-0.6b-v2      # streaming, English
@@ -146,11 +163,11 @@ name and a WER; without an entry it still appears, under its bare repo name. The
 WER there is measured locally against the exact quantised snapshot, not copied
 from a leaderboard, because quantisation moves it: the 4-bit Qwen3-ASR build
 measures 3.93 where the full-precision original tops the Open ASR Leaderboard.
-`ENGINES` in the same file is the list of architectures the picker will run — an
+`ENGINES` in `lib/stt_server.lua` is the list of architectures the picker will run — an
 mlx-audio release that adds an architecture needs a key here too, and
 `test_stt.sh` keeps its own copy in step.
 
-The batch backend needs `soundfile` and `sentencepiece`, which mlx-audio does not
+The mlx-audio backend needs `soundfile` and `sentencepiece`, which mlx-audio does not
 pull in itself: `uv tool install mlx-audio --with soundfile --with sentencepiece`.
 Without them Granite fails on load and Cohere Transcribe fails on its tokenizer.
 

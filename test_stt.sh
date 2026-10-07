@@ -32,7 +32,7 @@ DUR=${DUR:-0}
 
 # mlx-audio STT architectures (mlx_audio/stt/models/*) plus the "parakeet" marker
 # the scan below synthesises for NeMo configs. Keep in step with ENGINES in
-# apps/dictation/init.lua — that table is the one the picker reads.
+# lib/stt_server.lua — that table is the one the picker reads.
 TYPES=(parakeet qwen3_asr mega_asr cohere_asr granite_speech granite_speech_nar
        whisper glm glmasr voxtral voxtral_realtime nemotron_asr fun_asr_nano
        fireredasr2 sensevoice canary moonshine vibevoice)

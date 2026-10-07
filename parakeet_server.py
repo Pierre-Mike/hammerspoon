@@ -1,36 +1,65 @@
 #!/usr/bin/env python3
-# Warm + streaming parakeet-mlx transcription server.
+# Warm speech-to-text server: ONE model, loaded once, shared by every caller
+# (apps/dictation and the pipecat voice agent both POST to it).
+#
+# The file keeps its historical name because callers point at it by path, but it
+# serves any model the dictation menu offers. Which backend runs is chosen at
+# launch, and the launcher must start it under the matching interpreter:
+#
+#   STT_ENGINE=parakeet  parakeet-mlx's python   STT_MODEL=<snapshot dir>
+#   STT_ENGINE=mlxa      mlx-audio's python      STT_MODEL=<HF repo id or dir>
+#
+# STT_MODEL_ID is the name /health reports (defaults to STT_MODEL); STT_PORT
+# overrides the port. PARAKEET_MODEL_PATH / PARAKEET_PORT / argv[1] still work, so
+# an old launcher keeps getting a parakeet server.
 #
 #   POST /transcribe  body=<wav path>  -> batch transcription (text back)
 #   POST /start       body=<raw path>  -> stream a growing headerless s16le/16k
 #                                          mono PCM file as it records
 #   POST /finish                        -> drain remaining audio, return text
 #   POST /cancel                        -> abort the current streaming session
+#   GET  /partial                       -> live hypothesis of the stream
+#   GET  /health                        -> JSON: engine, model, ready, streams
+#
+# Errors come back as a non-200 status with a body starting "__ERROR__". Only the
+# parakeet engine streams: on an mlx-audio model /start and /finish fail at once,
+# so dictation falls back to /transcribe.
 #
 # All MLX work runs on ONE dedicated worker thread (model loaded there too):
-# MLX's Metal stream is thread-bound. The HTTP server (main thread) only hands
-# the worker Session objects and signals them via events.
+# MLX's Metal stream is thread-bound. The HTTP server threads only hand the
+# worker Session objects and signal them via events.
 #
-# Each /start makes a fresh Session and preempts (aborts) any in-flight one, so
-# an orphaned session can never leak a stale transcript into a later /finish.
+# A new /start preempts (aborts) any in-flight stream, so an orphaned session can
+# never leak a stale transcript into a later /finish. Batch jobs queue instead of
+# preempting; while a stream is live the worker serves them between feeds, so a
+# voice-agent turn never waits for a dictation to end.
+import json
 import os
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-MODEL = os.environ.get("PARAKEET_MODEL_PATH") or sys.argv[1]
+ENGINE = os.environ.get("STT_ENGINE", "parakeet")
+MODEL = (os.environ.get("STT_MODEL") or os.environ.get("PARAKEET_MODEL_PATH")
+         or (sys.argv[1] if len(sys.argv) > 1 else None))
+MODEL_ID = os.environ.get("STT_MODEL_ID") or MODEL
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("PARAKEET_PORT", "8765"))
+PORT = int(os.environ.get("STT_PORT") or os.environ.get("PARAKEET_PORT", "8765"))
+STREAMS = ENGINE == "parakeet"
 
 SR = 16000
 BLOCK = SR          # 1.0s feed blocks: smaller first chunks drop the leading word
 CONTEXT = (256, 256)
 DEPTH = 2
 
+if ENGINE not in ("parakeet", "mlxa") or not MODEL:
+    sys.exit(f"usage: STT_ENGINE=parakeet|mlxa STT_MODEL=<path or repo> {sys.argv[0]}")
+
 
 def log(msg):
-    print(f"[parakeet-server] {msg}", flush=True)
+    print(f"[stt-server:{ENGINE}] {msg}", flush=True)
 
 
 class Session:
@@ -46,20 +75,47 @@ class Session:
 
 _lock = threading.Lock()
 _wake = threading.Event()
-_current = {"sess": None}   # the live session (what /finish, /cancel act on)
-_pending = {"sess": None}   # next session for the worker to pick up
+_current = {"sess": None}   # the live stream session (what /finish, /cancel act on)
+_queue = deque()            # sessions waiting for the worker, oldest first
+# What /health reports. `error` is set when the model failed to load, after which
+# every request is answered with it instead of hanging until its timeout.
+_state = {"ready": False, "error": None, "load_s": None}
 
 
 def _new_session(kind, path):
     s = Session(kind, path)
     with _lock:
-        prev = _current["sess"]
-        if prev is not None and not prev.done.is_set():
-            prev.abort.set()    # preempt any in-flight session
-        _current["sess"] = s
-        _pending["sess"] = s
+        if _state["error"]:
+            s.text = f"__ERROR__ model failed to load: {_state['error']}"
+            s.done.set()
+            return s
+        if kind == "stream":
+            prev = _current["sess"]
+            if prev is not None and not prev.done.is_set():
+                prev.abort.set()    # preempt any in-flight stream
+            _current["sess"] = s
+        _queue.append(s)
     _wake.set()
     return s
+
+
+def _next_batch():
+    """Pop the oldest queued batch job, leaving any stream sessions in place."""
+    with _lock:
+        for s in _queue:
+            if s.kind == "batch":
+                _queue.remove(s)
+                return s
+    return None
+
+
+def _run_batch(backend, s):
+    try:
+        s.text = backend.transcribe(s.path)
+    except Exception as e:  # noqa: BLE001
+        log(f"batch error: {e}")
+        s.text = f"__ERROR__ {e}"
+    s.done.set()
 
 
 def _read_pcm(fh, leftover):
@@ -84,7 +140,8 @@ def _feed(st, pending, arr):
     return buf[off:]
 
 
-def _run_stream(model, s):
+def _run_stream(backend, s):
+    model = backend.model
     for _ in range(50):                     # wait for ffmpeg to create the file
         if os.path.exists(s.path):
             break
@@ -93,6 +150,10 @@ def _run_stream(model, s):
     with model.transcribe_stream(context_size=CONTEXT, depth=DEPTH) as st, \
             open(s.path, "rb") as fh:
         while not s.finish.is_set() and not s.abort.is_set():
+            b = _next_batch()
+            if b is not None:               # a voice-agent turn mid-dictation
+                _run_batch(backend, b)
+                continue
             arr, leftover = _read_pcm(fh, leftover)
             if arr is not None:
                 pending = _feed(st, pending, arr); feeds += 1
@@ -118,6 +179,40 @@ def _run_stream(model, s):
     s.done.set()
 
 
+class ParakeetBackend:
+    def __init__(self, path):
+        from parakeet_mlx import from_pretrained
+        self.model = from_pretrained(path)
+
+    def transcribe(self, wav):
+        return (self.model.transcribe(wav).text or "").strip()
+
+
+class MlxAudioBackend:
+    """Any mlx-audio STT architecture, called the way its batch CLI calls it."""
+
+    def __init__(self, repo):
+        import inspect
+        import mlx.core as mx
+        from mlx_audio.stt.generate import parse_args
+        from mlx_audio.stt.utils import load_model
+        self.model = load_model(repo)
+        # The CLI's own defaults (language="en", max_tokens=8192, …), filtered to
+        # what this model's generate() names, exactly as generate_transcription
+        # does — so a dictation reads the same here as it did through the CLI.
+        defaults = vars(parse_args(["--audio", "-", "--output-path", "-"]))
+        params = inspect.signature(self.model.generate).parameters
+        self.kwargs = {k: v for k, v in defaults.items()
+                       if k in params and k not in ("audio", "verbose", "stream")}
+        if "generation_stream" in params:
+            # Created on this (the worker) thread, which owns the MLX stream.
+            self.kwargs["generation_stream"] = mx.new_stream(mx.default_device())
+
+    def transcribe(self, wav):
+        out = self.model.generate(wav, verbose=False, **self.kwargs)
+        return (getattr(out, "text", "") or "").strip()
+
+
 def worker():
     import mlx.core as mx  # (worker thread must own the MLX stream)
     # Bound MLX's Metal buffer cache. Left unbounded it grows across streaming
@@ -132,10 +227,18 @@ def worker():
             f"cache={mx.get_cache_memory() / MB:.0f}MB "
             f"peak={mx.get_peak_memory() / MB:.0f}MB")
 
-    from parakeet_mlx import from_pretrained
     log(f"loading model: {MODEL}")
     t0 = time.time()
-    model = from_pretrained(MODEL)
+    try:
+        backend = ParakeetBackend(MODEL) if ENGINE == "parakeet" else MlxAudioBackend(MODEL)
+    except Exception as e:  # noqa: BLE001
+        log(f"model load FAILED: {e}")
+        with _lock:
+            _state["error"] = str(e)
+            waiting = list(_queue); _queue.clear()
+        for s in waiting:
+            s.text = f"__ERROR__ model failed to load: {e}"; s.done.set()
+        return
     log(f"model loaded in {time.time() - t0:.2f}s")
     try:
         import numpy as np
@@ -145,31 +248,35 @@ def worker():
             with wave.open(warm, "w") as w:
                 w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
                 w.writeframes(np.zeros(SR, dtype=np.int16).tobytes())
-        tw = time.time(); model.transcribe(warm)
+        tw = time.time(); backend.transcribe(warm)
         log(f"warmup inference {time.time() - tw:.2f}s")
     except Exception as e:  # noqa: BLE001
         log(f"warmup skipped: {e}")
     mx.clear_cache()
+    _state["load_s"] = round(time.time() - t0, 2)
+    _state["ready"] = True
     memlog("ready")
     log("worker ready")
     while True:
         _wake.wait(); _wake.clear()
-        with _lock:
-            s = _pending["sess"]; _pending["sess"] = None
-        if s is None or s.abort.is_set():
-            continue
-        try:
-            if s.kind == "batch":
-                s.text = (model.transcribe(s.path).text or "").strip()
-                s.done.set()
-            else:
-                _run_stream(model, s)
-        except Exception as e:  # noqa: BLE001
-            log(f"{s.kind} error: {e}")
-            s.text = f"__ERROR__ {e}"; s.done.set()
-        # Idle now: hand cached Metal scratch buffers back to the OS so the
-        # resident footprint between dictations stays at the model's ~1.2GB.
-        mx.clear_cache()
+        while True:
+            with _lock:
+                s = _queue.popleft() if _queue else None
+            if s is None:
+                break
+            if s.abort.is_set():
+                s.done.set(); continue
+            try:
+                if s.kind == "batch":
+                    _run_batch(backend, s)
+                else:
+                    _run_stream(backend, s)
+            except Exception as e:  # noqa: BLE001
+                log(f"{s.kind} error: {e}")
+                s.text = f"__ERROR__ {e}"; s.done.set()
+            # Idle now: hand cached Metal scratch buffers back to the OS so the
+            # resident footprint between dictations stays at the model's weights.
+            mx.clear_cache()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -180,17 +287,20 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(n).decode("utf-8").strip() if n else ""
 
-    def _reply(self, code, text):
+    def _reply(self, code, text, ctype="text/plain"):
         b = text.encode("utf-8")
         self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", f"{ctype}; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)
 
     def do_POST(self):
         body = self._body()
-        if self.path == "/start":
+        if self.path in ("/start", "/finish") and not STREAMS:
+            # Fail fast: dictation treats any non-200 here as "use /transcribe".
+            self._reply(501, f"__ERROR__ {MODEL_ID} does not stream; use /transcribe")
+        elif self.path == "/start":
             _new_session("stream", body); self._reply(200, "started")
         elif self.path == "/finish":
             with _lock:
@@ -199,7 +309,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(500, "__ERROR__ no session"); return
             s.finish.set()
             if s.done.wait(timeout=30):
-                self._reply(200, s.text or "")
+                t = s.text or ""
+                self._reply(200 if not t.startswith("__ERROR__") else 500, t)
             else:
                 self._reply(500, "__ERROR__ timeout")
         elif self.path == "/cancel":
@@ -224,10 +335,17 @@ class Handler(BaseHTTPRequestHandler):
                 s = _current["sess"]
             txt = s.partial if (s is not None and not s.done.is_set()) else ""
             self._reply(200, txt)
+        elif self.path == "/health":
+            self._reply(200, json.dumps({
+                "engine": ENGINE, "model": MODEL_ID, "path": MODEL,
+                "streams": STREAMS, "ready": _state["ready"],
+                "error": _state["error"], "load_s": _state["load_s"],
+                "pid": os.getpid(),
+            }), "application/json")
         else:
             self._reply(200, "ok")
 
 
 threading.Thread(target=worker, daemon=True).start()
-log(f"listening on http://{HOST}:{PORT}")
-HTTPServer((HOST, PORT), Handler).serve_forever()
+log(f"listening on http://{HOST}:{PORT} ({MODEL_ID})")
+ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

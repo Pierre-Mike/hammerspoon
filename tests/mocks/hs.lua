@@ -7,9 +7,17 @@ local hs = {}
 -- fires the timer by calling it. Nothing runs on its own: a test that wants a
 -- tick says so.
 hs.timer = {
+  _every = {},
   secondsSinceEpoch = function() return os.time() end,
   doAfter = function(_, fn) return { start = fn, stop = function() end } end,
-  doEvery = function(_, fn) return { start = fn, stop = function() end, fn = fn } end,
+  -- Repeating timers are also pushed onto hs.timer._every, so a spec can drive
+  -- a loop whose handle the module kept to itself: call _every[n].fn() once per
+  -- tick you want to happen.
+  doEvery = function(_, fn)
+    local t = { start = fn, stop = function() end, fn = fn }
+    hs.timer._every[#hs.timer._every + 1] = t
+    return t
+  end,
   new = function(_, fn) return { start = function() end, stop = function() end, fn = fn } end,
 }
 
@@ -30,11 +38,99 @@ hs.pasteboard = {
 hs.eventtap = {
   new = function(_, _) return { start = function() end, stop = function() end } end,
   event = { types = { flagsChanged = 1, keyDown = 2, systemDefined = 3 } },
+  -- Every synthetic keystroke lands here in order instead of going to the
+  -- window server, so a spec can read back exactly what a module tried to type.
+  -- Specs that care clear it first; the paste path only needs the call not to
+  -- fail, and ignores it.
+  _sent = {},
 }
 
--- Real macOS virtual keycodes for the letters apps/dictation chords on
--- (Fn+C cancel, Fn+S speak selection).
-hs.keycodes = { map = { c = 8, s = 1 } }
+function hs.eventtap.keyStroke(mods, key, delay)
+  hs.eventtap._sent[#hs.eventtap._sent + 1] =
+    { kind = "key", mods = mods, key = key, delay = delay }
+end
+
+-- Nothing is physically held in a test, so a module waiting for the user's
+-- hand to come off the keys proceeds at once.
+function hs.eventtap.checkKeyboardModifiers() return {} end
+
+-- A key event carrying a unicode string. The stub keeps the setters chainable
+-- and only records on post(), because an event that is built and never posted
+-- is not a keystroke.
+-- Hammerspoon accepts both newKeyEvent(keycode, isdown) and the longer
+-- newKeyEvent(mods, key, isdown), and keystroke_typer uses each for a different
+-- job: the short form to carry a unicode string, the long form to ask the
+-- layout what a key gives under Shift. The stub takes both.
+function hs.eventtap.event.newKeyEvent(a, b, c)
+  local mods, keycode, isdown
+  if type(a) == "table" then mods, keycode, isdown = a, b, c
+  else mods, keycode, isdown = {}, a, b end
+  if type(keycode) == "string" then keycode = hs.keycodes.map[keycode] end
+
+  local shift = false
+  for _, m in ipairs(mods) do if m == "shift" then shift = true end end
+
+  local e = { keycode = keycode, isdown = isdown, mods = mods }
+  function e:setFlags(f) self.flags = f; return self end
+  function e:setUnicodeString(s) self.unicode = s; return self end
+  -- The layout's answer, which is what the real one returns for an event that
+  -- was built and never posted.
+  function e:getCharacters(_) return hs.keycodes.charFor(keycode, shift) end
+  function e:post()
+    hs.eventtap._sent[#hs.eventtap._sent + 1] =
+      { kind = "text", down = self.isdown, text = self.unicode,
+        flags = self.flags, keycode = self.keycode }
+    return self
+  end
+  return e
+end
+
+-- Images resolve to an opaque handle: specs only ever pass it back to a menubar
+-- stub, so the identity is all that matters.
+hs.image = {
+  imageFromName = function(name) return { _name = name } end,
+  imageFromPath = function(path) return { _path = path } end,
+}
+
+-- A real US keyboard's virtual keycodes, in hs.keycodes.map's shape: the name
+-- to its keycode and the keycode back to the name. The whole layout rather than
+-- the few keys apps/dictation chords on, because apps/keystroke_typer resolves
+-- every character it types through this table, and a stub with three keys in it
+-- would let a typer that cannot spell "hello" pass.
+hs.keycodes = { map = {} }
+for name, code in pairs({
+  a = 0,  s = 1,  d = 2,  f = 3,  h = 4,  g = 5,  z = 6,  x = 7,  c = 8,  v = 9,
+  b = 11, q = 12, w = 13, e = 14, r = 15, y = 16, t = 17,
+  ["1"] = 18, ["2"] = 19, ["3"] = 20, ["4"] = 21, ["6"] = 22, ["5"] = 23,
+  ["="] = 24, ["9"] = 25, ["7"] = 26, ["-"] = 27, ["8"] = 28, ["0"] = 29,
+  ["]"] = 30, o = 31, u = 32, ["["] = 33, i = 34, p = 35,
+  ["return"] = 36, l = 37, j = 38, ["'"] = 39, k = 40, [";"] = 41,
+  ["\\"] = 42, [","] = 43, ["/"] = 44, n = 45, m = 46, ["."] = 47,
+  tab = 48, space = 49, ["`"] = 50, delete = 51, escape = 53,
+}) do
+  hs.keycodes.map[name] = code
+  hs.keycodes.map[code] = name
+end
+
+-- What each key gives with Shift held on that same US keyboard. The mock models
+-- this because the module asks the layout rather than assuming it, and a stub
+-- that answered nothing would silently exercise only the fallback path.
+hs.keycodes._shift = {
+  ["1"] = "!", ["2"] = "@", ["3"] = "#", ["4"] = "$", ["5"] = "%",
+  ["6"] = "^", ["7"] = "&", ["8"] = "*", ["9"] = "(", ["0"] = ")",
+  ["-"] = "_", ["="] = "+", ["["] = "{", ["]"] = "}", ["\\"] = "|",
+  [";"] = ":", ["'"] = '"', [","] = "<", ["."] = ">", ["/"] = "?", ["`"] = "~",
+}
+
+-- The character a keycode produces, given the modifiers held. Shared by the
+-- newKeyEvent stub below and by any spec that wants to read back what a client
+-- translating by keycode alone would have received.
+function hs.keycodes.charFor(code, shift)
+  local name = hs.keycodes.map[code]
+  if type(name) ~= "string" or #name ~= 1 then return nil end
+  if not shift then return name end
+  return hs.keycodes._shift[name] or name:upper()
+end
 
 hs.screen = {
   mainScreen = function()

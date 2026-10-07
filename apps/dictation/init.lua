@@ -1,7 +1,8 @@
 -- Dictation: hold Fn = record, release = transcribe & paste at cursor.
--- Pipeline: ffmpeg → parakeet-mlx → pbpaste → ⌘V
+-- Pipeline: ffmpeg → warm STT server (the selected model) → pbpaste → ⌘V
 
 local earcon      = require("lib.earcon")
+local sttServer   = require("lib.stt_server")
 local configFile  = require("lib.config")
 local EARCONS_CFG = configFile.EARCONS
 
@@ -12,22 +13,21 @@ local TXT  = "/tmp/hs-dictate.txt"
 local FFMPEG   = "/opt/homebrew/bin/ffmpeg"
 local PARAKEET = os.getenv("HOME") .. "/.local/bin/parakeet-mlx"
 local MODEL_PATH = os.getenv("HOME") .. "/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3/snapshots/ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15"
--- Warm transcription server: model stays resident, so each dictation pays only
--- ~0.2s inference instead of the ~2s cold-start of the parakeet-mlx CLI.
-local PARAKEET_PY     = os.getenv("HOME") .. "/.local/share/uv/tools/parakeet-mlx/bin/python"
-local PARAKEET_SERVER = os.getenv("HOME") .. "/.hammerspoon/parakeet_server.py"
-local PARAKEET_BASE   = "http://127.0.0.1:8765"
-local PARAKEET_URL    = PARAKEET_BASE .. "/transcribe"  -- batch (fallback only)
--- mlx-audio runtime: the batch backend behind every non-streaming model
--- (Qwen3-ASR, Whisper, Granite, Cohere Transcribe, Mega-ASR — see ENGINES).
--- Separate from the parakeet server: it cold-loads per call, one model at a
--- time, and has no live-preview streaming.
-local MLXA_PY   = os.getenv("HOME") .. "/.local/share/uv/tools/mlx-audio/bin/python"
-local BATCH_OUT = "/tmp/hs-stt-batch"
+-- One warm transcription server holds the ONE selected model, so each dictation
+-- pays only inference (~0.1–0.2s) instead of a multi-second cold load. The voice
+-- agent POSTs to the same port, so it always hears with the same model.
+-- parakeet_server.py serves both engines; it runs under the interpreter of the
+-- selected model's engine (parakeet-mlx or mlx-audio — see lib/stt_server).
+local PARAKEET_PY = os.getenv("HOME") .. "/.local/share/uv/tools/parakeet-mlx/bin/python"
+local MLXA_PY     = os.getenv("HOME") .. "/.local/share/uv/tools/mlx-audio/bin/python"
+local STT_SERVER  = os.getenv("HOME") .. "/.hammerspoon/parakeet_server.py"
+local STT_PORT    = 8765
+local STT_BASE    = "http://127.0.0.1:" .. STT_PORT
+local STT_URL     = STT_BASE .. "/transcribe"  -- batch: every mlx-audio take, parakeet fallback
 local MIN_DURATION = 0.6            -- avfoundation needs ~300ms to start; below this = no audio
 local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button release is ever missed
 
-local M = { recording = false, ffmpegTask = nil, fnDown = false, playDown = false, startedAt = 0, lastResult = nil, cancelled = false }
+local M = { recording = false, ffmpegTask = nil, fnDown = false, startedAt = 0, lastResult = nil, cancelled = false, ducked = false, preDuckVolume = nil }
 
 -- File logger so we can debug dictation without staring at the HS console.
 local LOG = "/tmp/hs-dictate.log"
@@ -105,39 +105,15 @@ setIcon("○")
 -- goes when the cache directory goes — gaining or losing a model is a download,
 -- not an edit here.
 --
--- Which backend runs a model is read off the model's own config.json, never its
--- name:
+-- Whichever model is selected is the only one loaded: the warm server is
+-- relaunched with it on every switch, the old process killed first so its
+-- memory is back before the new model loads. Which backend runs a model is read
+-- off the model's own config.json, never its name (table in lib/stt_server):
 --   • a NeMo `target` (the parakeet family) → parakeet-mlx, the only backend
 --     that streams, so these are the only models with a live preview
---   • a `model_type` mlx-audio implements → mlx-audio's batch CLI, which
---     cold-loads per call and returns the text on release
+--   • a `model_type` mlx-audio implements → mlx-audio, loaded once in the same
+--     server and transcribing the whole WAV on release
 local HF_HUB = os.getenv("HOME") .. "/.cache/huggingface/hub"
-
--- config.json model_type → backend. "parakeet" is synthesised by the scan below
--- for any NeMo-target config; every other key is an mlx-audio STT architecture
--- (one directory each under mlx_audio/stt/models/). A cached model whose type is
--- absent here is skipped rather than guessed at, which is also what keeps the
--- non-speech models in the same cache — LLMs, pocket-tts — out of the menu.
-local ENGINES = {
-  parakeet           = "parakeet",
-  qwen3_asr          = "mlxa",
-  mega_asr           = "mlxa",
-  cohere_asr         = "mlxa",
-  granite_speech     = "mlxa",
-  granite_speech_nar = "mlxa",
-  whisper            = "mlxa",
-  glm                = "mlxa",
-  glmasr             = "mlxa",
-  voxtral            = "mlxa",
-  voxtral_realtime   = "mlxa",
-  nemotron_asr       = "mlxa",
-  fun_asr_nano       = "mlxa",
-  fireredasr2        = "mlxa",
-  sensevoice         = "mlxa",
-  canary             = "mlxa",
-  moonshine          = "mlxa",
-  vibevoice          = "mlxa",
-}
 
 -- Label and accuracy for the models worth naming. `wer` is measured HERE, on
 -- this machine, against the exact quantised snapshot the menu loads: 73
@@ -184,8 +160,8 @@ end
 
 -- One pass over the hub. Per snapshot it emits every model_type in the config —
 -- there are usually several, since nested encoder configs carry their own — plus
--- a "parakeet" marker for NeMo configs. Lua then takes the first type ENGINES
--- recognises, so a nested `qwen3_asr_audio_encoder` can never decide a backend.
+-- a "parakeet" marker for NeMo configs. sttServer.engineFor then takes the first
+-- type it recognises, so a nested `qwen3_asr_audio_encoder` can never decide a backend.
 -- A repo with `.incomplete` blobs is a download still in flight: listing it would
 -- put a model in the menu that fails the moment it is picked.
 local HUB_SCAN = [==[
@@ -207,8 +183,7 @@ local function discoverModels()
   local out = hs.execute('HF_HUB="' .. HF_HUB .. '"\n' .. HUB_SCAN) or ""
   local models = {}
   for dir, path, kb, types in out:gmatch("([^\t\n]+)\t([^\t\n]+)\t([^\t\n]+)\t([^\n]*)") do
-    local engine
-    for t in types:gmatch("%S+") do engine = engine or ENGINES[t] end
+    local engine = sttServer.engineFor(types)
     if engine then
       local id = dir:gsub("^models%-%-", ""):gsub("%-%-", "/")   -- → mlx-community/…
       local meta = CATALOG[id] or {}
@@ -278,27 +253,15 @@ local function initModel()
   return MODELS[1] or { id = "default", path = MODEL_PATH, name = "default", engine = "parakeet", stream = true }
 end
 
--- The warm parakeet server always runs a *parakeet* model (used when a streaming
--- model is selected, and kept ready for when you switch back from a batch one).
-local function defaultParakeet()
-  for _, m in ipairs(MODELS) do if m.engine == "parakeet" and m.path == MODEL_PATH then return m end end
-  for _, m in ipairs(MODELS) do if m.engine == "parakeet" then return m end end
-  return { path = MODEL_PATH, name = "v3 · multilingual" }
-end
-
+-- The warm server runs the selected model and nothing else — M.serverModel is
+-- always the same entry as the selection, set again on every switch.
 local _sel = initModel()
-M.engine     = _sel.engine            -- "parakeet" (streams) | "mlxa" (batch)
-M.stream     = _sel.stream            -- live preview?
-M.selectedId = _sel.id                -- for the menu checkmark
-M.modelName  = _sel.name
-M.modelSize  = _sel.sizeStr           -- resident-memory footprint (e.g. "2.3 GB")
-M.modelRepo  = _sel.id                -- mlx-audio --model arg (batch engine)
-if _sel.engine == "parakeet" then
-  M.serverModelPath, M.serverModelName = _sel.path, _sel.name
-else
-  local p = defaultParakeet()
-  M.serverModelPath, M.serverModelName = p.path, p.name
-end
+M.engine      = _sel.engine           -- "parakeet" (streams) | "mlxa" (batch)
+M.stream      = _sel.stream           -- live preview?
+M.selectedId  = _sel.id               -- for the menu checkmark
+M.modelName   = _sel.name
+M.modelSize   = _sel.sizeStr          -- resident-memory footprint (e.g. "2.3 GB")
+M.serverModel = _sel                  -- what parakeet_server.py loads
 M.menu:setTooltip("Dictate · " .. M.modelName .. " · " .. (M.modelSize or "?") .. " · mic: " .. (M.micName or "?"))
 
 -- Floating HUD at screen center
@@ -459,16 +422,40 @@ local function paste(text)
   hs.eventtap.keyStroke({"cmd"}, "v", 0)
 end
 
+-- Duck system audio while the mic is open; unduckNoise puts it back. One duck,
+-- one restore — M.ducked is what keeps them paired. Without it a second duck
+-- would save the already-ducked 30 as the "original" volume, and from then on
+-- every restore would hand back 30 instead of what the user was listening at.
+local DUCK_LEVEL = 30
+local function duckNoise()
+  if M.ducked then logf("[duck] already ducked — keeping saved volume"); return end
+  local dev = hs.audiodevice.defaultOutputDevice()
+  if not dev then logf("[duck] no output device"); return end
+  local vol = dev:volume()
+  if not vol then logf("[duck] output device reports no volume"); return end
+  M.preDuckVolume, M.ducked = vol, true
+  dev:setVolume(DUCK_LEVEL)
+  logf("[duck] volume %.1f → %d", vol, DUCK_LEVEL)
+end
+
+-- The single restore point. Every exit from a take routes here — transcript
+-- pasted, chord cancel, tap too short, transcription error — so calling it is
+-- always safe and never double-restores. State is cleared before the device
+-- call so a failing setVolume cannot strand us ducked forever.
+local function unduckNoise()
+  if not M.ducked then return end
+  local vol = M.preDuckVolume
+  M.ducked, M.preDuckVolume = false, nil
+  local dev = hs.audiodevice.defaultOutputDevice()
+  if not dev then logf("[duck] no output device to restore to"); return end
+  dev:setVolume(vol)
+  logf("[duck] restored %.1f", vol)
+end
+
 -- Shared tail: reset UI, then paste at the cursor.
 local function finishTranscript(out)
   setIcon("○"); hideHUD(); hideLivePreview(); M.recording = false
-  -- Restore system volume after recording.
-  local dev = hs.audiodevice.defaultOutputDevice()
-  if dev and M.preDuckVolume then
-    dev:setVolume(M.preDuckVolume)
-    logf("[duck] restored %.1f", M.preDuckVolume)
-    M.preDuckVolume = nil
-  end
+  unduckNoise()
   logf("[dictate] result: %s", tostring(out))
   if out and out ~= "" then
     out = out:gsub("^%s+", ""):gsub("%s+$", "")
@@ -479,7 +466,8 @@ local function finishTranscript(out)
   end
 end
 
--- Cold fallback: spawn the parakeet-mlx CLI (used only if the warm server is down).
+-- Cold fallback for parakeet models only: spawn the parakeet-mlx CLI on the same
+-- snapshot when the warm server misses (not up yet, mid-restart, error).
 local function transcribeCLI()
   os.remove(TXT); os.remove("/private/tmp/hs-dictate.txt")
   local task = hs.task.new(PARAKEET,
@@ -488,65 +476,34 @@ local function transcribeCLI()
       if stdErr and stdErr ~= "" then logf("[dictate] stderr: %s", stdErr) end
       finishTranscript(readFile(TXT) or readFile("/private/tmp/hs-dictate.txt"))
     end,
-    {"--model", M.serverModelPath, "--output-dir", "/tmp", "--output-format", "txt", WAV}
+    {"--model", M.serverModel.path, "--output-dir", "/tmp", "--output-format", "txt", WAV}
   )
   task:setEnvironment({ HOME = os.getenv("HOME"), PATH = "/opt/homebrew/bin:/usr/bin:/bin" })
   task:start()
 end
 
--- Warm path: POST the wav path to the resident server; fall back to the CLI on
--- any miss (server not up yet, connection refused, transcription error).
+-- Batch path: POST the finished WAV's path to the warm server, which holds the
+-- selected model whatever its engine. This is every take on an mlx-audio model
+-- (no live preview: transcribed after release, the CLI's defaults incl.
+-- language "en") and the fallback for a parakeet stream that missed. On a miss
+-- a parakeet model falls back to its CLI; an mlx-audio model reports the error
+-- rather than cold-loading a second copy of itself.
 local function transcribe()
   setIcon("…")
   showHUD("Transcribing…", COLOR_PROC)
-  hs.http.asyncPost(PARAKEET_URL, WAV, { ["Content-Type"] = "text/plain" },
+  hs.http.asyncPost(STT_URL, WAV, { ["Content-Type"] = "text/plain" },
     function(status, body, _)
       if status == 200 and body and body ~= "" and not body:match("^__ERROR__") then
         logf("[dictate] server ok len=%d", #body)
         finishTranscript(body)
-      else
+      elseif M.engine == "parakeet" then
         logf("[dictate] server miss (status=%s), CLI fallback", tostring(status))
         transcribeCLI()
+      else
+        logf("[dictate] server miss (status=%s) on %s: %s", tostring(status), M.modelName, tostring(body))
+        finishTranscript(nil)
       end
     end)
-end
-
--- Duck system audio on recording start; stored on M so finishTranscript can restore.
-local DUCK_LEVEL = 30
-local function duckNoise()
-  local dev = hs.audiodevice.defaultOutputDevice()
-  if dev then
-    M.preDuckVolume = dev:volume()
-    dev:setVolume(DUCK_LEVEL)
-    logf("[duck] volume %.1f → %d", M.preDuckVolume, DUCK_LEVEL)
-  else
-    logf("[duck] no output device")
-  end
-end
-
-local function unduckNoise()
-  local dev = hs.audiodevice.defaultOutputDevice()
-  if dev and M.preDuckVolume then
-    dev:setVolume(M.preDuckVolume)
-    logf("[duck] restored %.1f", M.preDuckVolume)
-    M.preDuckVolume = nil
-  end
-end
-
--- Batch path for every non-streaming model, run through mlx-audio. No live
--- preview: the finished WAV is transcribed after release. No --language flag, so
--- the model auto-detects (English/French). Cold-loads the model each call, which
--- is why these entries cost seconds where a warm parakeet costs ~0.2s.
-local function transcribeBatch()
-  os.remove(BATCH_OUT .. ".txt")
-  logf("[dictate] batch transcribe (%s)", M.modelRepo)
-  local t = hs.task.new(MLXA_PY, function(code, _, err)
-    if code ~= 0 and err and err ~= "" then logf("[dictate] batch stderr: %s", err) end
-    finishTranscript(readFile(BATCH_OUT .. ".txt"))
-  end, {"-m", "mlx_audio.stt.generate", "--model", M.modelRepo,
-        "--audio", WAV, "--output-path", BATCH_OUT, "--format", "txt"})
-  t:setEnvironment({ HOME = os.getenv("HOME"), PATH = "/opt/homebrew/bin:/usr/bin:/bin" })
-  t:start()
 end
 
 -- Forward decl so startRecording's watchdog can call stopRecording (defined below).
@@ -565,13 +522,13 @@ local function startRecording()
   showLivePreview(nil)   -- "Listening…" (stays put for batch engines: no partials)
   duckNoise()
   logf("[dictate] recording start (mic=%q, engine=%s)", M.micName, M.engine)
-  -- Two outputs from one capture: WAV for batch transcription (CLI / mlx-audio),
-  -- plus a headerless s16le PCM file the parakeet server tails live.
+  -- Two outputs from one capture: WAV for batch transcription (server /transcribe),
+  -- plus a headerless s16le PCM file the server tails live (parakeet models).
   M.ffmpegTask = hs.task.new(FFMPEG, function(code, _, err)
     logf("[dictate] ffmpeg exit=%d", code)
     if code ~= 0 and err and err ~= "" then logf("[dictate] ffmpeg stderr: %s", err) end
     -- Non-streaming engine: WAV is finalized now, so kick off the batch transcribe.
-    if M.batchFinish then M.batchFinish = false; transcribeBatch() end
+    if M.batchFinish then M.batchFinish = false; transcribe() end
   end,
     {"-y", "-f", "avfoundation", "-i", ":" .. M.micName,
      "-ar", "16000", "-ac", "1", WAV,
@@ -590,12 +547,12 @@ local function startRecording()
   end)
   if M.stream then
     -- Begin streaming this recording into the warm model as it's captured.
-    hs.http.asyncPost(PARAKEET_BASE .. "/start", RAW, {}, function(status, _, _)
+    hs.http.asyncPost(STT_BASE .. "/start", RAW, {}, function(status, _, _)
       if status ~= 200 then logf("[dictate] /start status=%s (will batch-fallback)", tostring(status)) end
     end)
     -- Poll the live hypothesis and show it growing in the preview panel.
     M.previewTimer = hs.timer.new(0.2, function()
-      hs.http.asyncGet(PARAKEET_BASE .. "/partial", nil, function(status, body, _)
+      hs.http.asyncGet(STT_BASE .. "/partial", nil, function(status, body, _)
         if M.recording and status == 200 and body and body ~= "" then
           showLivePreview(body)
         end
@@ -606,7 +563,7 @@ local function startRecording()
 end
 
 local function cancelStream()
-  hs.http.asyncPost(PARAKEET_BASE .. "/cancel", "", {}, function() end)
+  hs.http.asyncPost(STT_BASE .. "/cancel", "", {}, function() end)
 end
 
 function stopRecording()
@@ -616,7 +573,7 @@ function stopRecording()
   if M.watchdog then M.watchdog:stop(); M.watchdog = nil end
   local dur = hs.timer.secondsSinceEpoch() - M.startedAt
   -- For batch engines, flag the finish BEFORE terminating ffmpeg so its exit
-  -- callback (which fires once the WAV is finalized) runs transcribeBatch.
+  -- callback (which fires once the WAV is finalized) runs transcribe().
   M.batchFinish = (not M.stream) and (not M.cancelled) and (dur >= MIN_DURATION)
   if M.ffmpegTask then M.ffmpegTask:terminate(); M.ffmpegTask = nil end
   if M.previewTimer then M.previewTimer:stop(); M.previewTimer = nil end
@@ -637,7 +594,7 @@ function stopRecording()
     -- ffmpeg already got SIGTERM; tell the server to drain the last audio and
     -- return the transcript. The model has consumed this clip live, so only the
     -- final <1s remains. Fall back to batch (server, then CLI) on miss.
-    hs.http.asyncPost(PARAKEET_BASE .. "/finish", "", {}, function(status, body, _)
+    hs.http.asyncPost(STT_BASE .. "/finish", "", {}, function(status, body, _)
       if status == 200 and body and body ~= "" and not body:match("^__ERROR__") then
         logf("[dictate] stream finish len=%d", #body)
         finishTranscript(body)
@@ -650,26 +607,45 @@ function stopRecording()
   -- Batch engine: handled by the ffmpeg exit callback (M.batchFinish) once WAV is finalized.
 end
 
--- Kill any stale process on port 8765, then launch the warm parakeet server.
+-- Launch the warm server on M.serverModel, under that engine's interpreter. The
+-- exit callback only clears M.serverTask if it is still this task: a killed
+-- server reports its exit after its replacement has already started.
 local function launchServer()
-  M.serverTask = hs.task.new(PARAKEET_PY,
+  local m = M.serverModel
+  local l, why = sttServer.launch(m, {
+    parakeetPy = PARAKEET_PY, mlxaPy = MLXA_PY, server = STT_SERVER,
+    home = os.getenv("HOME"), port = STT_PORT,
+  })
+  if not l then
+    logf("[server] cannot launch: %s", tostring(why))
+    notify("STT server not started: " .. tostring(why), 2.8)
+    return
+  end
+  local task
+  task = hs.task.new(l.python,
     function(code, _, err)
       logf("[server] exited code=%d err=%s", code, tostring(err))
-      M.serverTask = nil
+      if M.serverTask == task then M.serverTask = nil end
     end,
-    { PARAKEET_SERVER })
-  M.serverTask:setEnvironment({
-    HOME = os.getenv("HOME"),
-    PATH = "/opt/homebrew/bin:/usr/bin:/bin",
-    PARAKEET_MODEL_PATH = M.serverModelPath,
-  })
-  M.serverTask:start()
-  logf("[server] launching warm parakeet server (%s)", M.serverModelName or "?")
+    l.args)
+  task:setEnvironment(l.env)
+  task:start()
+  M.serverTask = task
+  logf("[server] launching warm %s server (%s)", m.engine, m.name or m.id or "?")
 end
 
-local killStale = hs.task.new("/bin/sh", function() launchServer() end,
-  {"-c", "lsof -ti :8765 | xargs kill -9 2>/dev/null; true"})
-killStale:start()
+-- (Re)launch the warm server on M.serverModel. Kills whatever holds :8765 and
+-- waits for the port to free before launching, so the previous model's memory
+-- is released before the next one loads: never two models resident at once.
+-- Also how startup gets rid of a server left over from before a reload.
+local function restartServer()
+  if M.serverTask then M.serverTask:terminate(); M.serverTask = nil end
+  local k = hs.task.new("/bin/sh", function() launchServer() end,
+    {"-c", sttServer.freePortCommand(STT_PORT)})
+  k:start()
+end
+
+restartServer()   -- after a reload: the saved selection, not a default parakeet
 
 -- Reap an orphaned capture: if HS reloads or crashes while recording, its child
 -- ffmpeg is reparented to launchd and keeps holding the mic (avfoundation :1)
@@ -679,36 +655,22 @@ local killStaleFfmpeg = hs.task.new("/bin/sh", nil,
   {"-c", "pkill -f 'ffmpeg .*hs-dictate[.]wav' 2>/dev/null; true"})
 killStaleFfmpeg:start()
 
--- Relaunch the warm server against M.serverModelPath. Frees :8765 first so the new
--- model loads cleanly into a fresh process (the previous worker held the GPU).
-local function restartServer()
-  if M.serverTask then M.serverTask:terminate(); M.serverTask = nil end
-  local k = hs.task.new("/bin/sh", function() launchServer() end,
-    {"-c", "lsof -ti :8765 | xargs kill -9 2>/dev/null; true"})
-  k:start()
-end
-
+-- Every switch restarts the server on the new model, whatever its engine: the
+-- old model is unloaded with its process, and dictation and the voice agent
+-- both move to the new one together.
 local function setModel(m)
   if M.recording then notify("stop recording before switching model", 1.8); return end
   if m.id == M.selectedId then return end
   M.engine, M.stream, M.selectedId = m.engine, m.stream, m.id
-  M.modelName, M.modelRepo, M.modelSize = m.name, m.id, m.sizeStr
+  M.modelName, M.modelSize = m.name, m.sizeStr
+  M.serverModel = m
   hs.settings.set("dictate.modelId", m.id)
   M.menu:setTooltip("Dictate · " .. M.modelName .. " · " .. (M.modelSize or "?"))
   logf("[model] switch → %s (engine=%s, %s)", m.name, m.engine, m.sizeStr or "?")
   local sz = " · " .. (m.sizeStr or "?") .. " RAM"
-  if m.engine == "parakeet" then
-    if m.path ~= M.serverModelPath then
-      M.serverModelPath, M.serverModelName = m.path, m.name
-      notify("Model: " .. m.name .. sz .. " — reloading…", 2.4)
-      restartServer()
-    else
-      notify("Model: " .. m.name .. sz, 1.6)   -- server already on this model
-    end
-  else
-    -- Batch engine: nothing to reload; the parakeet server stays warm for switch-back.
-    notify("Model: " .. m.name .. sz .. " · batch (no live preview)", 2.8)
-  end
+  local kind = m.stream and "" or " · batch (no live preview)"
+  notify("Model: " .. m.name .. sz .. kind .. " — loading…", 2.8)
+  restartServer()
 end
 
 -- Dynamic menu: rebuilt each open so the active model keeps its checkmark.
@@ -792,25 +754,6 @@ M.flagWatcher = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function
   return false
 end)
 M.flagWatcher:start()
-
--- Headset MFB → Play/Pause (Logi Tune: Single Press → Play/Pause).
--- Same hold-to-record semantics as Fn. Swallows the event so it doesn't
--- toggle Music/Spotify. Auto-repeats are ignored via the playDown guard.
-M.playWatcher = hs.eventtap.new({hs.eventtap.event.types.systemDefined}, function(e)
-  local d = e:systemKey()
-  if not d or d.key ~= "PLAY" then return false end
-  if d.down and not M.playDown then
-    M.playDown = true
-    if not M.recording then startRecording() end
-    return true
-  elseif d.down == false and M.playDown then
-    M.playDown = false
-    if M.recording then stopRecording() end
-    return true
-  end
-  return false
-end)
-M.playWatcher:start()
 
 -- Chord detection while holding Fn:
 --   Fn+C  cancel current recording and recall last
