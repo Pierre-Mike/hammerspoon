@@ -1,0 +1,52 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The specs load lib/ and apps/ against tests/mocks/hs.lua, so they need no
+  # macOS. The macOS paths in them (/opt/homebrew/bin, /usr/bin/afplay) are only
+  # compared as strings.
+  lua:
+    name: Lua specs (busted, Lua 5.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Hammerspoon embeds Lua 5.4.
+      - uses: leafo/gh-actions-lua@6919171ccf181b826f44b9bca76307b577217377 # v13.0.0
+        with:
+          luaVersion: "5.4"
+
+      - uses: leafo/gh-actions-luarocks@35d062def313a7699a0d513e996bcf4352f05389 # v6.1.0
+
+      - name: Install busted
+        run: luarocks install busted 2.3.0
+
+      - name: Run specs
+        run: make test-lua
+
+  # nose_geom.py has no third-party imports, so this needs neither pyobjc nor a
+  # camera.
+  noseguard:
+    name: NoseGuard geometry (unittest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Run tests
+        run: make test-noseguard
