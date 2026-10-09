@@ -562,26 +562,79 @@ function M.route(target, method, path, body)
 end
 
 -- ── Tile ───────────────────────────────────────────────────────────────────
--- Quiet in the normal case, loud only when it matters. `ready` and `starting`
--- are the same cloud; the emoji presentation selector makes the ready one
--- coloured and leaves the other monochrome, which is as close to "dimmed" as a
--- menu-bar title gets.
-M.GLYPH = {
-  off      = "\u{2601}\u{FE0E}",
-  starting = "\u{2601}\u{FE0E}",
-  ready    = "\u{2601}\u{FE0F}",
-  error    = "\u{26A0}\u{FE0F}",
+-- The tile's glyph is a status light. Green means a tunnel is up and handing
+-- out a URL; red means there is none, which covers both "stopped" and "broken";
+-- amber is the in-between, where a child is running but has printed no URL yet.
+--
+-- It used to be a cloud, monochrome or coloured. A cloud says "Cloudflare" to
+-- someone already reading a tile labelled Cloudflare tunnel, and says nothing
+-- about whether the tunnel is up — which is the only question the tile is
+-- there to answer.
+M.DOT = {
+  off      = "\u{1F534}",   -- red
+  starting = "\u{1F7E1}",   -- amber
+  ready    = "\u{1F7E2}",   -- green
+  error    = "\u{1F534}",   -- red
 }
 
-function M.title(s)
-  return M.GLYPH[M.computeStatus(s)] or M.GLYPH.off
-end
+-- The same four states as a word, for a menu row that has space for one.
+M.LABEL = {
+  off = "Stopped", starting = "Starting", ready = "Running", error = "Error",
+}
+
+function M.statusDot(s)   return M.DOT[M.computeStatus(s)]   or M.DOT.off   end
+function M.statusLabel(s) return M.LABEL[M.computeStatus(s)] or M.LABEL.off end
+
+function M.title(s) return M.statusDot(s) end
 
 function M.humanDuration(seconds)
   seconds = math.max(0, math.floor(tonumber(seconds) or 0))
   if seconds < 60 then return string.format("%ds", seconds) end
   if seconds < 3600 then return string.format("%dm %ds", seconds // 60, seconds % 60) end
   return string.format("%dh %dm", seconds // 3600, (seconds % 3600) // 60)
+end
+
+-- The menu's first row: the light, the word for it, and the one detail that
+-- matters in that state. Nothing here repeats the URL — that has its own row,
+-- because a row you can read is a row you can copy from.
+function M.statusLine(s, now)
+  local status = M.computeStatus(s)
+  local head = M.statusDot(s) .. "  " .. M.statusLabel(s)
+  if status == "ready" then
+    return string.format("%s · up %s · generation %d", head,
+                         M.humanDuration(M.uptime(s, now)), s.generation or 0)
+  end
+  if status == "error" then
+    return head .. " · " .. (s.err or "something went wrong")
+  end
+  if status == "starting" then
+    return head .. " · " .. (s.err or "waiting for a URL")
+  end
+  if s.url and s.url ~= "" then
+    return head .. " · the lease supplies " .. s.url
+  end
+  return head .. " · nothing has leased a tunnel"
+end
+
+-- The URL row. There is one even when there is no URL, so "Copy URL" keeps its
+-- place in the menu instead of sliding under the pointer as a tunnel comes up.
+M.NO_URL = "No URL yet"
+
+function M.urlLine(s)
+  local url = s and s.url
+  if url and url ~= "" then return url end
+  return M.NO_URL
+end
+
+-- Everything the tile shows that can change on its own, as one string.
+-- apps/cloudflare_tunnel redraws after every decision, and most of those
+-- redraws draw what was already there; this is how it tells the one that is a
+-- real change — a new child, a URL, an error — from the twenty that are not.
+-- Uptime is deliberately absent: it moves every second and changes nothing.
+function M.tileKey(s)
+  s = s or {}
+  return table.concat({ M.computeStatus(s), s.url or "-",
+                        tostring(s.generation or 0), s.err or "-" }, "|")
 end
 
 -- First line only: lib/menuhub takes it as the tile's status and strips the
@@ -599,6 +652,11 @@ function M.tooltip(s, now)
   end
   if status == "starting" then
     return "Cloudflare tunnel: " .. (s.err or "starting a tunnel…")
+  end
+  -- An `off` lease means the owner brought its own public URL. Showing it beats
+  -- showing nothing: it is still the address traffic arrives on.
+  if s.url and s.url ~= "" then
+    return "Cloudflare tunnel: off; the lease supplies " .. s.url
   end
   return "Cloudflare tunnel: ready for leases"
 end

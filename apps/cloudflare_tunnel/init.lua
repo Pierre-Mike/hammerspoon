@@ -29,6 +29,13 @@
 -- The child stops 60s after the last lease goes, which is long enough that a
 -- caller restarting does not lose its URL.
 --
+-- WHAT THE TILE SHOWS. A status light: green while a tunnel is up and handing
+-- out a URL, amber while one is coming up, red when there is none — stopped and
+-- broken both. The menu under it carries the status in words, the public URL on
+-- a row you can read, a Copy URL beside it, who holds a lease and for how much
+-- longer, and the two buttons for a tunnel that went wrong: Retry now and Open
+-- log. The tile is redrawn after every decision, so it never lags the tunnel.
+--
 -- All the logic worth asserting on lives in lib/cloudflare_tunnel, which has no
 -- hs.* in it. This file is the child process, the timer, the port and the tile.
 
@@ -67,6 +74,8 @@ local M = {
   menu       = nil,
   intake     = nil,
   timer      = nil,
+  tileKey    = nil,  -- what the tile last drew, so a real change is spottable
+  tileDraws  = 0,    -- how many times that has actually changed
 }
 
 -- Seams. A spec drives the clock and the filesystem rather than waiting on
@@ -113,9 +122,22 @@ function M.reqKey(req)
 end
 
 -- ── The tile ───────────────────────────────────────────────────────────────
+-- Everything that changes the tunnel ends here, so the glyph and the status
+-- line never lag it: a child starting, a URL arriving, a probe giving up, a
+-- fatal, a tunnel going away. The menu follows for free — it is a function, so
+-- it is rebuilt from the state it finds at the moment it opens.
+--
+-- Most calls redraw what was already on screen. The ones that do not are
+-- logged, because "when did it go red" is the first question asked about a
+-- tunnel that stopped working.
 function M.redraw()
   if not M.menu then return end
   local raw = M.raw()
+  local key = T.tileKey(raw)
+  if key ~= M.tileKey then
+    M.tileKey, M.tileDraws = key, M.tileDraws + 1
+    logf("[cloudflare] tile: %s", T.statusLine(raw, M.now()))
+  end
   M.menu:setTitle(T.title(raw))
   M.menu:setTooltip(T.tooltip(raw, M.now()))
 end
@@ -448,18 +470,35 @@ function M.retryNow()
 end
 
 -- ── Menu ───────────────────────────────────────────────────────────────────
-local function buildMenu()
-  local now = M.now()
+-- The clipboard, from the menu. Answers the URL it copied, so the console — and
+-- a spec — can tell "copied" from "there was nothing to copy".
+function M.copyUrl()
+  local url = M.state().url
+  if not url then return nil end
+  if hs.pasteboard and hs.pasteboard.setContents then
+    hs.pasteboard.setContents(url)
+  end
+  logf("[cloudflare] copied %s to the clipboard", url)
+  return url
+end
+
+-- Rebuilt every time it opens, so it shows the tunnel as it is now rather than
+-- as it was when the tile was last drawn.
+function M.buildMenu()
+  local now  = M.now()
+  local raw  = M.raw()
   local snap = M.state()
   local items = {
-    { title = T.tooltip(M.raw(), now):gsub("\n", " · "), disabled = true },
+    { title = T.statusLine(raw, now), disabled = true },
+    { title = "-" },
+    -- The URL gets a row of its own, readable without hovering the tile for a
+    -- tooltip, and a Copy action next to it that does not move: both rows are
+    -- always there, greyed when there is nothing behind them.
+    { title = T.urlLine(snap), disabled = true },
+    { title = "Copy URL", disabled = snap.url == nil,
+      fn = function() M.copyUrl() end },
     { title = "-" },
   }
-
-  if snap.url then
-    items[#items + 1] = { title = "Copy " .. snap.url,
-                          fn = function() hs.pasteboard.setContents(snap.url) end }
-  end
 
   local leases = snap.leases or {}
   if #leases == 0 then
@@ -485,7 +524,7 @@ end
 
 -- ── init ───────────────────────────────────────────────────────────────────
 M.menu = ctx:tile("Cloudflare tunnel")
-if M.menu then M.menu:setMenu(buildMenu) end
+if M.menu then M.menu:setMenu(M.buildMenu) end
 M.redraw()
 
 -- Nothing starts on a config reload: a tunnel exists because something leased

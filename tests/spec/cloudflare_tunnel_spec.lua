@@ -330,14 +330,101 @@ describe("cloudflare_tunnel.route", function()
   end)
 end)
 
-describe("cloudflare_tunnel tile text", function()
-  it("stays monochrome until there is a URL and goes coloured when there is", function()
-    assert.equals(T.GLYPH.off, T.title({}))
-    assert.equals(T.GLYPH.starting, T.title({ pending = true }))
-    assert.equals(T.GLYPH.ready, T.title({ url = "https://x", child = true }))
-    assert.equals(T.GLYPH.error, T.title({ fatal = true }))
+describe("cloudflare_tunnel status light", function()
+  it("is green only while a tunnel is actually up", function()
+    assert.equals(T.DOT.ready, T.title({ url = "https://x", child = true }))
+    assert.equals("Running", T.statusLabel({ url = "https://x", child = true }))
   end)
 
+  it("is red when nothing is serving, stopped and broken alike", function()
+    assert.equals(T.DOT.off, T.title({}))
+    assert.equals(T.DOT.error, T.title({ fatal = true }))
+    -- One colour for both, because the question the light answers is "is there
+    -- a tunnel right now", and the answer is no either way.
+    assert.equals(T.DOT.off, T.DOT.error)
+    assert.equals("Stopped", T.statusLabel({}))
+    assert.equals("Error", T.statusLabel({ fatal = true }))
+  end)
+
+  it("is amber in between: a child is up, no URL yet", function()
+    assert.equals(T.DOT.starting, T.title({ child = true }))
+    assert.equals(T.DOT.starting, T.title({ pending = true }))
+    assert.is_true(T.DOT.starting ~= T.DOT.ready)
+    assert.is_true(T.DOT.starting ~= T.DOT.off)
+    assert.equals("Starting", T.statusLabel({ pending = true }))
+  end)
+
+  it("is red for a URL with nothing serving it", function()
+    -- A leftover string is not a tunnel, and a green light over one would send
+    -- somebody to an address that answers nothing.
+    assert.equals(T.DOT.off, T.title({ url = "https://x" }))
+  end)
+end)
+
+describe("cloudflare_tunnel.statusLine", function()
+  it("says how long it has been up and which generation it is", function()
+    local line = T.statusLine({ url = "https://x", child = true, generation = 3,
+                                startedAt = 40 }, 100)
+    assert.truthy(line:find(T.DOT.ready, 1, true))
+    assert.truthy(line:find("Running", 1, true))
+    assert.truthy(line:find("1m 0s", 1, true))
+    assert.truthy(line:find("generation 3", 1, true))
+  end)
+
+  it("keeps the URL off it, because the URL has its own row to be copied from", function()
+    assert.is_nil(T.statusLine({ url = "https://x", child = true, generation = 1,
+                                 startedAt = 100 }, 100):find("https://", 1, true))
+  end)
+
+  it("says what broke instead", function()
+    local line = T.statusLine({ fatal = true, err = "no cert.pem" }, 100)
+    assert.truthy(line:find(T.DOT.error, 1, true))
+    assert.truthy(line:find("no cert.pem", 1, true))
+  end)
+
+  it("says why it is waiting while it waits", function()
+    assert.truthy(T.statusLine({ pending = true, err = "cloudflared exited (1)" }, 100)
+                   :find("exited", 1, true))
+    assert.truthy(T.statusLine({ child = true }, 100):find("waiting for a URL", 1, true))
+  end)
+
+  it("says nobody has asked for a tunnel when nobody has", function()
+    assert.truthy(T.statusLine({}, 100):find("nothing has leased", 1, true))
+  end)
+end)
+
+describe("cloudflare_tunnel.urlLine", function()
+  it("is the URL when there is one", function()
+    assert.equals("https://x.trycloudflare.com",
+                  T.urlLine({ url = "https://x.trycloudflare.com" }))
+  end)
+
+  it("still fills a row when there is none, so Copy URL does not move", function()
+    assert.equals(T.NO_URL, T.urlLine({}))
+    assert.equals(T.NO_URL, T.urlLine({ url = "" }))
+    assert.equals(T.NO_URL, T.urlLine(nil))
+  end)
+end)
+
+describe("cloudflare_tunnel.tileKey", function()
+  local ready = { url = "https://a", child = true, generation = 1, startedAt = 0 }
+
+  it("changes when a new tunnel hands out a new URL", function()
+    local next_ = { url = "https://b", child = true, generation = 2, startedAt = 0 }
+    assert.is_true(T.tileKey(ready) ~= T.tileKey(next_))
+  end)
+
+  it("changes when it breaks", function()
+    assert.is_true(T.tileKey(ready) ~= T.tileKey({ fatal = true, err = "no cert.pem" }))
+  end)
+
+  it("ignores the clock, so a tile is not redrawn once a second for nothing", function()
+    assert.equals(T.tileKey(ready), T.tileKey({ url = "https://a", child = true,
+                                                generation = 1, startedAt = 999 }))
+  end)
+end)
+
+describe("cloudflare_tunnel tooltip", function()
   it("leads the ready line with a word, because the hub upper-cases it", function()
     local line = T.tooltip({ url = "https://x", child = true, generation = 2,
                              startedAt = 0 }, 90):match("^[^\n]*")
@@ -346,6 +433,11 @@ describe("cloudflare_tunnel tile text", function()
 
   it("shows the reason when it is broken", function()
     assert.truthy(T.tooltip({ fatal = true, err = "no cert.pem" }):find("no cert.pem", 1, true))
+  end)
+
+  it("names the owner's own URL when the lease asked for off", function()
+    assert.truthy(T.tooltip({ mode = "off", url = "https://already.example.com" })
+                   :find("https://already.example.com", 1, true))
   end)
 
   it("rounds a duration to something a human reads", function()
@@ -360,8 +452,9 @@ end)
 -- ════════════════════════════════════════════════════════════════════════════
 
 describe("apps/cloudflare_tunnel", function()
-  local app, clock, tasks, afters, hub, probe, contexts
+  local app, clock, tasks, afters, hub, probe, contexts, copied
   local realMenuhub, realTaskNew, realDoAfter, realAsyncGet, realLogf, realNew
+  local realSetContents
 
   local function child() return tasks[#tasks] end
 
@@ -386,6 +479,14 @@ describe("apps/cloudflare_tunnel", function()
 
   local function tick() app.timer.fn() end
 
+  -- The menu as the hub asks for it: a function, called fresh on every open.
+  local function row(text)
+    for _, it in ipairs(hub.menu()) do
+      if type(it.title) == "string" and it.title:find(text, 1, true) then return it end
+    end
+    return nil
+  end
+
   setup(function()
     realMenuhub  = package.loaded["lib.menuhub"]
     realTaskNew  = hs.task.new
@@ -393,6 +494,7 @@ describe("apps/cloudflare_tunnel", function()
     realAsyncGet = hs.http.asyncGet
     realLogf     = utils.logf
     realNew      = context.new
+    realSetContents = hs.pasteboard.setContents
   end)
 
   teardown(function()
@@ -402,6 +504,7 @@ describe("apps/cloudflare_tunnel", function()
     hs.task.new, hs.timer.doAfter = realTaskNew, realDoAfter
     hs.http.asyncGet, utils.logf = realAsyncGet, realLogf
     context.new = realNew
+    hs.pasteboard.setContents = realSetContents
   end)
 
   before_each(function()
@@ -414,17 +517,26 @@ describe("apps/cloudflare_tunnel", function()
     end
     hub = { made = {}, deleted = {} }
     probe = { code = 200, body = "tok", urls = {} }
+    copied = nil
+    -- The stock mock takes the text as its *second* argument, which
+    -- keystroke_typer_spec relies on; the plugin calls the real one-argument
+    -- API, so this records that instead of changing the mock under another spec.
+    hs.pasteboard.setContents = function(text) copied = text end
 
     utils.logf = function() end   -- the plugin logs on every decision
 
+    -- A tile that remembers what it was last told to draw, so a test can read
+    -- the glyph, the status line and the menu the way a human would see them.
     package.loaded["lib.menuhub"] = {
       item = function(name)
         hub.made[#hub.made + 1] = name
-        return {
-          setTitle = function() end, setIcon = function() end,
-          setTooltip = function() end, setMenu = function(_, fn) hub.menu = fn end,
-          delete = function() hub.deleted[#hub.deleted + 1] = name end,
-        }
+        local tile = {}
+        function tile:setTitle(t)   hub.title = t;   return self end
+        function tile:setIcon()     return self end
+        function tile:setTooltip(t) hub.tooltip = t; return self end
+        function tile:setMenu(fn)   hub.menu = fn;   return self end
+        function tile:delete()      hub.deleted[#hub.deleted + 1] = name end
+        return tile
       end,
     }
 
@@ -794,6 +906,125 @@ describe("apps/cloudflare_tunnel", function()
   it("publishes the state to the shell", function()
     assert.is_function(_G.tunnelState)
     assert.equals("off", T.decode(_G.tunnelState()).status)
+  end)
+
+  -- ── The tile ─────────────────────────────────────────────────────────────
+  it("shows a red light and an empty URL row while nothing is leased", function()
+    assert.equals(T.DOT.off, hub.title)
+    assert.truthy(row("nothing has leased"))
+    assert.truthy(row(T.NO_URL))
+  end)
+
+  it("goes amber while the tunnel comes up and green once it is up", function()
+    lease({ owner = "voice", mode = "quick", port = 8088 })
+    assert.equals(T.DOT.starting, hub.title)
+
+    says("https://odd-sheep.trycloudflare.com")
+    assert.equals(T.DOT.ready, hub.title)
+    assert.truthy(hub.tooltip:find("odd-sheep.trycloudflare.com", 1, true))
+  end)
+
+  it("goes red the moment it breaks, and says why", function()
+    lease({ owner = "voice", mode = "quick", port = 8088 })
+    says("ERR cannot determine default origin certificate: no file cert.pem")
+
+    assert.equals(T.DOT.error, hub.title)
+    assert.truthy(row("cloudflared login"))
+  end)
+
+  it("goes back to red once the last lease is gone", function()
+    lease({ owner = "voice", mode = "quick", port = 8088, ttl_s = 10 })
+    says("https://odd-sheep.trycloudflare.com")
+    assert.equals(T.DOT.ready, hub.title)
+
+    clock = clock + 11
+    tick()                         -- the lease expires, the child waits out its grace
+    assert.equals(T.DOT.ready, hub.title)
+
+    clock = clock + T.GRACE_S + 1
+    tick()
+    assert.equals(T.DOT.off, hub.title)
+    assert.truthy(row(T.NO_URL))
+  end)
+
+  it("redraws on a new child, on the URL and on an error — and not on a quiet tick",
+     function()
+    local idle = app.tileDraws
+    lease({ owner = "voice", mode = "quick", port = 8088 })
+    local started = app.tileDraws
+    assert.is_true(started > idle)              -- a child is up
+
+    says("https://odd-sheep.trycloudflare.com")
+    local ready = app.tileDraws
+    assert.is_true(ready > started)             -- the URL arrived
+
+    clock = clock + T.WATCH_S
+    tick()
+    -- Nothing about the tunnel changed, so nothing about the tile did: the
+    -- watchdog runs every 30s and must not count as a change.
+    assert.equals(ready, app.tileDraws)
+
+    says("ERR no file cert.pem")
+    assert.is_true(app.tileDraws > ready)       -- it broke
+  end)
+
+  it("follows the URL across a restart onto the new one", function()
+    lease({ owner = "voice", mode = "quick", port = 8088 })
+    says("https://first.trycloudflare.com")
+    assert.truthy(row("https://first.trycloudflare.com"))
+
+    lease({ owner = "voice", mode = "quick", port = 9000 })   -- same owner, new target
+    assert.equals(T.DOT.starting, hub.title)
+    assert.truthy(row(T.NO_URL))
+
+    says("https://second.trycloudflare.com")
+    assert.equals(T.DOT.ready, hub.title)
+    assert.truthy(row("https://second.trycloudflare.com"))
+    assert.is_nil(row("https://first.trycloudflare.com"))
+  end)
+
+  -- ── The menu ─────────────────────────────────────────────────────────────
+  it("puts the URL on a row of its own and copies it on demand", function()
+    lease({ owner = "voice", mode = "quick", port = 8088 })
+    says("https://odd-sheep.trycloudflare.com")
+
+    assert.truthy(row("https://odd-sheep.trycloudflare.com"))
+    local copy = row("Copy URL")
+    assert.is_false(copy.disabled)
+    copy.fn()
+    assert.equals("https://odd-sheep.trycloudflare.com", copied)
+    assert.equals("https://odd-sheep.trycloudflare.com", app.copyUrl())
+  end)
+
+  it("greys Copy URL out when there is nothing to copy", function()
+    lease({ owner = "voice", mode = "quick", port = 8088 })
+
+    local copy = row("Copy URL")
+    assert.is_true(copy.disabled)
+    copy.fn()                      -- the hub still calls it; it must do nothing
+    assert.is_nil(copied)
+    assert.is_nil(app.copyUrl())
+  end)
+
+  it("shows the status, who holds a lease, and when the next attempt is", function()
+    lease({ owner = "voice", mode = "quick", port = 8088 })
+    says("https://odd-sheep.trycloudflare.com")
+    assert.truthy(row("Running"))
+    assert.truthy(row("voice — 2m 0s left"))
+
+    child().done(1)
+    assert.truthy(row("Next attempt in 30s"))
+    assert.truthy(row("Retry now"))
+  end)
+
+  it("shows the owner's own URL when the lease asked for off", function()
+    lease({ owner = "voice", mode = "off", public_url = "https://already.example.com" })
+
+    -- Nothing of ours is serving it, so the light stays red; the address is
+    -- still the one traffic arrives on, so it is still worth copying.
+    assert.equals(T.DOT.off, hub.title)
+    assert.truthy(row("https://already.example.com"))
+    assert.is_false(row("Copy URL").disabled)
   end)
 
   -- ── Switching it off ─────────────────────────────────────────────────────
