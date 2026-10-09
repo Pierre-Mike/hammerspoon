@@ -2,5 +2,6 @@ return {
   default = {
     ROOT = { "tests/spec" },
     pattern = "_spec",
+    helper = "tests/helper.lua",
   },
 }

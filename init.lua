@@ -19,6 +19,9 @@ plugins.loadAll({
   "dsh",
   "shokz_mute",
   "keystroke_typer",
+  -- Before voice_agent, which is the thing that leases a tunnel: the service
+  -- reads better above its caller in the hub.
+  "cloudflare_tunnel",
   -- Symlinked in by ~/Github/pipecat-voice-agent/hammerspoon/install.sh. On a
   -- fresh clone of this repo it is simply not there, and discovery skips it
   -- rather than this file having to ask.
