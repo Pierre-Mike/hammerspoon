@@ -180,3 +180,258 @@ describe("context atExit", function()
     assert.is_true(ran)
   end)
 end)
+
+describe("context event taps", function()
+  -- A tap that was built and never started is not watching anything, and a tap
+  -- still running after dispose is swallowing keys on behalf of a module that
+  -- is gone. Both are checked on the same handle.
+  local function tapStub()
+    local real = hs.eventtap.new
+    hs.eventtap.new = function(types, fn)
+      return { types = types, fn = fn, running = false,
+               start = function(s) s.running = true;  return s end,
+               stop  = function(s) s.running = false; return s end }
+    end
+    return function() hs.eventtap.new = real end
+  end
+
+  it("starts the tap and stops it on dispose", function()
+    local restore = tapStub()
+    local ctx = context.new("t")
+    local tap = ctx:eventtap(hs.eventtap.event.types.flagsChanged, function() end)
+    restore()
+
+    assert.is_true(tap.running)
+    assert.equals(1, ctx:count())
+    ctx:dispose()
+    assert.is_false(tap.running)
+  end)
+
+  it("stops one tap early without touching the other", function()
+    local restore = tapStub()
+    local ctx = context.new("t")
+    local flags = ctx:eventtap(1, function() end)
+    local _, releaseKeys = ctx:eventtap(2, function() end)
+    restore()
+
+    releaseKeys()
+    assert.equals(1, ctx:count())
+    assert.is_true(flags.running)
+  end)
+
+  it("takes a single event type or a list of them", function()
+    local ctx, seen = context.new("t"), {}
+    local real = hs.eventtap.new
+    hs.eventtap.new = function(types) seen[#seen + 1] = types; return real(types) end
+
+    ctx:eventtap(7, function() end)
+    ctx:eventtap({ 7, 8 }, function() end)
+
+    hs.eventtap.new = real
+    assert.same({ 7 }, seen[1])
+    assert.same({ 7, 8 }, seen[2])
+  end)
+end)
+
+describe("context servers", function()
+  it("binds the port, serves, and gives it back on dispose", function()
+    local ctx = context.new("t")
+    local srv = ctx:httpserver(8790, function() return "ok", 200, {} end)
+    assert.equals(8790, srv.port)
+    assert.is_true(srv.running)
+    assert.is_function(srv.callback)
+    ctx:dispose()
+    assert.is_false(srv.running)
+  end)
+end)
+
+describe("context watchers", function()
+  local realAudio, realCaffeinate
+
+  before_each(function()
+    realAudio, realCaffeinate = hs.audiodevice, hs.caffeinate
+  end)
+
+  after_each(function()
+    hs.audiodevice, hs.caffeinate = realAudio, realCaffeinate
+    local aw = require("lib.audiowatch")
+    aw.handlers, aw.order, aw.started = {}, {}, nil
+  end)
+
+  it("unsubscribes the shared audio handler on dispose", function()
+    local stopped = false
+    hs.audiodevice = { watcher = {
+      setCallback = function() end, start = function() end,
+      stop = function() stopped = true end,
+    } }
+    local aw = require("lib.audiowatch")
+    aw.handlers, aw.order, aw.started = {}, {}, nil
+
+    local ctx = context.new("Dictation")
+    ctx:watcher("audio", "dictation", function() end)
+    assert.is_function(aw.handlers["dictation"])
+
+    ctx:dispose()
+    assert.is_nil(aw.handlers["dictation"])
+    assert.same({}, aw.order)
+    -- Nothing left listening, so the system watcher is not kept awake either.
+    assert.is_true(stopped)
+  end)
+
+  it("registers the audio handler under the context's own name by default", function()
+    hs.audiodevice = { watcher = { setCallback = function() end, start = function() end } }
+    local aw = require("lib.audiowatch")
+    aw.handlers, aw.order, aw.started = {}, {}, nil
+
+    context.new("Dictation"):watcher("audio", function() end)
+    assert.is_function(aw.handlers["Dictation"])
+  end)
+
+  it("starts a machine-wide watcher and stops it on dispose", function()
+    local stopped, handler = false, nil
+    hs.caffeinate = { watcher = {
+      systemDidWake = 1,
+      new = function(fn)
+        handler = fn
+        return { start = function(s) return s end, stop = function() stopped = true end }
+      end,
+    } }
+
+    local ctx, woke = context.new("t"), false
+    ctx:watcher("caffeinate", function() woke = true end)
+    handler(1)
+    assert.is_true(woke)
+
+    ctx:dispose()
+    assert.is_true(stopped)
+  end)
+
+  it("hands back nothing when this Mac has no such watcher", function()
+    hs.caffeinate = nil
+    local ctx = context.new("t")
+    local w, release = ctx:watcher("caffeinate", function() end)
+    assert.is_nil(w)
+    assert.equals(0, ctx:count())
+    release()                       -- a plugin that releases anyway is fine
+  end)
+
+  it("watches one path and stops watching it on dispose", function()
+    local ctx = context.new("t")
+    local w = ctx:watcher("path", "/tmp/thing", function() end)
+    local stopped = false
+    w.stop = function() stopped = true end
+    assert.equals("/tmp/thing", w.path)
+    ctx:dispose()
+    assert.is_true(stopped)
+  end)
+
+  it("says so when the kind is a typo", function()
+    local ctx = context.new("t")
+    assert.has_error(function() ctx:watcher("caffinate", function() end) end,
+                     "context: no watcher of kind caffinate")
+  end)
+end)
+
+describe("context canvas", function()
+  it("deletes the overlay on dispose", function()
+    local ctx = context.new("t")
+    local c = ctx:canvas({ x = 0, y = 0, w = 10, h = 10 })
+    local gone = false
+    c.delete = function() gone = true end
+    ctx:dispose()
+    assert.is_true(gone)
+  end)
+
+  it("takes the previous one down when a name is reused", function()
+    local ctx = context.new("t")
+    local first = ctx:canvas("hud", { x = 0, y = 0, w = 10, h = 10 })
+    local gone = false
+    first.delete = function() gone = true end
+
+    local second = ctx:canvas("hud", { x = 0, y = 0, w = 20, h = 20 })
+    assert.is_true(gone)
+    assert.are_not.equal(first, second)
+    -- One overlay held, not two: this is what keeps a panel that is redrawn on
+    -- every spoken word from stacking a window per redraw.
+    assert.equals(1, ctx:count())
+  end)
+
+  it("forgets a named overlay that was released early", function()
+    local ctx = context.new("t")
+    local _, release = ctx:canvas("hud", { x = 0, y = 0, w = 10, h = 10 })
+    release()
+    assert.equals(0, ctx:count())
+    ctx:canvas("hud", { x = 0, y = 0, w = 10, h = 10 })
+    assert.equals(1, ctx:count())
+  end)
+end)
+
+describe("context sound", function()
+  it("stops a playing sound on dispose", function()
+    local ctx = context.new("t")
+    local snd = ctx:sound("/tmp/noise_brown.wav")
+    snd:play()
+    assert.is_true(snd.playing)
+    ctx:dispose()
+    assert.is_false(snd.playing)
+  end)
+
+  it("reads a bare name as one of macOS's own sounds", function()
+    local ctx, asked = context.new("t"), {}
+    local byName, byFile = hs.sound.getByName, hs.sound.getByFile
+    hs.sound.getByName = function(n) asked[#asked + 1] = "name:" .. n; return byName(n) end
+    hs.sound.getByFile = function(p) asked[#asked + 1] = "file:" .. p; return byFile(p) end
+
+    ctx:sound("Sosumi")
+    ctx:sound("/System/Library/Sounds/Sosumi.aiff")
+
+    hs.sound.getByName, hs.sound.getByFile = byName, byFile
+    assert.same({ "name:Sosumi", "file:/System/Library/Sounds/Sosumi.aiff" }, asked)
+  end)
+
+  it("hands back nothing for a sound that will not load", function()
+    local ctx = context.new("t")
+    local byName = hs.sound.getByName
+    hs.sound.getByName = function() return nil end
+
+    local snd, release = ctx:sound("NoSuchSound")
+    hs.sound.getByName = byName
+
+    assert.is_nil(snd)
+    assert.equals(0, ctx:count())
+    release()
+  end)
+end)
+
+describe("context globals", function()
+  it("publishes the name and takes it back on dispose", function()
+    local ctx = context.new("t")
+    _G.ctxSpecGlobal = nil
+    local fn = function() return 42 end
+    ctx:global("ctxSpecGlobal", fn)
+    assert.equals(42, _G.ctxSpecGlobal())
+    ctx:dispose()
+    assert.is_nil(_G.ctxSpecGlobal)
+  end)
+
+  it("puts the previous binding back", function()
+    local old = function() return "old" end
+    _G.ctxSpecGlobal = old
+    local ctx = context.new("t")
+    ctx:global("ctxSpecGlobal", function() return "new" end)
+    assert.equals("new", _G.ctxSpecGlobal())
+    ctx:dispose()
+    assert.equals(old, _G.ctxSpecGlobal)
+    _G.ctxSpecGlobal = nil
+  end)
+
+  it("leaves a name something else has claimed since", function()
+    local ctx = context.new("t")
+    ctx:global("ctxSpecGlobal", function() return "mine" end)
+    local theirs = function() return "theirs" end
+    _G.ctxSpecGlobal = theirs
+    ctx:dispose()
+    assert.equals(theirs, _G.ctxSpecGlobal)
+    _G.ctxSpecGlobal = nil
+  end)
+end)

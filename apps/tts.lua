@@ -20,10 +20,18 @@
 -- This module also owns the lifecycle of a *second* pocket-tts server, on 8793,
 -- running the French model for apps/voice_agent. Nothing spoken here goes to it:
 -- notifications are English and stay on 8791. See the bottom of the file.
+--
+-- Everything here belongs to this plugin's context: the intake on :8790, the
+-- speak() globals a shell calls, the hammerspoon:// handlers, the two voice
+-- servers and the tile. M.dispose() gives all of it back, which is the whole
+-- reason the port can be rebound: a plugin switched off and on again has to
+-- find :8790 free, and before this the old intake was still holding it.
 
 local core  = require("lib.tts_core")
 local utils = require("lib.utils")
 local cfg   = require("lib.config")
+
+local ctx = require("lib.context").new("Speech queue")
 
 local LOG = "/tmp/hs-tts.log"
 local function logf(fmt, ...) utils.logf(LOG, fmt, ...) end
@@ -58,13 +66,19 @@ function updateMenu()
   M.menu:setTitle(q > 0 and (icon .. tostring(q)) or icon)
 end
 
+-- The player is a child process, so a plugin disposed mid-sentence has to take
+-- it with it: afplay holds the output device and would finish the sentence on
+-- behalf of a queue that no longer exists.
 function play(path, myGen)
-  M.playTask = hs.task.new(cfg.AFPLAY, function(_code)
-    M.playTask = nil
+  local task, done
+  task, done = ctx:task(cfg.AFPLAY, function(_code)
+    done()
+    M.playTask, M.playRelease = nil, nil
     M.speaking = false
     if myGen == M.gen then drain() end
     updateMenu()
   end, { path })
+  M.playTask, M.playRelease = task, done
   M.playTask:start()
   updateMenu()
 end
@@ -116,7 +130,10 @@ end
 function M.stop()
   M.gen = M.gen + 1
   local dropped = core.clear(M.queue)
-  if M.playTask then M.playTask:terminate(); M.playTask = nil end
+  -- Through the release: it terminates afplay AND stops the context holding a
+  -- handle to a player that is already dead.
+  if M.playRelease then M.playRelease() end
+  M.playTask, M.playRelease = nil, nil
   M.speaking = false
   logf("[tts] stop (dropped %d)", dropped)
   updateMenu()
@@ -148,16 +165,20 @@ function M.speakSelection(sel)
 
   -- One tick of delay: we are normally called from inside a keyDown eventtap,
   -- and a synthetic ⌘C posted from within that callback can be swallowed.
-  -- Timers live on M: an unreferenced hs.timer can be collected mid-poll.
-  M.selStart = hs.timer.doAfter(poll, function()
+  -- Both timers go through the context, which also keeps them referenced: an
+  -- unreferenced hs.timer can be collected mid-poll.
+  M.selStart = ctx:after(poll, function()
     M.selStart = nil
     hs.eventtap.keyStroke({ "cmd" }, "c", 0)
     local waited = 0
-    M.selPoll = hs.timer.doEvery(poll, function()
+    -- Held as the context's release rather than the timer handle: calling it
+    -- stops the poll and hands the effect back in one go.
+    local stopPoll
+    local _, release = ctx:timer(poll, function()
       waited = waited + poll
       local landed = hs.pasteboard.changeCount() ~= before
       if not landed and waited < timeout then return end
-      M.selPoll:stop(); M.selPoll = nil
+      stopPoll(); M.selPollStop = nil
       M.selecting = false
 
       local text = core.selectionText(landed and hs.pasteboard.getContents() or nil, landed)
@@ -171,15 +192,17 @@ function M.speakSelection(sel)
       hs.alert.show("🔊 " .. utils.truncate(core.sanitize(text), 60))
       M.speak(text, sel or SEL.PROFILE)
     end)
+    stopPoll = release
+    M.selPollStop = release
   end)
 end
 
 -- ---- HTTP intake (the service other apps post to) -------------------------
--- Kept on M (not a bare local): an unreferenced hs.httpserver gets garbage-
--- collected after load and silently stops listening on the port.
-M.intake = hs.httpserver.new()
-M.intake:setPort(cfg.TTS_PORT)
-M.intake:setCallback(function(method, headers, path, body)
+-- Through the context, which holds the server as well as knowing how to stop
+-- it. Both matter: an unreferenced hs.httpserver gets garbage-collected after
+-- load and silently stops listening, and one that is never stopped keeps
+-- :8790 away from the next instance of this plugin.
+M.intake = ctx:httpserver(cfg.TTS_PORT, function(method, headers, path, body)
   -- hs.httpserver passes (method, path, headers, body) in some versions and
   -- (method, headers, path, body) in others; detect which arg is the path.
   if type(path) ~= "string" or path:sub(1, 1) ~= "/" then
@@ -217,29 +240,30 @@ M.intake:setCallback(function(method, headers, path, body)
   end
   return "ok\n", 200, {}
 end)
-M.intake:start()
 logf("[tts] intake listening on http://127.0.0.1:%s", tostring(cfg.TTS_PORT))
 
 -- ---- CLI + URL entry points ----------------------------------------------
 -- Global so `hs -c 'speak("hi there")'` works from any shell/app.
 -- Second arg picks a voice: profile key, raw voice name, or clone path.
 --   hs -c 'speak("build passed", "code")'   hs -c 'speak("hi", "marius")'
-_G.speak = function(text, sel) return M.speak(text, sel) end
-_G.speakStop = function() return M.stop() end
+-- Registered through the context, so switching the plugin off takes the names
+-- back instead of leaving `hs -c 'speak("hi")'` answering into a dead queue.
+ctx:global("speak", function(text, sel) return M.speak(text, sel) end)
+ctx:global("speakStop", function() return M.stop() end)
 -- Same thing Fn+S does, without the chord — handy for testing from a shell.
-_G.speakSelection = function(sel) return M.speakSelection(sel) end
+ctx:global("speakSelection", function(sel) return M.speakSelection(sel) end)
 
 -- open 'hammerspoon://speak?text=hi%20there&profile=alerts'  (or &voice=marius)
-hs.urlevent.bind("speak", function(_evt, params)
+ctx:url("speak", function(_evt, params)
   M.speak(params.text or "", params.profile or params.voice)
 end)
-hs.urlevent.bind("speakStop", function() M.stop() end)
-hs.urlevent.bind("speakSelection", function(_evt, params)
+ctx:url("speakStop", function() M.stop() end)
+ctx:url("speakSelection", function(_evt, params)
   M.speakSelection((params or {}).profile or (params or {}).voice)
 end)
 
 -- ---- menu bar -------------------------------------------------------------
-M.menu = require("lib.menuhub").item("Speech queue")
+M.menu = ctx:tile("Speech queue")
 if M.menu then
   M.menu:setMenu(function()
     -- Submenu: pick the default voice by profile (sorted, tick the current one).
@@ -305,8 +329,12 @@ local INSTANCES = {
   },
 }
 
--- Held on M: an unreferenced hs.task can be collected before its callback runs.
+-- Held on M as well as by the context: an unreferenced hs.task can be collected
+-- before its callback runs.
 M.killTasks = {}
+-- ctx releases, by instance key, so a restart stops holding the server it just
+-- replaced and a dispose terminates the one that is actually running.
+M.serverReleases = {}
 
 local function launchServer(inst)
   local voice = inst.voice()
@@ -318,12 +346,14 @@ local function launchServer(inst)
     inst.out, cfg.POCKET_TTS_PY, cfg.POCKET_TTS_SERVER, inst.log)
   -- Only clear the handle if it is still ours: a restart terminates the old
   -- server, whose callback lands after the new one is stored here.
-  local task
-  task = hs.task.new("/bin/sh", function(code, _out, err)
+  local task, done
+  task, done = ctx:task("/bin/sh", function(code, _out, err)
     logf("[tts] %s server exited code=%s err=%s", inst.name, tostring(code), tostring(err))
-    if M[inst.key] == task then M[inst.key] = nil end
+    done()
+    if M[inst.key] == task then M[inst.key] = nil; M.serverReleases[inst.key] = nil end
   end, { "-c", cmd })
   M[inst.key] = task
+  M.serverReleases[inst.key] = done
   M[inst.key]:setEnvironment({
     HOME = os.getenv("HOME"),
     PATH = "/opt/homebrew/bin:/usr/bin:/bin",
@@ -347,12 +377,15 @@ end
 local function restartOne(inst)
   local pending = M.killTasks[inst.key]
   if pending and pending:isRunning() then return end   -- a restart is already underway
-  if M[inst.key] then M[inst.key]:terminate(); M[inst.key] = nil end
+  if M.serverReleases[inst.key] then M.serverReleases[inst.key]() end
+  M[inst.key], M.serverReleases[inst.key] = nil, nil
   local killCmd = string.format(
     "lsof -tiTCP:%d -sTCP:LISTEN | grep -vx %d | xargs kill -9 2>/dev/null; true",
     inst.port, hs.processInfo.processID)
-  M.killTasks[inst.key] = hs.task.new("/bin/sh", function() launchServer(inst) end,
+  local kill, done
+  kill, done = ctx:task("/bin/sh", function() done(); launchServer(inst) end,
     { "-c", killCmd })
+  M.killTasks[inst.key] = kill
   M.killTasks[inst.key]:start()
 end
 
@@ -361,5 +394,15 @@ function M.restartServer()
 end
 
 M.restartServer()
+
+-- Switch the plugin off: the queue is dropped, afplay and both voice servers
+-- are terminated, :8790 is given back, and speak() stops being a global. The
+-- tile goes with the context.
+function M.dispose()
+  M.stop()
+  ctx:dispose()
+  M.intake, M.server, M.frServer = nil, nil, nil
+  M.serverReleases, M.killTasks = {}, {}
+end
 
 return M

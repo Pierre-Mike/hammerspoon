@@ -10,11 +10,13 @@
 _G.hs = require("hs")
 
 local menuFn
+local tileDeleted = 0
 package.loaded["lib.menuhub"] = {
   item = function(_)
     return {
       setTitle = function() end, setIcon = function() end, setTooltip = function() end,
       setMenu = function(_, fn) menuFn = fn end,
+      delete = function() tileDeleted = tileDeleted + 1 end,
     }
   end,
 }
@@ -113,9 +115,9 @@ end
 
 local tasks
 hs.task.new = function(path, cb, args)
-  local t = { path = path, cb = cb, args = args or {} }
-  t.start = function(self) return self end
-  t.terminate = function() end
+  local t = { path = path, cb = cb, args = args or {}, terminated = false }
+  t.start = function(self) self.started = true; return self end
+  t.terminate = function(self) self.terminated = true; return self end
   t.setEnvironment = function(self, env) self.env = env end
   tasks[#tasks + 1] = t
   return t
@@ -376,5 +378,71 @@ describe("event tap watchdog", function()
     mods = { fn = true }
     d.tapTimer.fn()
     assert.is_true(d.recording)
+  end)
+end)
+
+-- ── Switching the plugin off ────────────────────────────────────────────────
+-- The two that make dictation the worst plugin in apps/ to leave half-running:
+-- the Fn tap sees every key on the machine, and the warm server holds :8765
+-- plus a multi-gigabyte model. Everything else it registers is checked here
+-- alongside them, because the Plugins tile reads dispose() as "it is gone".
+describe("dispose", function()
+  it("releases the taps, the server, the overlays and the tile", function()
+    load()
+    local before = tileDeleted
+    local server = tasks[#tasks]
+    local preview, hide, frame = _G.dictatePreview, _G.dictateHide, _G.dictateFrame
+    assert.is_true(taps[1].enabled)
+    assert.is_true(taps[2].enabled)
+    assert.is_function(preview)
+    assert.is_function(require("lib.audiowatch").handlers["dictation"])
+
+    d.dispose()
+
+    -- The tap: an abandoned one swallows Fn for every app until a reload.
+    assert.is_false(taps[1].enabled)
+    assert.is_false(taps[2].enabled)
+    -- The warm server: its port and its model have to come back, or the plugin
+    -- cannot be switched on again.
+    assert.is_true(server.terminated)
+    assert.equals(before + 1, tileDeleted)
+    -- Gone, not necessarily nil: the context puts back whatever held the name
+    -- before, which in this spec is an earlier load of this same module. What
+    -- matters is that `hs -c 'dictatePreview(…)'` no longer reaches this one.
+    assert.are_not.equal(preview, _G.dictatePreview)
+    assert.are_not.equal(hide, _G.dictateHide)
+    assert.are_not.equal(frame, _G.dictateFrame)
+    -- The mic watcher is one slot in a shared registry, so leaving it behind
+    -- would keep telling a disposed plugin about every device change.
+    assert.is_nil(require("lib.audiowatch").handlers["dictation"])
+  end)
+
+  it("ends a take that is still running", function()
+    load()
+    d.toggle()
+    assert.is_true(d.recording)
+    local ffmpeg
+    for _, t in ipairs(tasks) do if t.path:find("ffmpeg", 1, true) then ffmpeg = t end end
+
+    d.dispose()
+
+    -- The mic is the thing the user would notice: a capture left running keeps
+    -- the orange indicator on with nothing recording.
+    assert.is_false(d.recording)
+    assert.is_true(ffmpeg.terminated)
+    assert.equals("idle", d.micState)
+  end)
+
+  it("stops the tap watchdog, which would otherwise re-arm the taps", function()
+    load()
+    local stopped = false
+    d.tapTimer.stop = function() stopped = true end
+
+    d.dispose()
+
+    -- This is how a disposed plugin comes back to life: the tap watchdog ticks
+    -- two seconds later, finds its tap off, and starts it again. Which is the
+    -- right thing to do while the plugin is running and exactly wrong after.
+    assert.is_true(stopped)
   end)
 end)

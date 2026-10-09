@@ -35,6 +35,7 @@ function M.new(name)
     _effects  = {},     -- id -> teardown fn, id ascending in build order
     _seq      = 0,
     _disposed = false,
+    _canvas   = {},     -- name -> release, for the overlays that are singletons
   }, Context)
 end
 
@@ -126,6 +127,163 @@ end
 function Context:url(name, fn)
   hs.urlevent.bind(name, fn)
   return name, self:effect(function() hs.urlevent.bind(name, function() end) end)
+end
+
+-- A plugin's shell surface is a global function: `hs -c 'speak("hi")'` runs in
+-- this Lua state, so apps/tts publishes speak() the only way a shell can reach
+-- it. A global left pointing into a disposed plugin is a command that still
+-- answers and no longer works.
+--
+-- Teardown puts the previous value back rather than clearing the name, so a
+-- partial reload that registers over itself leaves the name where it was. It
+-- only does so if the name is still ours: something that claimed it in the
+-- meantime keeps it, because overwriting a live binding to "clean up" is the
+-- same bug one step along.
+function Context:global(name, fn)
+  local prior = _G[name]
+  _G[name] = fn
+  return name, self:effect(function()
+    if _G[name] == fn then _G[name] = prior end
+  end)
+end
+
+-- ── Event taps ─────────────────────────────────────────────────────────────
+-- The most dangerous thing a plugin can leave behind. A tap sits in front of
+-- every keystroke on the machine, and one belonging to a module that is gone
+-- still swallows the keys it claimed — apps/dictation's tap eats Fn, so an
+-- abandoned one means Fn does nothing, for anyone, until a reload.
+--
+-- Started here, because a tap that is not running is not a tap and every caller
+-- started it on the next line anyway. `types` takes one
+-- hs.eventtap.event.types value or a list of them: the constructor wants a
+-- list, a single type is what most callers have.
+function Context:eventtap(types, fn)
+  local tap = hs.eventtap.new(type(types) == "table" and types or { types }, fn)
+  tap:start()
+  return tap, self:effect(function() tap:stop() end)
+end
+
+-- ── Servers ────────────────────────────────────────────────────────────────
+-- An abandoned listener is worse than a leak, because a port is exclusive: the
+-- plugin cannot be switched off and on again, since its own replacement cannot
+-- bind the port the old one is still holding.
+--
+-- The context's teardown closure is also what keeps the server alive. An
+-- unreferenced hs.httpserver is collected soon after load and stops listening
+-- with no error anywhere, which is why apps/tts used to have to park its
+-- intake on a module field by hand.
+function Context:httpserver(port, fn)
+  local srv = hs.httpserver.new()
+  srv:setPort(port)
+  srv:setCallback(fn)
+  srv:start()
+  return srv, self:effect(function() srv:stop() end)
+end
+
+-- ── Watchers ───────────────────────────────────────────────────────────────
+-- One method for every hs.*.watcher, because they are all the same shape —
+-- new(fn), start(), stop() — and a plugin should not have to remember which
+-- namespace a given watcher hides in.
+--
+--   ctx:watcher("caffeinate", fn)            sleep, wake, unlock
+--   ctx:watcher("path", "/tmp/x", fn)        one file or directory
+--   ctx:watcher("audio", "dictation", fn)    audio devices, see below
+--
+-- `path` is whatever the kind needs to name itself and is left out by the ones
+-- that watch the whole machine; called without it, the handler lands there and
+-- is shifted across.
+local WATCHER_NS = {
+  caffeinate  = function() return hs.caffeinate  and hs.caffeinate.watcher  end,
+  usb         = function() return hs.usb         and hs.usb.watcher         end,
+  screen      = function() return hs.screen      and hs.screen.watcher      end,
+  application = function() return hs.application and hs.application.watcher end,
+  battery     = function() return hs.battery     and hs.battery.watcher     end,
+  wifi        = function() return hs.wifi        and hs.wifi.watcher        end,
+  spaces      = function() return hs.spaces      and hs.spaces.watcher      end,
+}
+
+function Context:watcher(kind, path, fn)
+  if fn == nil and type(path) == "function" then path, fn = nil, path end
+
+  -- hs.audiodevice.watcher holds one callback for the whole config, so this
+  -- one is a shared service rather than an object: lib/audiowatch owns the
+  -- system callback and fans it out by name. `path` is the name to register
+  -- under, and teardown takes that name back out — which is the part a plugin
+  -- could not do for itself before, because the registry had no way to forget.
+  if kind == "audio" or kind == "audiodevice" then
+    local name = path or self.name
+    local aw = require("lib.audiowatch")
+    aw.on(name, fn)
+    return name, self:effect(function() aw.off(name) end)
+  end
+
+  if kind == "path" then
+    if not hs.pathwatcher then return nil, function() end end
+    local w = hs.pathwatcher.new(path, fn)
+    w:start()
+    return w, self:effect(function() w:stop() end)
+  end
+
+  local lookup = WATCHER_NS[kind]
+  -- A kind that is not in the table is a typo, which is worth saying out loud:
+  -- returning nothing would read as "this Mac has no such watcher" and the
+  -- plugin would carry on quietly doing less than it was written to do.
+  if not lookup then error("context: no watcher of kind " .. tostring(kind), 2) end
+  local ns = lookup()
+  -- The namespace itself being absent is an environment fact, not a mistake:
+  -- an older Hammerspoon, or a spec running headless. The plugin asks for the
+  -- watcher it wants and carries on without one, instead of guarding the call.
+  if not ns then return nil, function() end end
+  local w = ns.new(fn)
+  w:start()
+  return w, self:effect(function() w:stop() end)
+end
+
+-- ── Overlays ───────────────────────────────────────────────────────────────
+-- A canvas is a window. One left behind floats over every space with nothing
+-- left that could delete it — apps/dictation's preview panel would sit in the
+-- middle of the screen for the rest of the session.
+--
+-- Named, because every canvas in this config is a singleton that gets rebuilt
+-- rather than added to: a HUD, a notification, a live preview. Asking for a
+-- name that is already drawn takes the old one down first, so the code that
+-- rebuilds one no longer has to remember to delete the last. `frame` is the
+-- rect hs.canvas.new wants; pass it alone for a canvas that needs no name.
+function Context:canvas(name, frame)
+  if type(name) == "table" then name, frame = nil, name end
+  if name and self._canvas[name] then self._canvas[name]() end
+  local c = hs.canvas.new(frame)
+  local release = self:effect(function()
+    if name then self._canvas[name] = nil end
+    c:delete()
+  end)
+  if name then self._canvas[name] = release end
+  return c, release
+end
+
+-- ── Sound ──────────────────────────────────────────────────────────────────
+-- A sound that is playing when its plugin goes away keeps playing, and
+-- apps/brown_noise loops its WAV forever: "switched off" would mean "still
+-- making noise, with nothing left to stop it".
+--
+-- A name with no slash in it is one of macOS's own sounds, anything else is a
+-- file. Both shapes are already in use — dictation's earcons are system
+-- sounds, the noise machine's are WAVs beside this file — so the distinction
+-- is made here once instead of at every call site.
+--
+-- A sound that will not load comes back nil rather than raising. An earcon is
+-- decoration: a missing .aiff must never cost a dictation.
+function Context:sound(path)
+  local ok, snd
+  if type(path) == "string" and path:find("/", 1, true) then
+    ok, snd = pcall(hs.sound.getByFile, path)
+    -- Older builds name the same constructor soundFromFile.
+    if not ok or not snd then ok, snd = pcall(hs.sound.soundFromFile, path) end
+  else
+    ok, snd = pcall(hs.sound.getByName, path)
+  end
+  if not ok or not snd then return nil, function() end end
+  return snd, self:effect(function() snd:stop() end)
 end
 
 -- ── Quitting ───────────────────────────────────────────────────────────────

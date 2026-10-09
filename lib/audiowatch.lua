@@ -36,4 +36,25 @@ function M.on(name, fn)
   end
 end
 
+-- Forget `name`. What makes a plugin switchable: a registry with no way out
+-- means a disposed plugin keeps being told about every device change, and keeps
+-- answering as if it were still running.
+--
+-- The system watcher stops once nothing is listening, so a config with every
+-- audio-aware plugin switched off is not still being woken. A later on() starts
+-- it again.
+function M.off(name)
+  if not M.handlers[name] then return end
+  M.handlers[name] = nil
+  for i, n in ipairs(M.order) do
+    if n == name then table.remove(M.order, i); break end
+  end
+  if M.started and next(M.handlers) == nil then
+    M.started = nil
+    -- pcall'd: the handler list is already empty either way, so a build (or a
+    -- test stub) without stop must not turn an unsubscribe into an error.
+    pcall(function() hs.audiodevice.watcher.stop() end)
+  end
+end
+
 return M

@@ -11,8 +11,15 @@
 -- unloaded first, then the new one loads. An embedding model keeps serving
 -- while the chat model changes, since the two don't compete for the same slot.
 
+-- Every timer, lms call and the tile itself belong to this plugin's context, so
+-- M.dispose() stops the poll and takes the tile back. It leaves the LM Studio
+-- server and whatever model is loaded exactly where they are: their lifetime is
+-- the user's call, not Hammerspoon's, and this tile only ever observed them.
+
 local L     = require("lib.lmstudio")
 local utils = require("lib.utils")
+
+local ctx = require("lib.context").new("LM Studio")
 
 local M = {
   menu    = nil,
@@ -81,8 +88,15 @@ end
 
 -- Every lms call is async: a blocking one would freeze the menu, and a load can
 -- take minutes.
+--
+-- Through the context, so a plugin switched off mid-load does not leave an
+-- `lms load` running against a tile that is gone. The call releases its own
+-- handle as it finishes, so a session's worth of polls does not pile up
+-- teardowns for processes that already exited.
 local function lms(args, cb)
-  local t = hs.task.new(LMS, function(code, out, err)
+  local t, done
+  t, done = ctx:task(LMS, function(code, out, err)
+    done()
     if cb then cb(code == 0, out or "", err or "") end
   end, args)
   t:setEnvironment(ENV)
@@ -198,7 +212,7 @@ end
 -- once immediately and once more a moment later.
 local function settle()
   M.poll()
-  hs.timer.doAfter(1.5, M.poll)
+  ctx:after(1.5, M.poll)
 end
 
 -- ── Actions ────────────────────────────────────────────────────────────────
@@ -482,7 +496,7 @@ local function buildMenu()
 end
 
 -- ── init ───────────────────────────────────────────────────────────────────
-M.menu = require("lib.menuhub").item("LM Studio")
+M.menu = ctx:tile("LM Studio")
 M.ttl = hs.settings.get(TTL_KEY) or 0
 M.menu:setMenu(buildMenu)
 redraw()
@@ -491,6 +505,10 @@ redraw()
 -- switch is the one thing that turns anything on.
 refreshCatalog()
 pollLive()
-M.timer = hs.timer.doEvery(POLL_SECS, function() M.poll() end)
+M.timer = ctx:timer(POLL_SECS, function() M.poll() end)
+
+-- Switch the plugin off: tile, poll and any lms call still in flight, in one
+-- call. Nothing is unloaded — see the note at the top of the file.
+function M.dispose() ctx:dispose() end
 
 return M

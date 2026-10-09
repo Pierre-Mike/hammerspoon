@@ -27,6 +27,7 @@ apps/noseguard/overlay/overlay
 /apps/voice_agent
 /lib/voice_toggle.lua
 /tests/spec/voice_toggle_spec.lua
+/tests/spec/voice_agent_spec.lua
 
 # Agent scratch: nested git worktrees, and a symlink into the ignored .claude/
 /.worktrees/

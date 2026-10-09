@@ -19,6 +19,8 @@ hs.timer = {
     return t
   end,
   new = function(_, fn) return { start = function() end, stop = function() end, fn = fn } end,
+  -- Same handle shape as doEvery: a spec fires the daily job by calling .fn.
+  doAt = function(_, _, fn) return { start = fn, stop = function() end, fn = fn } end,
 }
 
 hs.hotkey = {
@@ -181,6 +183,43 @@ hs.http = {
   asyncGet  = function(_, _, cb)   if cb then cb(200, "", {}) end end,
 }
 
+-- An intake a spec can post to: hs.httpserver._servers collects every one
+-- built, so a test calls .callback(method, headers, path, body) to stand in for
+-- a request and reads .running to see whether the port was given back.
+hs.httpserver = {
+  _servers = {},
+  new = function()
+    local s = { running = false, port = nil, callback = nil }
+    s.setPort     = function(self, p)  self.port = p;      return self end
+    s.setCallback = function(self, fn) self.callback = fn; return self end
+    s.start       = function(self) self.running = true;  return self end
+    s.stop        = function(self) self.running = false; return self end
+    hs.httpserver._servers[#hs.httpserver._servers + 1] = s
+    return s
+  end,
+}
+
+hs.pathwatcher = {
+  new = function(path, fn)
+    return { start = function(s) return s end, stop = function(s) return s end,
+             path = path, fn = fn }
+  end,
+}
+
+-- A socket that records what was sent and never connects on its own: a spec
+-- opens it by calling .fn("open"), the way the real one calls back.
+hs.websocket = {
+  _sockets = {},
+  new = function(url, fn)
+    local s = { url = url, fn = fn, sent = {}, state = "connecting" }
+    s.send   = function(self, msg) self.sent[#self.sent + 1] = msg; return self end
+    s.close  = function(self) self.state = "closed"; return self end
+    s.status = function(self) return self.state end
+    hs.websocket._sockets[#hs.websocket._sockets + 1] = s
+    return s
+  end,
+}
+
 hs.alert = { show = function(_, _) end }
 
 hs.styledtext = {
@@ -197,20 +236,22 @@ hs.urlevent = {
 }
 
 -- hs.sound stub. Tests that care about earcon playback substitute their own
--- getByName / soundFromFile so they can capture the call and assert on it.
+-- getByName / getByFile so they can capture the call and assert on it.
+-- stop() is here because lib/context stops a sound on teardown: a looping WAV
+-- that outlives its plugin is the thing that wrapper exists to prevent.
+local function fakeSound()
+  local s = { playing = false }
+  s.volume    = function(self, _) return self end
+  s.play      = function(self) self.playing = true;  return self end
+  s.stop      = function(self) self.playing = false; return self end
+  s.loopSound = function(self, _) return self end
+  return s
+end
+
 hs.sound = {
-  getByName = function(_)
-    local s = {}
-    s.volume = function(self, _) return self end
-    s.play   = function(self)    return self end
-    return s
-  end,
-  soundFromFile = function(_)
-    local s = {}
-    s.volume = function(self, _) return self end
-    s.play   = function(self)    return self end
-    return s
-  end,
+  getByName     = function(_) return fakeSound() end,
+  getByFile     = function(_) return fakeSound() end,
+  soundFromFile = function(_) return fakeSound() end,
 }
 
 -- Settings live in memory for the run. A spec that cares seeds hs.settings._v
@@ -243,6 +284,16 @@ hs.fs = {
 }
 
 hs.configdir = "/fake/.hammerspoon"
+
+-- A 32 GB Mac with about half of it in use, in hs.host.vmStat's own shape, so
+-- lib/lmstudio's memory join has something plausible to divide.
+hs.host = {
+  vmStat = function()
+    return { memSize = 34359738368, pageSize = 16384,
+             anonymousPages = 600000, pagesPurgeable = 20000,
+             pagesWiredDown = 200000, pagesUsedByVMCompressor = 100000 }
+  end,
+}
 
 hs.execute = function(_) return "", true, "exit", 0 end
 hs.json = { decode = function(s) return {} end, encode = function(_) return "{}" end }

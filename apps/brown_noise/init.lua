@@ -1,5 +1,12 @@
 -- Noise machine: play/stop, volume slider, and color picker, shown as the
 -- Noise tile in the menu-bar hub (lib/menuhub.lua). Default color is brown.
+--
+-- The tile and the sound belong to this plugin's context, so B.dispose() stops
+-- the noise and takes the tile back. That matters more here than almost
+-- anywhere else in apps/: the WAV loops forever, so a plugin switched off
+-- without releasing its sound would keep playing with nothing left to stop it.
+
+local ctx = require("lib.context").new("Noise")
 
 local HOME = os.getenv("HOME")
 local DIR  = HOME .. "/.hammerspoon/"
@@ -13,12 +20,13 @@ local COLORS = {
   { id = "violet", label = "Violet" },
 }
 
-local B = { playing = false, sound = nil, volume = 0.4, color = COLORS[1].id }
+local B = { playing = false, sound = nil, volume = 0.4, color = COLORS[1].id,
+            release = nil }   -- ctx handle on the sound: stops it and forgets it
 
 local ICON_OFF = "🟤"   -- stopped
 local ICON_ON  = "🔊"   -- playing
 
-B.menu = require("lib.menuhub").item("Noise")
+B.menu = ctx:tile("Noise")
 
 local function fileFor(id) return DIR .. "noise_" .. id .. ".wav" end
 
@@ -36,13 +44,21 @@ end
 -- Build (or rebuild) the sound for the current color.
 local function ensureSound()
   if not B.sound then
-    B.sound = hs.sound.getByFile(fileFor(B.color))
+    B.sound, B.release = ctx:sound(fileFor(B.color))
     if B.sound then
       B.sound:loopSound(true)
       B.sound:volume(B.volume)
     end
   end
   return B.sound
+end
+
+-- Let the current sound go. Through the context's release rather than
+-- sound:stop(), so the context stops holding a handle to a sound nobody will
+-- play again — a color picked five times should not leave five of them behind.
+local function dropSound()
+  if B.release then B.release() end
+  B.sound, B.release = nil, nil
 end
 
 local function play()
@@ -73,7 +89,7 @@ local function setColor(id)
   if id == B.color then return end
   B.color = id
   local wasPlaying = B.playing
-  if B.sound then B.sound:stop(); B.sound = nil end
+  dropSound()
   if wasPlaying then play() else setIcon() end
 end
 
@@ -108,5 +124,11 @@ B.play = play
 B.stop = stop
 B.setColor = setColor
 B.setVolume = setVolume
+
+-- Switch the plugin off: the noise stops and the tile goes, in one call.
+function B.dispose()
+  ctx:dispose()
+  B.sound, B.release, B.playing = nil, nil, false
+end
 
 return B

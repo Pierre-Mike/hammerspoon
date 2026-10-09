@@ -41,6 +41,14 @@ local teams   = require("lib.teams_api")
 local teamsAx = require("lib.teams_ax")
 local utils   = require("lib.utils")
 
+-- Everything this plugin builds belongs to its context: the `log stream` child,
+-- the websocket, every timer, the tile, and the quit hook that reaps the child.
+-- The quit hook is the one that used to be a problem — hs.shutdownCallback is a
+-- single global slot, and this file chained onto whatever apps/noseguard had
+-- put there, which only worked because it knew noseguard was first. Through the
+-- context, both register and neither has to know about the other.
+local ctx = require("lib.context").new("Shokz mute")
+
 local LOG = "/tmp/hs-shokz-mute.log"
 
 local TEAMS = {
@@ -69,10 +77,23 @@ local M = { enabled = true, mac = nil, showMenubar = true, backend = "auto" }
 
 local function logf(fmt, ...) utils.logf(LOG, fmt, ...) end
 
+-- Every timer in this file is a one-shot held only so it can be cancelled, and
+-- every cancel site reads `t:stop()`. So they are wrapped: stop() releases the
+-- context's handle as well as stopping the timer, which keeps a module that
+-- cancels its own timers from leaving the context holding dead ones. A timer
+-- that fires forgets itself, so a day of reconnect attempts does not pile up.
+local function after(delay, fn)
+  local _, release = ctx:after(delay, fn)
+  return { stop = function() release() end }
+end
+
 -- ── Runtime state ──────────────────────────────────────────────────────────
 local state        = teams.initialState()
 local headsetMuted = nil
 local sock, logTask, logRestart, bar
+-- ctx releases: one closes the socket, one terminates the `log stream` child,
+-- one takes the tile back.
+local sockRelease, logRelease, barRelease
 local retry, retryTimer, ackTimer = RETRY_MIN, nil, nil
 local reqId, buf = 0, ""
 -- Accessibility: the mic button found by the last walk, the window set it was
@@ -133,7 +154,7 @@ apply = function(ev)
     if ackTimer then ackTimer:stop() end
     -- Without this, one dropped acknowledgement would wedge the reducer in
     -- `pending` and every later press would be ignored.
-    ackTimer = hs.timer.doAfter(ACK_TIMEOUT, function()
+    ackTimer = after(ACK_TIMEOUT, function()
       ackTimer = nil
       logf("no acknowledgement in %.1fs, clearing pending", ACK_TIMEOUT)
       apply({ type = "ack", ok = false })
@@ -170,6 +191,7 @@ local function onWebsocket(event, message)
   elseif event == "closed" or event == "fail" then
     logf("websocket %s: %s", event, utils.truncate(tostring(message or ""), 120))
     sock = nil
+    if sockRelease then sockRelease(); sockRelease = nil end
     apply({ type = "closed" })
     scheduleReconnect()
   end
@@ -180,14 +202,23 @@ connect = function()
   local token = hs.settings.get(TOKEN_KEY)
   local url = teams.buildUrl(TEAMS, token)
   logf("connecting to Teams%s", token and " (with stored token)" or " (first pairing)")
-  sock = hs.websocket.new(url, onWebsocket)
+  local ws = hs.websocket.new(url, onWebsocket)
+  sock = ws
+  -- No ctx wrapper for websockets: this is the only one in the config, so the
+  -- escape hatch is cheaper than a constructor nothing else would call.
+  --
+  -- The teardown closes `ws`, not `sock`: by the time it runs the module's
+  -- variable may already have moved on to a reconnect, and closing whatever is
+  -- current instead of the socket this effect was made for would take down the
+  -- live connection.
+  sockRelease = ctx:effect(function() pcall(function() ws:close() end) end)
 end
 
 scheduleReconnect = function()
   if not M.enabled then return end
   if retryTimer then retryTimer:stop() end
   logf("retrying in %ds (is Teams > Settings > Privacy > Third-party app API on?)", retry)
-  retryTimer = hs.timer.doAfter(retry, function()
+  retryTimer = after(retry, function()
     retryTimer = nil
     connect()
   end)
@@ -325,9 +356,9 @@ local function withTeamsFront(app, gen, fn)
       logf("Teams did not come to the front, giving up on the click")
       return fn(nil)
     end
-    syncTimer = hs.timer.doAfter(AX_SETTLE, poll)
+    syncTimer = after(AX_SETTLE, poll)
   end
-  syncTimer = hs.timer.doAfter(AX_SETTLE, poll)
+  syncTimer = after(AX_SETTLE, poll)
 end
 
 -- Make Teams' mute match the headset. A newer press cancels an older sync.
@@ -370,7 +401,7 @@ local function syncTeams(desired)
     if step == "done" then
       finish(phase == "keystroke" and "confirmed" or "confirmed after click")
     elseif step == "wait" then
-      syncTimer = hs.timer.doAfter(AX_SETTLE, function() check(phase, attempt + 1) end)
+      syncTimer = after(AX_SETTLE, function() check(phase, attempt + 1) end)
     elseif step == "click" then
       logf("Cmd+Shift+M did not register, trying a click")
       withTeamsFront(app, gen, function(didActivate)
@@ -379,14 +410,14 @@ local function syncTeams(desired)
         -- catches up once Teams is in front. Clicking then would undo it.
         if readTeamsMute(app) == desired then return finish("confirmed") end
         clickButton()
-        syncTimer = hs.timer.doAfter(AX_SETTLE, function() check("click", 1) end)
+        syncTimer = after(AX_SETTLE, function() check("click", 1) end)
       end)
     else
       finish("failed")
     end
   end
 
-  syncTimer = hs.timer.doAfter(AX_SETTLE, function() check("keystroke", 1) end)
+  syncTimer = after(AX_SETTLE, function() check("keystroke", 1) end)
 end
 
 -- ── Headset ────────────────────────────────────────────────────────────────
@@ -435,15 +466,16 @@ startLogStream = function()
   -- and forgets the task at once, but its callback fires later, and a pause and
   -- resume in between would otherwise clear the NEW task and schedule a third.
   -- Two live streams would decode every press twice and toggle Teams twice.
-  local task
-  task = hs.task.new("/usr/bin/log", function(code)
+  local task, release
+  task, release = ctx:task("/usr/bin/log", function(code)
     if logTask ~= task then return end
-    logTask = nil
+    release()
+    logTask, logRelease = nil, nil
     if not M.enabled then return end
     logf("log stream exited (%s); restarting in 5s", tostring(code))
-    logRestart = hs.timer.doAfter(5, function() logRestart = nil; startLogStream() end)
+    logRestart = after(5, function() logRestart = nil; startLogStream() end)
   end, onStream, hfp.logArgs())
-  logTask = task
+  logTask, logRelease = task, release
   logTask:start()
   logf("watching bluetoothd for mic gain events")
 end
@@ -526,13 +558,16 @@ function M.stop(keepMenu)
   if ackTimer then ackTimer:stop(); ackTimer = nil end
   cancelSync()
   axBtn, axWinKey, teamsScreenMuted = nil, nil, nil
-  if sock then pcall(function() sock:close() end); sock = nil end
+  if sockRelease then sockRelease() end
+  sock, sockRelease = nil, nil
   if logRestart then logRestart:stop(); logRestart = nil end
-  if logTask then pcall(function() logTask:terminate() end); logTask = nil end
+  if logRelease then logRelease() end
+  logTask, logRelease = nil, nil
   if keepMenu then
     render()
-  elseif bar then
-    pcall(function() bar:delete() end); bar = nil
+  else
+    if barRelease then barRelease() end
+    bar, barRelease = nil, nil
   end
   logf("stopped")
 end
@@ -541,7 +576,7 @@ function M.start()
   M.enabled = true
   state = teams.initialState()
   if M.showMenubar and not bar then
-    bar = require("lib.menuhub").item("Shokz mute")
+    bar, barRelease = ctx:tile("Shokz mute")
     bar:setMenu(buildMenu)
   end
   render()
@@ -567,9 +602,11 @@ function M.status()
   }
 end
 
--- Guards a partial reload (re-requiring this file), where _G survives.
+-- Guards a partial reload (re-requiring this file), where _G survives. Through
+-- dispose() rather than stop(), so the old instance's context goes with it and
+-- the two do not both hold a tile.
 local PREV = _G.__shokz_mute
-if PREV and PREV.stop then pcall(PREV.stop) end
+if PREV and PREV.dispose then pcall(PREV.dispose) end
 _G.__shokz_mute = M
 
 -- Guards a full hs.reload(), where it does not. The Lua state is destroyed, so
@@ -578,12 +615,17 @@ _G.__shokz_mute = M
 -- later — one idle process per reload until then. Measured: a reload left a
 -- second `log stream` with PPID 1.
 --
--- apps/noseguard already owns hs.shutdownCallback, so chain rather than
--- assign, or its teardown is silently dropped.
-local priorShutdown = hs.shutdownCallback
-hs.shutdownCallback = function()
-  pcall(M.stop)
-  if priorShutdown then pcall(priorShutdown) end
+-- Through the context rather than hs.shutdownCallback: that is one global slot,
+-- and this file used to take it and chain onto whatever apps/noseguard had left
+-- there. Correct only for as long as noseguard happened to register first, and
+-- silently wrong for any third plugin that wanted one.
+ctx:atExit(function() M.stop() end)
+
+-- Switch the plugin off: the headset stops driving Teams, the `log stream`
+-- child and the socket go, and the tile goes with them.
+function M.dispose()
+  M.stop()
+  ctx:dispose()
 end
 
 M.start()

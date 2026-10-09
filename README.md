@@ -17,7 +17,7 @@ Apps load themselves: anything under `apps/` with an `init.lua`, and any single
 
 | App | What it does |
 |-----|--------------|
-| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with the speech model picked in the menu and paste at the cursor. One warm server (`parakeet_server.py`, port 8765) holds that model and nothing else; the voice agent transcribes through the same server. Parakeet models stream a live preview. `Fn+C` cancels & recalls the last result. `Fn+S` cancels and reads the current *selection* aloud through `apps/tts`. Menu-bar picker switches speech models. |
+| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with the speech model picked in the menu and paste at the cursor. One warm server (`parakeet_server.py`, port 8765) holds that model and nothing else; the voice agent transcribes through the same server. Parakeet models stream a live preview. `Fn+C` cancels & recalls the last result. `Fn+S` cancels and reads the current *selection* aloud through `apps/tts`. Menu-bar picker switches speech models. Other apps subscribe to the take with `onState(name, fn)`; the voice agent uses it to stop listening while the mic is ours. |
 | `apps/brown_noise` | Noise machine in the hub: a Play switch, volume slider, and color picker (white/pink/brown/blue/violet). |
 | `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
 | `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. `Fn+S` reads the current selection aloud. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
@@ -329,6 +329,14 @@ the only things that turn it on.
 make install-deps   # luarocks install busted
 make test           # busted specs under tests/, plus the noseguard geometry
 ```
+
+`tests/spec/dictation_state_spec.lua` guards the contract other apps hang off
+dictation: one `true` when a take starts and one `false` when it ends, whichever
+way it ends. The short-tap and cancel paths produce no transcript and are the
+ones most likely to forget the release, which would leave the voice agent deaf
+with nothing coming to free it. A listener that throws is wrapped, because
+dictation is what the user is actually doing and a subscriber is not allowed to
+cost them a sentence.
 
 `apps/noseguard/nose_geom.py` deliberately imports nothing from Vision or
 AVFoundation, so its tests need no venv and no camera:

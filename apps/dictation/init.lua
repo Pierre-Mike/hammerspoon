@@ -1,5 +1,15 @@
 -- Dictation: hold Fn = record, release = transcribe & paste at cursor.
 -- Pipeline: ffmpeg → warm STT server (the selected model) → pbpaste → ⌘V
+--
+-- Everything this plugin builds belongs to its context, and two of those things
+-- are why it matters here more than anywhere else in apps/. The Fn tap sits in
+-- front of every keystroke on the machine, so one left behind means Fn does
+-- nothing, for every app, until a reload. And the warm STT server holds :8765
+-- and a multi-gigabyte model, so a plugin that could not release it could not
+-- be switched off and on again — its own replacement would find the port taken.
+--
+-- M.dispose() gives back the tap, the server, the ffmpeg child, the overlays,
+-- the mic watcher and the Dictate tile, in one call.
 
 local earcon      = require("lib.earcon")
 local sttServer   = require("lib.stt_server")
@@ -10,6 +20,8 @@ local llm         = require("lib.llm_cleanup")
 local takes       = require("lib.dictation_takes")
 local tapGuard    = require("lib.tap_guard")
 local EARCONS_CFG = configFile.EARCONS
+
+local ctx = require("lib.context").new("Dictation")
 
 local DEFAULT_MIC = "MacBook Pro Microphone"  -- selected by NAME; avfoundation indices reshuffle when devices change
 local WAV  = "/tmp/hs-dictate.wav"
@@ -57,38 +69,81 @@ local function logf(fmt, ...)
   print(line)
 end
 
+-- ── State listeners ─────────────────────────────────────────────────────────
+-- Other apps need to know when the microphone is ours. The voice agent is the
+-- first: it shares this Mac's one mic and the same STT server on :8765, so
+-- while a take is in flight it must neither hear the dictation nor answer it.
+--
+-- Registered by name and fanned out in registration order, the way
+-- lib/audiowatch handles the one system audio callback. Each handler is wrapped
+-- so a listener that throws cannot break a take: dictation is the thing the
+-- user is actually doing, and a subscriber is not allowed to cost them a
+-- sentence.
+M.listeners, M.listenerOrder = {}, {}
+
+local function fire(name, active)
+  local ok, err = pcall(M.listeners[name], active)
+  if not ok then logf("[state] listener %s failed: %s", name, tostring(err)) end
+end
+
+-- Registering under a name that is already taken replaces that handler rather
+-- than stacking a second one, so a Hammerspoon reload cannot double up.
+--
+-- The immediate call is wrapped like every other one: apps/voice_agent
+-- subscribes at load time, and a POST that throws there would otherwise abort
+-- the require and take the rest of that app's wiring with it.
+function M.onState(name, fn)
+  if not M.listeners[name] then M.listenerOrder[#M.listenerOrder + 1] = name end
+  M.listeners[name] = fn
+  fire(name, M.recording)   -- a late subscriber starts in sync
+end
+
+-- Unsubscribe. apps/voice_agent calls this when its own context comes apart:
+-- a listener left registered would keep POSTing holds at a daemon that is no
+-- longer being supervised, and keep the agent deaf with nothing to release it.
+function M.offState(name)
+  if not M.listeners[name] then return end
+  M.listeners[name] = nil
+  for i, n in ipairs(M.listenerOrder) do
+    if n == name then table.remove(M.listenerOrder, i); break end
+  end
+end
+
+-- The one place M.recording is written. `active` is true from the first frame
+-- of capture until the transcript is pasted or the take is dropped, because
+-- that whole window is when the mic, the STT server and the cursor are ours —
+-- not just the capture. Writing the same value again fires nothing.
+local function setRecording(active)
+  if M.recording == active then return end
+  M.recording = active
+  for _, name in ipairs(M.listenerOrder) do fire(name, active) end
+end
+
 -- Earcon player: hs.sound is non-blocking, so calling this from startRecording
 -- does NOT delay ffmpeg spawn. Failures are swallowed on purpose — a missing
 -- .aiff must never break the dictation path. Sounds are cached after first load
 -- so subsequent triggers are effectively free.
+-- Each cached sound is one context effect, so disposing mid-cue stops it. A
+-- sound that will not load is cached as `false` so a missing .aiff is looked
+-- for once rather than on every take.
 local _earconCache = {}
-local function _loadSystemSound(name)
-  if _earconCache[name] ~= nil then return _earconCache[name] or nil end
-  local ok, snd = pcall(hs.sound.getByName, name)
-  if not ok or not snd then
-    -- Fall back to /System/Library/Sounds/<name>.aiff — hs.sound.getByName
-    -- occasionally misses freshly-registered sounds.
-    local path = "/System/Library/Sounds/" .. name .. ".aiff"
-    ok, snd = pcall(hs.sound.soundFromFile, path)
-    if not ok then snd = nil end
-  end
-  _earconCache[name] = snd or false
-  return snd or nil
-end
-local function _loadFileSound(path)
-  if _earconCache[path] ~= nil then return _earconCache[path] or nil end
-  local ok, snd = pcall(hs.sound.soundFromFile, path)
-  if not ok then snd = nil end
-  _earconCache[path] = snd or false
+local function _loadSound(key, fallback)
+  if _earconCache[key] ~= nil then return _earconCache[key] or nil end
+  local snd = ctx:sound(key)
+  -- /System/Library/Sounds/<name>.aiff: hs.sound.getByName occasionally misses
+  -- a freshly-registered system sound, and the file is there either way.
+  if not snd and fallback then snd = ctx:sound(fallback) end
+  _earconCache[key] = snd or false
   return snd or nil
 end
 local _earconPlayer = {
   system = function(name, volume)
-    local snd = _loadSystemSound(name); if not snd then return end
+    local snd = _loadSound(name, "/System/Library/Sounds/" .. name .. ".aiff")
+    if not snd then return end
     pcall(function() snd:volume(volume); snd:stop(); snd:play() end)
   end,
   file = function(path, volume)
-    local snd = _loadFileSound(path); if not snd then return end
+    local snd = _loadSound(path); if not snd then return end
     pcall(function() snd:volume(volume); snd:stop(); snd:play() end)
   end,
 }
@@ -98,7 +153,7 @@ local function playEarcon(kind)
   if not ok then logf("[earcon] play(%s) failed: %s", tostring(kind), tostring(err)) end
 end
 
-M.menu = require("lib.menuhub").item("Dictation")
+M.menu = ctx:tile("Dictation")
 -- Native template image (monochrome, auto-tints to the menubar colour).
 local ICON_MIC = hs.image.imageFromName("NSTouchBarAudioInputTemplate")
 local function setIcon(s)
@@ -282,12 +337,14 @@ M.menu:setTooltip("Dictate · " .. M.modelName .. " · " .. (M.modelSize or "?")
 
 -- Floating HUD at screen center
 local function showHUD(label, dotColor)
-  if M.hud then M.hud:delete(); M.hud = nil end
   local f = hs.screen.mainScreen():frame()
   local w, h = 260, 70
   local x = f.x + (f.w - w) / 2
   local y = f.y + (f.h - h) / 2
-  M.hud = hs.canvas.new({x = x, y = y, w = w, h = h}):behavior({"canJoinAllSpaces", "stationary"})
+  -- Named, so asking for it again takes the previous one down: three of these
+  -- are drawn per take and a stack of them would float over every space.
+  M.hud, M.hudRelease = ctx:canvas("hud", {x = x, y = y, w = w, h = h})
+  M.hud:behavior({"canJoinAllSpaces", "stationary"})
   M.hud:level(hs.canvas.windowLevels.overlay)
   M.hud:appendElements(
     { type = "rectangle", action = "fill",
@@ -305,19 +362,22 @@ local function showHUD(label, dotColor)
 end
 
 local function hideHUD()
-  if M.hud then M.hud:delete(); M.hud = nil end
+  if M.hudRelease then M.hudRelease() end
+  M.hud, M.hudRelease = nil, nil
 end
 
 -- Single centered notification that always replaces the previous one.
 -- Avoids hs.alert.show's bottom-stacked behavior so the user sees one message at a time.
 local function notify(text, seconds)
-  if M.notify then M.notify:delete(); M.notify = nil end
-  if M.notifyTimer then M.notifyTimer:stop(); M.notifyTimer = nil end
+  if M.notifyTimer then M.notifyTimer(); M.notifyTimer = nil end
   local f = hs.screen.mainScreen():frame()
   local w, h = 420, 56
   local x = f.x + (f.w - w) / 2
   local y = f.y + (f.h - h) / 2
-  M.notify = hs.canvas.new({x = x, y = y, w = w, h = h}):behavior({"canJoinAllSpaces", "stationary"})
+  -- The name is what makes this replace rather than stack: one message on
+  -- screen at a time is the whole point of not using hs.alert here.
+  M.notify, M.notifyRelease = ctx:canvas("notify", {x = x, y = y, w = w, h = h})
+  M.notify:behavior({"canJoinAllSpaces", "stationary"})
   M.notify:level(hs.canvas.windowLevels.overlay)
   M.notify:appendElements(
     { type = "rectangle", action = "fill",
@@ -329,10 +389,13 @@ local function notify(text, seconds)
       frame = { x = 12, y = 16, w = w - 24, h = h - 24 } }
   )
   M.notify:show()
-  M.notifyTimer = hs.timer.doAfter(seconds or 1.6, function()
-    if M.notify then M.notify:delete(); M.notify = nil end
-    M.notifyTimer = nil
+  -- Held as the context's release, so the cancel above stops the timer and
+  -- hands the effect back in one call.
+  local _, stop = ctx:after(seconds or 1.6, function()
+    if M.notifyRelease then M.notifyRelease() end
+    M.notify, M.notifyRelease, M.notifyTimer = nil, nil, nil
   end)
+  M.notifyTimer = stop
 end
 
 local COLOR_REC  = { red = 1.0, green = 0.25, blue = 0.25, alpha = 1 }
@@ -391,8 +454,8 @@ local function showLivePreview(text)
   local y = f.y + f.h - h - 120                         -- bottom edge stays fixed
 
   if not M.preview then
-    M.preview = hs.canvas.new({ x = x, y = y, w = w, h = h })
-      :behavior({ "canJoinAllSpaces", "stationary" })
+    M.preview, M.previewRelease = ctx:canvas("preview", { x = x, y = y, w = w, h = h })
+    M.preview:behavior({ "canJoinAllSpaces", "stationary" })
     M.preview:level(hs.canvas.windowLevels.overlay)
   else
     M.preview:frame({ x = x, y = y, w = w, h = h })
@@ -414,18 +477,22 @@ local function showLivePreview(text)
 end
 
 local function hideLivePreview()
-  if M.previewTimer then M.previewTimer:stop(); M.previewTimer = nil end
-  if M.preview then M.preview:delete(); M.preview = nil end
+  if M.previewPoll then M.previewPoll() end
+  M.previewTimer, M.previewPoll = nil, nil
+  if M.previewRelease then M.previewRelease() end
+  M.preview, M.previewRelease = nil, nil
 end
 
 -- Debug handles so the preview can be driven from `hs -c` without a mic.
-_G.dictatePreview = showLivePreview
-_G.dictateHide = hideLivePreview
-_G.dictateFrame = function()
+-- Through the context, so switching the plugin off takes the names back
+-- instead of leaving three commands that answer and no longer work.
+ctx:global("dictatePreview", showLivePreview)
+ctx:global("dictateHide", hideLivePreview)
+ctx:global("dictateFrame", function()
   if not M.preview then return "nil" end
   local fr = M.preview:frame()
   return string.format("x=%d y=%d w=%d h=%d", fr.x, fr.y, fr.w, fr.h)
-end
+end)
 
 local function readFile(p)
   local f = io.open(p, "r"); if not f then return nil end
@@ -443,7 +510,11 @@ local function paste(text)
   if not text or text == "" then return end
   text = text:gsub("^%s+", ""):gsub("%s+$", "")
   if text == "" then return end
-  M.restoreTimer = clipboard.pasteAndRestore(text)
+  -- The restore timer goes through the context as well: a plugin disposed in
+  -- the half-second before it fires must not put a clipboard back afterwards.
+  M.restoreTimer = clipboard.pasteAndRestore(text, {
+    after = function(delay, fn) return ctx:after(delay, fn) end,
+  })
 end
 
 -- Duck system audio while the mic is open; unduckNoise puts it back. One duck,
@@ -485,16 +556,17 @@ local function polish(text, done)
   local function finish(result, why)
     if finished then return end
     finished = true
-    if M.polishTimer then M.polishTimer:stop(); M.polishTimer = nil end
+    if M.polishTimer then M.polishTimer(); M.polishTimer = nil end
     if why then logf("[llm] %s; pasting the raw transcript", why) end
     if not M.recording then hideHUD() end
     done(result or text)
   end
   showHUD("Cleaning up…", COLOR_PROC)
-  M.polishTimer = hs.timer.doAfter(llm.TIMEOUT, function()
+  local _, stopPolish = ctx:after(llm.TIMEOUT, function()
     M.polishTimer = nil
     finish(nil, "no reply in " .. llm.TIMEOUT .. "s")
   end)
+  M.polishTimer = stopPolish
   hs.http.asyncGet(llm.BASE .. "/api/v0/models", nil, function(status, body, _)
     if finished then return end
     local ok, decoded = pcall(hs.json.decode, body or "")
@@ -515,7 +587,7 @@ end
 
 -- Shared tail: reset UI, clean the transcript, then paste at the cursor.
 local function finishTranscript(out)
-  setIcon("○"); hideHUD(); hideLivePreview(); M.recording = false
+  setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false)
   unduckNoise()
   logf("[dictate] result: %s", tostring(out))
   if not out or out == "" then
@@ -543,8 +615,10 @@ end
 -- snapshot when the warm server misses (not up yet, mid-restart, error).
 local function transcribeCLI()
   os.remove(TXT); os.remove("/private/tmp/hs-dictate.txt")
-  local task = hs.task.new(PARAKEET,
+  local task, done
+  task, done = ctx:task(PARAKEET,
     function(exitCode, stdOut, stdErr)
+      done()
       logf("[dictate] parakeet(CLI) exit=%d", exitCode)
       if stdErr and stdErr ~= "" then logf("[dictate] stderr: %s", stdErr) end
       finishTranscript(readFile(TXT) or readFile("/private/tmp/hs-dictate.txt"))
@@ -613,13 +687,14 @@ end
 local MIC_POLL = 0.05
 
 local function stopReadyPoll()
-  if M.readyTimer then M.readyTimer:stop(); M.readyTimer = nil end
+  if M.readyRelease then M.readyRelease() end
+  M.readyTimer, M.readyRelease = nil, nil
 end
 
 local function startReadyPoll()
   stopReadyPoll()
   M.micState = "starting"
-  M.readyTimer = hs.timer.doEvery(MIC_POLL, function()
+  M.readyTimer, M.readyRelease = ctx:timer(MIC_POLL, function()
     if not M.recording then stopReadyPoll(); return end
     if fileSize(M.paths.RAW) > 0 then
       stopReadyPoll()
@@ -638,7 +713,7 @@ local function startRecording()
   -- is non-blocking, so this adds no measurable latency to mic capture.
   playEarcon("start")
   os.remove(M.paths.WAV); os.remove(M.paths.RAW)
-  M.recording = true
+  setRecording(true)
   M.batchFinish = false
   M.keepTake = false
   M.lastPartial = nil
@@ -651,7 +726,10 @@ local function startRecording()
   logf("[dictate] recording start (mic=%q, engine=%s)", M.micName, M.engine)
   -- Two outputs from one capture: WAV for batch transcription (server /transcribe),
   -- plus a headerless s16le PCM file the server tails live (parakeet models).
-  M.ffmpegTask = hs.task.new(FFMPEG, function(code, _, err)
+  local ffmpeg, stopFfmpeg
+  ffmpeg, stopFfmpeg = ctx:task(FFMPEG, function(code, _, err)
+    stopFfmpeg()
+    if M.ffmpegTask == ffmpeg then M.ffmpegTask, M.ffmpegRelease = nil, nil end
     logf("[dictate] ffmpeg exit=%d", code)
     if code ~= 0 and err and err ~= "" then logf("[dictate] ffmpeg stderr: %s", err) end
     -- The WAV is finalized now: keep a copy before anything reads or replaces it.
@@ -662,11 +740,12 @@ local function startRecording()
     {"-y", "-f", "avfoundation", "-i", ":" .. M.micName,
      "-ar", "16000", "-ac", "1", M.paths.WAV,
      "-ar", "16000", "-ac", "1", "-f", "s16le", "-flush_packets", "1", M.paths.RAW})
+  M.ffmpegTask, M.ffmpegRelease = ffmpeg, stopFfmpeg
   M.ffmpegTask:start()
   -- Watchdog: never hold the mic open forever if a release event is missed
   -- (e.g. a spurious headset PLAY press, or a swallowed Fn key-up).
-  if M.watchdog then M.watchdog:stop() end
-  M.watchdog = hs.timer.doAfter(MAX_RECORD, function()
+  if M.watchdog then M.watchdog() end
+  local _, stopWatchdog = ctx:after(MAX_RECORD, function()
     M.watchdog = nil
     if M.recording then
       logf("[dictate] watchdog fired after %ds — auto-stopping (missed release?)", MAX_RECORD)
@@ -674,13 +753,14 @@ local function startRecording()
       stopRecording()
     end
   end)
+  M.watchdog = stopWatchdog
   if M.stream then
     -- Begin streaming this recording into the warm model as it's captured.
     hs.http.asyncPost(STT_BASE .. "/start", M.paths.RAW, {}, function(status, _, _)
       if status ~= 200 then logf("[dictate] /start status=%s (will batch-fallback)", tostring(status)) end
     end)
     -- Poll the live hypothesis and show it growing in the preview panel.
-    M.previewTimer = hs.timer.new(0.2, function()
+    M.previewTimer, M.previewPoll = ctx:timer(0.2, function()
       hs.http.asyncGet(STT_BASE .. "/partial", nil, function(status, body, _)
         if M.recording and status == 200 and body and body ~= "" then
           M.lastPartial = body
@@ -688,7 +768,6 @@ local function startRecording()
         end
       end)
     end)
-    M.previewTimer:start()
   end
 end
 
@@ -700,7 +779,7 @@ function stopRecording()
   -- Fire the "captured" cue immediately on release, before terminating ffmpeg
   -- or dispatching transcription. Distinguishable from the start cue by ear.
   playEarcon("stop")
-  if M.watchdog then M.watchdog:stop(); M.watchdog = nil end
+  if M.watchdog then M.watchdog(); M.watchdog = nil end
   local dur = hs.timer.secondsSinceEpoch() - M.startedAt
   -- For batch engines, flag the finish BEFORE terminating ffmpeg so its exit
   -- callback (which fires once the WAV is finalized) runs transcribe().
@@ -708,17 +787,21 @@ function stopRecording()
   M.keepTake = (not M.cancelled) and (dur >= MIN_DURATION)
   stopReadyPoll()
   M.micState = "idle"
-  if M.ffmpegTask then M.ffmpegTask:terminate(); M.ffmpegTask = nil end
-  if M.previewTimer then M.previewTimer:stop(); M.previewTimer = nil end
+  -- Through the release: it terminates ffmpeg AND stops the context holding a
+  -- handle to a capture that is over.
+  if M.ffmpegRelease then M.ffmpegRelease() end
+  M.ffmpegTask, M.ffmpegRelease = nil, nil
+  if M.previewPoll then M.previewPoll() end
+  M.previewTimer, M.previewPoll = nil, nil
   if M.cancelled then
     logf("[dictate] cancelled by chord")
-    M.cancelled = false; setIcon("○"); hideHUD(); hideLivePreview(); M.recording = false; unduckNoise()
+    M.cancelled = false; setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false); unduckNoise()
     if M.stream then cancelStream() end
     return
   end
   if dur < MIN_DURATION then
     logf("[dictate] tap too short (%.2fs), ignored", dur)
-    setIcon("○"); hideHUD(); hideLivePreview(); M.recording = false; unduckNoise()
+    setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false); unduckNoise()
     if M.stream then cancelStream() end
     return
   end
@@ -754,16 +837,17 @@ local function launchServer()
     notify("STT server not started: " .. tostring(why), 2.8)
     return
   end
-  local task
-  task = hs.task.new(l.python,
+  local task, done
+  task, done = ctx:task(l.python,
     function(code, _, err)
       logf("[server] exited code=%d err=%s", code, tostring(err))
-      if M.serverTask == task then M.serverTask = nil end
+      done()
+      if M.serverTask == task then M.serverTask, M.serverRelease = nil, nil end
     end,
     l.args)
   task:setEnvironment(l.env)
   task:start()
-  M.serverTask = task
+  M.serverTask, M.serverRelease = task, done
   logf("[server] launching warm %s server (%s)", m.engine, m.name or m.id or "?")
 end
 
@@ -772,8 +856,12 @@ end
 -- is released before the next one loads: never two models resident at once.
 -- Also how startup gets rid of a server left over from before a reload.
 local function restartServer()
-  if M.serverTask then M.serverTask:terminate(); M.serverTask = nil end
-  local k = hs.task.new("/bin/sh", function() launchServer() end,
+  -- The release terminates the old server and stops the context holding it, so
+  -- a model switched five times does not leave five dead handles behind.
+  if M.serverRelease then M.serverRelease() end
+  M.serverTask, M.serverRelease = nil, nil
+  local k, done
+  k, done = ctx:task("/bin/sh", function() done(); launchServer() end,
     {"-c", sttServer.freePortCommand(STT_PORT)})
   k:start()
 end
@@ -784,7 +872,7 @@ restartServer()   -- after a reload: the saved selection, not a default parakeet
 -- ffmpeg is reparented to launchd and keeps holding the mic (avfoundation :1)
 -- open forever — the persistent orange mic indicator with nothing recording.
 -- The WAV path is a unique signature, so this only ever hits our own ffmpeg.
-local killStaleFfmpeg = hs.task.new("/bin/sh", nil,
+local killStaleFfmpeg = ctx:task("/bin/sh", nil,
   {"-c", "pkill -f 'ffmpeg .*hs-dictate[.]wav' 2>/dev/null; true"})
 killStaleFfmpeg:start()
 
@@ -939,8 +1027,10 @@ local function recallLast()
   notify("copied: " .. preview, 1.6)
 end
 
--- Watch Fn modifier flag transitions
-M.flagWatcher = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(e)
+-- Watch Fn modifier flag transitions. Through the context, because this tap
+-- sees every key on the machine: one left running after the plugin is gone
+-- swallows Fn for every app until a reload.
+M.flagWatcher = ctx:eventtap(hs.eventtap.event.types.flagsChanged, function(e)
   local flags = e:getFlags()
   local nowDown = flags.fn == true
   if nowDown ~= M.fnDown then
@@ -949,13 +1039,12 @@ M.flagWatcher = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function
   end
   return false
 end)
-M.flagWatcher:start()
 
 -- Chord detection while holding Fn:
 --   Fn+C  cancel current recording and recall last
 --   Fn+S  speak the current selection through the TTS queue (no dictation)
 
-M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
+M.keyWatcher = ctx:eventtap(hs.eventtap.event.types.keyDown, function(e)
   if not M.fnDown then return false end
   -- Bare Fn+<key> only. Without this guard the synthetic ⌘C that Fn+S fires to
   -- grab the selection comes straight back through this tap as Fn+C, cancelling
@@ -985,7 +1074,6 @@ M.keyWatcher = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
   end
   return false
 end)
-M.keyWatcher:start()
 
 -- Tap watchdog. macOS switches a global event tap off without notice — after
 -- sleep, when a callback runs slow under load, or while secure input is on —
@@ -1007,21 +1095,25 @@ local function rearmTaps(why)
 end
 M.rearmTaps = rearmTaps
 
-M.tapTimer = hs.timer.doEvery(TAP_CHECK, function() rearmTaps("check") end)
+M.tapTimer = ctx:timer(TAP_CHECK, function() rearmTaps("check") end)
 
-if hs.caffeinate and hs.caffeinate.watcher then
+-- The `if hs.caffeinate` guard that used to wrap this is gone: ctx:watcher
+-- hands back nothing on a machine (or in a spec) that has no such watcher, so
+-- the plugin asks for the one it wants and carries on either way. The event
+-- constants are read inside the handler, which only ever runs where there was
+-- a watcher to read them off.
+M.wakeWatcher = ctx:watcher("caffeinate", function(event)
   local W = hs.caffeinate.watcher
-  M.wakeWatcher = W.new(function(event)
-    if event == W.systemDidWake or event == W.screensDidUnlock then rearmTaps("wake") end
-  end)
-  M.wakeWatcher:start()
-end
+  if event == W.systemDidWake or event == W.screensDidUnlock then rearmTaps("wake") end
+end)
 
 -- Keep the mic list fresh even without opening the menu: a headset that
 -- (dis)connects after launch retriggers discovery, and if the *selected* mic
 -- disappears we say so instead of silently recording nothing.
--- Through lib/audiowatch: the system watcher has room for one callback only.
-require("lib.audiowatch").on("dictation", function()
+-- Through ctx:watcher("audio", …), which is lib/audiowatch: the system watcher
+-- has room for one callback only, so apps register by name and the registry
+-- fans it out. The name is what dispose gives back.
+ctx:watcher("audio", "dictation", function()
   MICS = discoverMics()
   local present = false
   for _, m in ipairs(MICS) do if m.name == M.micName then present = true; break end end
@@ -1040,5 +1132,18 @@ end
 
 notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+S speak selection", 2.0)
 logf("[dictate] init complete")
+
+-- Switch the plugin off: the Fn tap, the warm server and its model, any capture
+-- in flight, the overlays, the mic watcher, the debug globals and the tile.
+-- Hammerspoon's own volume is put back first, because a plugin disposed mid-take
+-- would otherwise leave the user's output ducked at 30 with nothing left that
+-- knows what it was.
+function M.dispose()
+  if M.recording then M.cancelled = true; stopRecording() end
+  unduckNoise()
+  ctx:dispose()
+  M.listeners, M.listenerOrder = {}, {}
+  _earconCache = {}
+end
 
 return M
