@@ -4,6 +4,7 @@
 #   POST /speak    body=<text>   [header X-Voice: alba]  -> streams the audio as it is made
 #   POST /speak    [header X-Format: path]               -> writes a WAV, returns its path
 #   GET  /health                                          -> "ok" once the model is resident
+#   GET  /voices                                          -> JSON: the voices X-Voice accepts
 #   GET  /                                                -> "ok"
 #
 # Mirrors parakeet_server.py: the model is loaded once and kept in memory so each
@@ -37,7 +38,9 @@
 # X-Format: path keeps the old behaviour for callers that need a finished file.
 # apps/tts.lua is the one that does: it plays through afplay, which wants a path
 # and will not read a growing file.
+import json
 import os
+import sys
 import threading
 import time
 from contextlib import closing
@@ -97,6 +100,66 @@ def _load():
         log(f"warmup skipped: {e}")
     _ready.set()
     log("worker ready")
+
+
+# ---- the voice catalogue ---------------------------------------------------
+# pocket-tts resolves X-Voice against a fixed catalogue of predefined names (and
+# also accepts a path or a hf:// url, which is not something a menu can offer).
+# The library keeps that catalogue in a private dict, so GET /voices reads it
+# out of the already-imported module rather than hard-coding a copy that a
+# pocket-tts upgrade would silently make wrong.
+#
+# This list is the answer when the library has not been imported yet — see
+# _voices() for why it is not simply imported here. It is pocket-tts 2.1.0's
+# catalogue, and it is allowed to go stale: it stops being used the moment the
+# model is loaded.
+_FALLBACK_VOICES = (
+    "cosette", "marius", "javert", "alba", "jean", "anna", "vera", "fantine",
+    "charles", "paul", "eponine", "azelma", "george", "mary", "jane", "michael",
+    "eve", "bill_boerst", "peter_yearsley", "stuart_bell", "caro_davy",
+    "giovanni", "lola", "juergen", "rafael", "estelle",
+)
+
+_catalogue = {}                    # cached once the library has really answered
+
+
+def _voices():
+    """Every name X-Voice accepts, catalogue order.
+
+    Read out of sys.modules rather than imported. Importing pocket_tts here
+    would drag torch in on the request thread, and while _load() is doing that
+    same import on its own thread this one would block behind it — so a menu
+    opened during the twenty seconds of model load would hang instead of
+    showing a list. tts_model.py imports this module, so by the time the model
+    is resident the real catalogue is there for the taking.
+    """
+    names = _catalogue.get("names")
+    if names is not None:
+        return names
+    module = sys.modules.get("pocket_tts.utils.utils")
+    origins = getattr(module, "_ORIGINS_OF_PREDEFINED_VOICES", None) if module else None
+    if not origins:
+        # Not cached: the library's own list is still coming.
+        return list(_FALLBACK_VOICES)
+    names = list(origins)
+    _catalogue["names"] = names
+    return names
+
+
+def _default_voice():
+    """What an empty X-Voice resolves to on this server."""
+    if DEFAULT_VOICE:
+        return DEFAULT_VOICE
+    resolve = _helpers.get("default_voice")
+    if resolve is not None:
+        return resolve(LANGUAGE)
+    # Same reasoning as _voices(): no import before the model load has done it.
+    module = sys.modules.get("pocket_tts.default_parameters")
+    table = getattr(module, "DEFAULT_VOICE_FOR_LANGUAGE", None) if module else None
+    for key, voice in (table or {}).items():
+        if LANGUAGE and key in LANGUAGE:
+            return voice
+    return "alba"
 
 
 def _voice_state(voice):
@@ -218,6 +281,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _json(self, code, payload):
+        b = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
     def _param(self, name):
         """A query-string value from the request path, or ''."""
         parts = self.path.split("?", 1)
@@ -295,9 +366,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(500, f"__ERROR__ {e}")
 
     def do_GET(self):
-        if self.path.split("?", 1)[0] == "/health":
+        path = self.path.split("?", 1)[0]
+        if path == "/health":
             self._reply(200 if _ready.is_set() else 503,
                         "ok" if _ready.is_set() else "loading")
+        elif path == "/voices":
+            # Answers while the model is still loading, unlike /health: a menu
+            # asking what it can offer should not have to wait for a model it
+            # is not going to use yet. `ready` says which list this is — false
+            # means the built-in one, which may be a release behind.
+            self._json(200, {
+                "voices": _voices(),
+                "default": _default_voice(),
+                "language": LANGUAGE,
+                "ready": _ready.is_set(),
+            })
         else:
             self._reply(200, "ok")
 
