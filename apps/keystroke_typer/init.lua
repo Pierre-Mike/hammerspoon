@@ -271,8 +271,21 @@ end
 
 -- Type any text. Exposed so other plugins and `hs -c` can reach it:
 --   hs -c 'require("apps.keystroke_typer").type("hello")'
-function M.type(text)
-  if run.active then return M.cancel() end
+--
+-- opts.replace  A run already going is dropped and the new text typed instead.
+--               The hotkey is a toggle — pressing it twice stops typing — and
+--               without this a caller handing over fresh text would hit that
+--               toggle and get silence. apps/dictation passes it: the take the
+--               user just spoke is the one they want at the cursor.
+-- opts.quiet    No "Typing N characters" alert. For a caller that already shows
+--               the user what is happening; apps/dictation has its own HUD, and
+--               an alert per utterance is noise.
+function M.type(text, opts)
+  opts = opts or {}
+  if run.active then
+    if not opts.replace then return M.cancel() end
+    stop(nil)
+  end
   if type(text) ~= "string" or text == "" then
     return hs.alert.show("Nothing to type", 1.2)
   end
@@ -285,7 +298,9 @@ function M.type(text)
 
   run.active, run.steps, run.i = true, steps, 0
   if esc then esc:enable() end
-  hs.alert.show(string.format("Typing %d characters — esc to cancel", #steps), 1.2)
+  if not opts.quiet then
+    hs.alert.show(string.format("Typing %d characters — esc to cancel", #steps), 1.2)
+  end
 
   whenHandsAreOff(function()
     if not run.active then return end         -- cancelled during the wait

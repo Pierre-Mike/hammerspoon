@@ -1,5 +1,5 @@
--- lib/clipboard: borrow the pasteboard and give it back. The pasteboard, the
--- keystroke and the timer are passed in, so these specs own all three.
+-- lib/clipboard: borrow the pasteboard and give it back. The pasteboard is
+-- passed in, so these specs own it.
 local clip = require("lib.clipboard")
 
 -- A pasteboard with every flavour (readAllData) and a changeCount that moves on
@@ -12,13 +12,6 @@ local function fakePasteboard(initial)
   function pb.setContents(s) pb.data = { ["public.utf8-plain-text"] = s }; pb.count = pb.count + 1 end
   function pb.changeCount() return pb.count end
   return pb
-end
-
-local function deps(pb)
-  local d = { pb = pb, sent = {}, timers = {} }
-  d.keyStroke = function(mods, key) d.sent[#d.sent + 1] = { mods = mods, key = key, text = pb.getContents() } end
-  d.after = function(delay, fn) d.timers[#d.timers + 1] = { delay = delay, fn = fn } end
-  return d
 end
 
 local IMAGE = { ["public.png"] = "PNGDATA", ["public.utf8-plain-text"] = "caption" }
@@ -39,41 +32,5 @@ describe("clipboard.snapshot", function()
     pb.setContents("new")
     restore()
     assert.equals("old", pb.getContents())
-  end)
-end)
-
-describe("clipboard.pasteAndRestore", function()
-  it("pastes the text with ⌘V, then restores the user's clipboard after a delay", function()
-    local pb = fakePasteboard(IMAGE)
-    local d = deps(pb)
-    clip.pasteAndRestore("dictated words", d)
-    assert.equals(1, #d.sent)
-    assert.same({ "cmd" }, d.sent[1].mods)
-    assert.equals("v", d.sent[1].key)
-    assert.equals("dictated words", d.sent[1].text)
-    -- Not restored yet: the app reads the pasteboard when it handles ⌘V.
-    assert.equals("dictated words", pb.getContents())
-    assert.equals(1, #d.timers)
-    assert.is_true(d.timers[1].delay > 0)
-    d.timers[1].fn()
-    assert.same(IMAGE, pb.data)
-  end)
-
-  -- The user copied something between the paste and the restore. Theirs wins.
-  it("leaves the clipboard alone if it changed after the paste", function()
-    local pb = fakePasteboard(IMAGE)
-    local d = deps(pb)
-    clip.pasteAndRestore("dictated words", d)
-    pb.setContents("copied meanwhile")
-    d.timers[1].fn()
-    assert.equals("copied meanwhile", pb.getContents())
-  end)
-
-  it("does nothing for empty text", function()
-    local pb = fakePasteboard(IMAGE)
-    local d = deps(pb)
-    clip.pasteAndRestore("", d)
-    assert.equals(0, #d.sent)
-    assert.same(IMAGE, pb.data)
   end)
 end)

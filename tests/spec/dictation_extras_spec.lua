@@ -1,8 +1,8 @@
 -- The dictation features around a take, driven through apps/dictation's own
 -- surface (toggle, the menu, its timers):
 --   • the preview says "Starting…" until the mic delivers audio
---   • a silence hallucination never pastes
---   • the user's clipboard comes back after the paste
+--   • a silence hallucination is never typed
+--   • the transcript is typed at the cursor and stays on the clipboard
 --   • the optional LM Studio pass, and its fallbacks to the raw text
 --   • the last takes are kept on disk and can be retranscribed
 --   • a tap macOS switched off is re-armed, ending a take whose release was lost
@@ -123,11 +123,49 @@ hs.task.new = function(path, cb, args)
   return t
 end
 
+-- apps/dictation asks the plugin registry for the typer rather than require()ing
+-- it, so the registry is where the spec puts one. Loading it for real is the
+-- point: these specs assert on the characters that reach the event tap, which is
+-- the only thing that proves a take actually landed somewhere.
+local plugins = require("lib.plugins")
+local typer = require("apps.keystroke_typer")
+
+-- Replay what was posted as the text an app would end up holding. A key press
+-- resolves through the layout, from its keycode and modifiers, never from a
+-- character riding on the event — the same rule keystroke_typer_spec reads by.
+local KEYTEXT = { ["return"] = "\n", tab = "\t", space = " " }
+local function typedText()
+  local out = {}
+  for _, e in ipairs(hs.eventtap._sent) do
+    if e.kind == "key" then
+      local shift = false
+      for _, m in ipairs(e.mods or {}) do if m == "shift" then shift = true end end
+      out[#out + 1] = KEYTEXT[e.key] or hs.keycodes.charFor(e.key, shift) or "?"
+    elseif e.down then
+      out[#out + 1] = e.text
+    end
+  end
+  return table.concat(out)
+end
+
+-- One tick per character, plus one for the loop to find nothing left and stop.
+-- The typer's repeating timer is the newest one, because it is built the moment
+-- the transcript is handed over.
+local function typeOut()
+  local timer = hs.timer._every[#hs.timer._every]
+  for _ = 1, 4000 do
+    timer.fn()
+    if not typer.status().typing then return end
+  end
+  error("the typing loop never finished")
+end
+
 local d
 local function load(settings)
   tasks, posts, gets, after, taps = {}, {}, {}, {}, {}
   hs.settings._v = settings or {}
   package.loaded["apps.dictation.init"] = nil
+  plugins.loaded["keystroke_typer"] = typer
   d = require("apps.dictation.init")
   d.paths = { WAV = TMP .. "/take.wav", RAW = TMP .. "/take.raw", TAKES = TMP .. "/cache/takes" }
 end
@@ -139,6 +177,9 @@ local function ffmpegExit()
 end
 
 -- A take long enough to transcribe. The WAV is written while "recording".
+-- Typing is left un-drained: a spec that cares about the characters calls
+-- typeOut() itself, and one that only cares that nothing was delivered would
+-- have no timer to drive.
 local function take(wav)
   d.toggle()
   write(d.paths.WAV, wav or "RIFFaudio")
@@ -155,6 +196,8 @@ local function menuItem(label, menu)
 end
 
 before_each(function()
+  typer.cancel()
+  hs.timer._every = {}
   finishBody, llmReply, modelsBody = "hello world", nil, nil
   pb.text, pb.count = "user clipboard", 1
   mods = {}
@@ -184,14 +227,14 @@ describe("mic-ready indicator", function()
     assert.is_nil(d.readyTimer)
     assert.equals("idle", d.micState)
     assert.is_false(d.recording)
-    assert.equals(0, #hs.eventtap._sent, "a too-short tap pasted something")
+    assert.equals(0, #hs.eventtap._sent, "a too-short tap delivered something")
     timer.fn()                              -- a stray tick after the stop is harmless
     assert.equals("idle", d.micState)
   end)
 end)
 
 describe("transcript clean-up", function()
-  it("pastes nothing when a Whisper-style take is a silence hallucination", function()
+  it("types nothing when a Whisper-style take is a silence hallucination", function()
     load()
     d.engine = "mlxa"
     finishBody = "Thanks for watching!"
@@ -200,16 +243,17 @@ describe("transcript clean-up", function()
     assert.equals("user clipboard", pb.text)
   end)
 
-  it("pastes a short stock line on Parakeet, where it was really said", function()
+  it("types a short stock line on Parakeet, where it was really said", function()
     load()
     d.engine = "parakeet"
     finishBody = "Thank you."
     take()
+    typeOut()
     assert.equals("Thank you.", d.lastResult)
-    assert.is_true(#hs.eventtap._sent > 0)
+    assert.equals("Thank you.", typedText())
   end)
 
-  it("collapses a looped sentence before pasting", function()
+  it("collapses a looped sentence before typing it", function()
     load()
     finishBody = "Open the file. Open the file. Open the file."
     take()
@@ -217,22 +261,62 @@ describe("transcript clean-up", function()
   end)
 end)
 
-describe("clipboard after a paste", function()
-  it("pastes with ⌘V and puts the user's clipboard back afterwards", function()
+describe("delivering a transcript", function()
+  it("types it at the cursor one character at a time", function()
     load()
     take()
-    assert.equals("v", hs.eventtap._sent[1].key)
-    assert.equals("hello world", pb.text)   -- still there while the app reads it
-    fire(0.5)
-    assert.equals("user clipboard", pb.text)
+    -- Nothing has arrived yet: the first character waits for the first tick.
+    assert.equals(0, #hs.eventtap._sent)
+    typeOut()
+    assert.equals("hello world", typedText())
+    -- ⌘V is never sent. The old path opened with it, so a regression that went
+    -- back to pasting would show up right here.
+    for _, e in ipairs(hs.eventtap._sent) do
+      assert.not_equals("v", e.key, "the transcript was pasted, not typed")
+    end
   end)
 
-  it("keeps something the user copied in the meantime", function()
+  it("leaves the transcript on the clipboard as the fallback", function()
     load()
     take()
+    typeOut()
+    assert.equals("hello world", pb.text)
+    -- No restore timer, so no amount of waiting takes the text away again.
+    fire(0.5)
+    assert.equals("hello world", pb.text)
+  end)
+
+  it("keeps something the user copied after the take", function()
+    load()
+    take()
+    typeOut()
     hs.pasteboard.setContents("copied after")
     fire(0.5)
     assert.equals("copied after", pb.text)
+  end)
+
+  -- The typer is a plugin of its own and can be switched off in the hub. A take
+  -- must still reach the user when it is, and must not quietly reload it.
+  it("falls back to the clipboard alone when the typer is not loaded", function()
+    load()
+    plugins.loaded["keystroke_typer"] = nil
+    take()
+    assert.equals(0, #hs.eventtap._sent)
+    assert.equals("hello world", pb.text)
+  end)
+
+  -- A take landing while the last one is still going replaces it, rather than
+  -- reading as the second press of a toggle and typing nothing at all.
+  it("drops a run still in flight and types the newest take", function()
+    load()
+    take()
+    local timer = hs.timer._every[#hs.timer._every]
+    timer.fn(); timer.fn()                  -- "he"
+    finishBody = "second take"
+    take()
+    typeOut()
+    assert.equals("hesecond take", typedText())
+    assert.equals("second take", pb.text)
   end)
 end)
 
@@ -247,7 +331,7 @@ describe("LM Studio clean-up", function()
     assert.equals("hello world", d.lastResult)
   end)
 
-  it("pastes the cleaned text when switched on from the menu", function()
+  it("types the cleaned text when switched on from the menu", function()
     load()
     menuItem("Clean up with LM Studio").fn()
     assert.is_true(hs.settings._v["dictate.llmCleanup"])
@@ -260,28 +344,31 @@ describe("LM Studio clean-up", function()
     assert.equals("Hello, world.", pb.text)
   end)
 
-  it("pastes the raw text when LM Studio is not running", function()
+  it("types the raw text when LM Studio is not running", function()
     load({ ["dictate.llmCleanup"] = true })
     take()
+    typeOut()
     assert.equals("hello world", d.lastResult)
-    assert.equals("v", hs.eventtap._sent[1].key)
+    assert.equals("hello world", typedText())
   end)
 
-  it("pastes the raw text on a timeout and ignores a late reply", function()
+  it("types the raw text on a timeout and ignores a late reply", function()
     load({ ["dictate.llmCleanup"] = true })
     JSON.models = MODELS
     modelsBody, llmReply = "models", "hang"
     take()
-    assert.equals(0, #hs.eventtap._sent, "pasted before the clean-up answered")
+    assert.equals(0, #hs.eventtap._sent, "delivered before the clean-up answered")
     fire(4)
-    assert.equals(1, #hs.eventtap._sent)
+    typeOut()
+    assert.equals("hello world", typedText())
     assert.equals("hello world", pb.text)
-    -- The reply lands after the timeout: nothing more is pasted.
+    -- The reply lands after the timeout: nothing more is typed.
+    local sent = #hs.eventtap._sent
     JSON.reply = REPLY
     for _, p in ipairs(posts) do
       if p.url:match("/chat/completions$") then p.cb(200, "reply", {}) end
     end
-    assert.equals(1, #hs.eventtap._sent)
+    assert.equals(sent, #hs.eventtap._sent)
   end)
 end)
 

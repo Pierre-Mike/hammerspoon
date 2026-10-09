@@ -1,5 +1,6 @@
--- Dictation: hold Fn = record, release = transcribe & paste at cursor.
--- Pipeline: ffmpeg → warm STT server (the selected model) → pbpaste → ⌘V
+-- Dictation: hold Fn = record, release = transcribe & type at cursor.
+-- Pipeline: ffmpeg → warm STT server (the selected model) → clipboard →
+-- apps/keystroke_typer, which types the transcript one keystroke at a time.
 --
 -- Everything this plugin builds belongs to its context, and two of those things
 -- are why it matters here more than anywhere else in apps/. The Fn tap sits in
@@ -14,7 +15,7 @@
 local earcon      = require("lib.earcon")
 local sttServer   = require("lib.stt_server")
 local configFile  = require("lib.config")
-local clipboard   = require("lib.clipboard")
+local plugins     = require("lib.plugins")
 local tfilter     = require("lib.transcript_filter")
 local llm         = require("lib.llm_cleanup")
 local takes       = require("lib.dictation_takes")
@@ -52,7 +53,7 @@ local M = { recording = false, ffmpegTask = nil, fnDown = false, startedAt = 0, 
 M.paths = { WAV = WAV, RAW = RAW, TAKES = TAKES_DIR }
 -- "starting" from Fn-down until the first audio bytes land, then "listening".
 M.micState = "idle"
--- Optional LM Studio pass over each transcript before it pastes. Off by default.
+-- Optional LM Studio pass over each transcript before it is typed. Off by default.
 M.llmCleanup = hs.settings.get("dictate.llmCleanup") == true
 -- Pins mlx-audio models to one language ("fr"); nil lets each model decide.
 M.language = hs.settings.get("dictate.language")
@@ -110,7 +111,7 @@ function M.offState(name)
 end
 
 -- The one place M.recording is written. `active` is true from the first frame
--- of capture until the transcript is pasted or the take is dropped, because
+-- of capture until the transcript is delivered or the take is dropped, because
 -- that whole window is when the mic, the STT server and the cursor are ours —
 -- not just the capture. Writing the same value again fires nothing.
 local function setRecording(active)
@@ -504,17 +505,39 @@ local function fileSize(p)
   local n = f:seek("end"); f:close(); return n or 0
 end
 
--- ⌘V the text at the cursor, then give the user their clipboard back once the
--- paste has landed (lib/clipboard).
-local function paste(text)
+-- Put the transcript at the cursor as real keystrokes, and leave it on the
+-- clipboard behind them.
+--
+-- ⌘V used to do this, and it failed silently in exactly the places dictation
+-- earns its keep: a terminal in bracketed-paste mode, a remote desktop or
+-- Citrix session, a kiosk form that only listens for keydown, anything that
+-- strips a paste for "security". The key went out, nothing arrived, and half a
+-- second later the clipboard was handed back — so the take was gone with no
+-- error anywhere to say so. apps/keystroke_typer sends each character as its own
+-- key event on the system event tap, which those same apps cannot tell from a
+-- person at the keyboard, and the text appearing as it types is its own receipt.
+--
+-- The clipboard is not restored afterwards. It holds the transcript until the
+-- user copies something else, so ⌘V is there when typing is the wrong answer —
+-- a field that rejects synthetic events, or a take typed into the wrong window.
+local function deliver(text)
   if not text or text == "" then return end
   text = text:gsub("^%s+", ""):gsub("%s+$", "")
   if text == "" then return end
-  -- The restore timer goes through the context as well: a plugin disposed in
-  -- the half-second before it fires must not put a clipboard back afterwards.
-  M.restoreTimer = clipboard.pasteAndRestore(text, {
-    after = function(delay, fn) return ctx:after(delay, fn) end,
-  })
+  hs.pasteboard.setContents(text)
+
+  -- Asked of the registry rather than require()d. plugins.unload clears
+  -- package.loaded, so a plain require would re-run apps/keystroke_typer and
+  -- bring back a plugin the user switched off in the hub — once per take.
+  local typer = plugins.loaded["keystroke_typer"]
+  if type(typer) ~= "table" or type(typer.type) ~= "function" then
+    logf("[dictate] keystroke typer not loaded — transcript is on the clipboard")
+    notify("copied — ⌘V to paste", 1.8)
+    return
+  end
+  -- replace: a run still going belongs to the previous take, and the newest one
+  -- is what the user is waiting for. quiet: the HUD already said its piece.
+  typer.type(text, { replace = true, quiet = true })
 end
 
 -- Duck system audio while the mic is open; unduckNoise puts it back. One duck,
@@ -534,7 +557,7 @@ local function duckNoise()
 end
 
 -- The single restore point. Every exit from a take routes here — transcript
--- pasted, chord cancel, tap too short, transcription error — so calling it is
+-- delivered, chord cancel, tap too short, transcription error — so calling it is
 -- always safe and never double-restores. State is cleared before the device
 -- call so a failing setVolume cannot strand us ducked forever.
 local function unduckNoise()
@@ -557,7 +580,7 @@ local function polish(text, done)
     if finished then return end
     finished = true
     if M.polishTimer then M.polishTimer(); M.polishTimer = nil end
-    if why then logf("[llm] %s; pasting the raw transcript", why) end
+    if why then logf("[llm] %s; typing the raw transcript", why) end
     if not M.recording then hideHUD() end
     done(result or text)
   end
@@ -585,7 +608,7 @@ local function polish(text, done)
   end)
 end
 
--- Shared tail: reset UI, clean the transcript, then paste at the cursor.
+-- Shared tail: reset UI, clean the transcript, then type it at the cursor.
 local function finishTranscript(out)
   setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false)
   unduckNoise()
@@ -604,10 +627,10 @@ local function finishTranscript(out)
     return
   end
   M.lastResult = text
-  if not M.llmCleanup then paste(text); return end
+  if not M.llmCleanup then deliver(text); return end
   polish(text, function(final)
     M.lastResult = final
-    paste(final)
+    deliver(final)
   end)
 end
 
@@ -937,7 +960,7 @@ local function setLlmCleanup(on)
 end
 
 -- Run a kept take through whatever model is loaded now, and put the result on
--- the clipboard rather than pasting it: the cursor has moved on since.
+-- the clipboard rather than typing it: the cursor has moved on since.
 local function retranscribe(name)
   local path = M.paths.TAKES .. "/" .. name
   logf("[takes] retranscribe %s with %s", name, tostring(M.modelName))
@@ -1125,7 +1148,7 @@ end)
 
 M.isRecording = function() return M.recording end
 -- Start or stop a take from something other than Fn (e.g. a Shokz chord). The
--- transcript pastes at the cursor, the same as a Fn take.
+-- transcript types at the cursor, the same as a Fn take.
 M.toggle = function()
   if M.recording then stopRecording() else startRecording() end
 end
