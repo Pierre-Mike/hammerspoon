@@ -5,6 +5,11 @@
 -- agent POSTs to the same server, so it always transcribes with that model too.
 -- This module answers the two questions a switch asks: which backend runs a
 -- model, and how to launch the server for it.
+--
+-- Three engines, three interpreters:
+--   parakeet  parakeet-mlx   streams, so the only one with a live preview
+--   mlxa      mlx-audio      batch, every other MLX architecture
+--   cactus    cactus-needle  batch, CPU only — the Whistle family
 
 local M = {}
 
@@ -14,6 +19,12 @@ local M = {}
 -- whose type is absent here is skipped rather than guessed at, which is also
 -- what keeps the non-speech models in the same cache — LLMs, pocket-tts — out of
 -- the menu.
+--
+-- Cactus is deliberately absent: its weights are a single .cact file with no
+-- safetensors beside it, so the hub scan never reaches a config.json for one.
+-- apps/dictation finds those by globbing the cactus-needle cache instead, and
+-- sets engine = "cactus" itself. Note `whisper` below is OpenAI's model on
+-- mlx-audio, NOT Cactus' `whistle` — one letter apart, different backends.
 M.ENGINES = {
   parakeet           = "parakeet",
   qwen3_asr          = "mlxa",
@@ -47,9 +58,9 @@ function M.engineFor(types)
 end
 
 -- How the server is started for model `m` (an entry from the menu's model list:
--- { id, path, engine }). `rt` names the runtime: { parakeetPy, mlxaPy, server,
--- home, port, language }. Each engine needs its own interpreter, since parakeet-mlx and
--- mlx-audio live in separate uv tool environments.
+-- { id, path, engine }). `rt` names the runtime: { parakeetPy, mlxaPy, cactusPy,
+-- server, home, port, language }. Each engine needs its own interpreter, since
+-- parakeet-mlx, mlx-audio and cactus-needle live in separate environments.
 --
 -- Returns { python, args, env, streams } or nil, reason.
 function M.launch(m, rt)
@@ -66,6 +77,10 @@ function M.launch(m, rt)
     -- A language code ("fr") pins mlx-audio models to it. Unset, each model
     -- uses its own default, which for Whisper means detecting it per take.
     STT_LANGUAGE = (rt.language and rt.language ~= "") and rt.language or nil,
+    -- cactus-needle POSTs a usage ping on every model load. Dictation loads a
+    -- model on every switch, so it is turned off here rather than left to leak
+    -- a count of how often this machine dictates.
+    NEEDLE_TELEMETRY = "0",
   }
   local python
   if m.engine == "parakeet" then
@@ -76,6 +91,12 @@ function M.launch(m, rt)
     -- off the repo name, and a snapshot directory is only a commit hash.
     if not m.id then return nil, "mlx-audio model has no repo id" end
     python, env.STT_MODEL = rt.mlxaPy, m.id
+  elseif m.engine == "cactus" then
+    -- By file path: a cactus model IS one .cact file, and needle.Whistle takes
+    -- it as `weights`. There is no repo to resolve and nothing to download at
+    -- launch, which is also why HF_HUB_OFFLINE above costs this engine nothing.
+    if not m.path then return nil, "cactus model " .. tostring(m.id) .. " has no .cact path" end
+    python, env.STT_MODEL = rt.cactusPy, m.path
   else
     return nil, "unknown engine " .. tostring(m.engine) .. " for " .. tostring(m.id)
   end

@@ -5,6 +5,7 @@ local stt = require("lib.stt_server")
 local RT = {
   parakeetPy = "/py/parakeet",
   mlxaPy     = "/py/mlx-audio",
+  cactusPy   = "/py/cactus",
   server     = "/hs/parakeet_server.py",
   home       = "/Users/me",
   port       = 8765,
@@ -17,6 +18,10 @@ local PARAKEET = {
 local COHERE = {
   id = "lyzgeorge/cohere-transcribe-03-2026-mlx-4bit", engine = "mlxa",
   path = "/hub/models--lyzgeorge--cohere-transcribe-03-2026-mlx-4bit/snapshots/def",
+}
+local WHISTLE = {
+  id = "Cactus-Compute/whistle", engine = "cactus",
+  path = "/cactus/whistle/2.0.0/whistle.cact",
 }
 
 describe("stt_server.engineFor", function()
@@ -38,6 +43,15 @@ describe("stt_server.engineFor", function()
     assert.is_nil(stt.engineFor("llama"))
     assert.is_nil(stt.engineFor(""))
     assert.is_nil(stt.engineFor(nil))
+  end)
+
+  -- Cactus weights are one .cact file with no config.json, so the hub scan never
+  -- produces a type for one and apps/dictation sets engine = "cactus" itself.
+  -- `whistle` landing here would be a typo for OpenAI's `whisper`, not a cactus
+  -- model, and would start Whistle under mlx-audio's python.
+  it("claims no model_type for cactus, and keeps whistle apart from whisper", function()
+    assert.is_nil(stt.ENGINES.whistle)
+    assert.equals("mlxa", stt.ENGINES.whisper)
   end)
 end)
 
@@ -62,6 +76,29 @@ describe("stt_server.launch", function()
     assert.equals(COHERE.id, l.env.STT_MODEL)
     assert.equals("1", l.env.HF_HUB_OFFLINE)
     assert.is_false(l.streams)
+  end)
+
+  -- needle.Whistle takes the weights file itself; there is no repo to resolve
+  -- and no snapshot directory, so a cactus model is launched by path.
+  it("runs a cactus model under cactus-needle's python, from its .cact file", function()
+    local l = assert(stt.launch(WHISTLE, RT))
+    assert.equals("/py/cactus", l.python)
+    assert.same({ "/hs/parakeet_server.py" }, l.args)
+    assert.equals("cactus", l.env.STT_ENGINE)
+    assert.equals(WHISTLE.path, l.env.STT_MODEL)
+    assert.equals(WHISTLE.id, l.env.STT_MODEL_ID)
+    assert.is_false(l.streams)
+  end)
+
+  it("refuses a cactus entry with no .cact path", function()
+    local l, err = stt.launch({ id = "Cactus-Compute/whistle", engine = "cactus" }, RT)
+    assert.is_nil(l)
+    assert.truthy(err)
+  end)
+
+  -- One usage ping per model load, and dictation loads a model on every switch.
+  it("switches cactus-needle's telemetry off", function()
+    assert.equals("0", stt.launch(WHISTLE, RT).env.NEEDLE_TELEMETRY)
   end)
 
   it("passes HOME and a PATH with Homebrew's ffmpeg on it", function()

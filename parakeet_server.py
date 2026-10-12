@@ -8,6 +8,12 @@
 #
 #   STT_ENGINE=parakeet  parakeet-mlx's python   STT_MODEL=<snapshot dir>
 #   STT_ENGINE=mlxa      mlx-audio's python      STT_MODEL=<HF repo id or dir>
+#   STT_ENGINE=cactus    cactus-needle's python  STT_MODEL=<path to a .cact file>
+#
+# The cactus engine runs Cactus Compute's Whistle on the CPU — no MLX, no Metal,
+# no GPU. Its interpreter has no mlx package at all, so every MLX call in this
+# file is behind _mlx(), which hands back a do-nothing stand-in when the import
+# is not there. Nothing else in the file needs to know which engine it is under.
 #
 # STT_MODEL_ID is the name /health reports (defaults to STT_MODEL); STT_PORT
 # overrides the port. PARAKEET_MODEL_PATH / PARAKEET_PORT / argv[1] still work, so
@@ -57,12 +63,45 @@ BLOCK = SR          # 1.0s feed blocks: smaller first chunks drop the leading wo
 CONTEXT = (256, 256)
 DEPTH = 2
 
-if ENGINE not in ("parakeet", "mlxa") or not MODEL:
-    sys.exit(f"usage: STT_ENGINE=parakeet|mlxa STT_MODEL=<path or repo> {sys.argv[0]}")
+if ENGINE not in ("parakeet", "mlxa", "cactus") or not MODEL:
+    sys.exit(f"usage: STT_ENGINE=parakeet|mlxa|cactus STT_MODEL=<path or repo> {sys.argv[0]}")
 
 
 def log(msg):
     print(f"[stt-server:{ENGINE}] {msg}", flush=True)
+
+
+class _NoMLX:
+    """Stand-in for mlx.core on an engine whose interpreter has no MLX.
+
+    Only the memory calls reach it: a CPU engine has no Metal buffer cache to
+    bound, clear or measure, so capping it is a no-op and every gauge reads 0.
+    Anything else is a bug in this file, and raises rather than quietly passing.
+    """
+
+    @staticmethod
+    def set_cache_limit(_n):
+        return 0
+
+    @staticmethod
+    def clear_cache():
+        return None
+
+    @staticmethod
+    def get_active_memory():
+        return 0
+
+    get_cache_memory = get_active_memory
+    get_peak_memory = get_active_memory
+
+
+def _mlx():
+    """mlx.core, or _NoMLX on the cactus engine. Call from the thread using it."""
+    try:
+        import mlx.core as mx
+        return mx
+    except ImportError:
+        return _NoMLX
 
 
 class Session:
@@ -235,8 +274,40 @@ class MlxAudioBackend:
         return (getattr(out, "text", "") or "").strip()
 
 
+class CactusBackend:
+    """Cactus Compute's Whistle: one 16.9 MB .cact file, decoded on the CPU.
+
+    The weights file is the whole model — no config, no tokenizer, no snapshot
+    directory — so MODEL is a path to it rather than a repo id.
+
+    Two habits of this engine the rest of the pipeline relies on:
+      - silence comes back as an empty string, not an invented sentence, so a
+        take with no speech types nothing instead of a hallucinated line
+      - one pass covers 30s and longer audio is windowed internally, so the
+        90s MAX_RECORD in apps/dictation needs no special case here
+
+    It detects the language per take across its seven (en, de, fr, es, it, nl,
+    pl). STT_LANGUAGE pins it the same way it pins an mlx-audio model, and an
+    unsupported code is ignored rather than fatal — a pin meant for a 99-language
+    Whisper should not leave this engine unable to start.
+    """
+
+    LANGUAGES = ("en", "de", "fr", "es", "it", "nl", "pl")
+
+    def __init__(self, weights):
+        import needle
+        self.language = LANGUAGE if LANGUAGE in self.LANGUAGES else None
+        if LANGUAGE and not self.language:
+            log(f"language {LANGUAGE!r} is not one of {'/'.join(self.LANGUAGES)} — detecting instead")
+        self.model = needle.Whistle(weights=weights)
+
+    def transcribe(self, wav):
+        out = self.model.transcribe(wav, language=self.language)
+        return ((out or {}).get("text") or "").strip()
+
+
 def worker():
-    import mlx.core as mx  # (worker thread must own the MLX stream)
+    mx = _mlx()  # (worker thread must own the MLX stream)
     # Bound MLX's Metal buffer cache. Left unbounded it grows across streaming
     # sessions (measured: 3.7GB cache on top of 1.2GB weights, 11GB peak) and
     # drives the system into paging. 512MB keeps buffer reuse fast while capping
@@ -252,7 +323,9 @@ def worker():
     log(f"loading model: {MODEL}")
     t0 = time.time()
     try:
-        backend = ParakeetBackend(MODEL) if ENGINE == "parakeet" else MlxAudioBackend(MODEL)
+        backend = {"parakeet": ParakeetBackend,
+                   "mlxa": MlxAudioBackend,
+                   "cactus": CactusBackend}[ENGINE](MODEL)
     except Exception as e:  # noqa: BLE001
         log(f"model load FAILED: {e}")
         with _lock:

@@ -23,8 +23,10 @@ fi
 
 OUT=/tmp/stt-test; mkdir -p "$OUT"
 HF_HUB="$HOME/.cache/huggingface/hub"
+CACTUS_CACHE="$HOME/.cache/cactus-needle"
 PARAKEET="$HOME/.local/bin/parakeet-mlx"
 MLXA_PY="$HOME/.local/share/uv/tools/mlx-audio/bin/python"
+CACTUS_PY="$HOME/.hammerspoon/.venv-cactus/bin/python"
 FFPROBE=/opt/homebrew/bin/ffprobe
 base="$(basename "${WAV%.*}")"
 DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$WAV" 2>/dev/null)
@@ -55,6 +57,13 @@ scan_models() {
       fi
     done
   done
+  # Whistle lives outside the hub: a lone .cact file, no config.json to read an
+  # engine off, so it is globbed by name the way apps/dictation globs it. The
+  # sibling v2/ and v3/ folders hold Needle, a tool-calling LLM, and stay out.
+  local c
+  for c in "$CACTUS_CACHE"/whistle/*/whistle.cact(N); do
+    printf '%s\t%s\n' "$c" cactus
+  done
 }
 
 report() {  # $1 = seconds, $2 = transcript file glob
@@ -83,11 +92,28 @@ run_mlxa() {  # $1 = repo
   report "$(( EPOCHREALTIME - t0 ))" "$OUT/batch*.txt"
 }
 
+run_cactus() {  # $1 = path to whistle.cact
+  local t0=$EPOCHREALTIME
+  NEEDLE_TELEMETRY=0 "$CACTUS_PY" -c '
+import sys, needle
+w = needle.Whistle(weights=sys.argv[1])
+langs = ("en","de","fr","es","it","nl","pl")
+lang = sys.argv[3] if sys.argv[3] in langs else None
+print((w.transcribe(sys.argv[2], language=lang).get("text") or "").strip())
+' "$1" "$WAV" "$LANG_HINT" >"$OUT/cactus.txt" 2>"$OUT/err.log"
+  local rc=$?
+  (( rc )) && { printf '   FAILED (rc=%d)\n' $rc; sed 's/^/   | /' <<<"$(tail -4 "$OUT/err.log")"; return; }
+  report "$(( EPOCHREALTIME - t0 ))" "$OUT/cactus.txt"
+}
+
 printf '================ STT comparison: %s (%.1fs) ================\n' "$WAV" "$DUR"
 scan_models | while IFS=$'\t' read -r dir engine; do
-  repo="${dir//--//}"
-  printf '\n### %s  [%s]\n' "$repo" "$engine"
-  [[ "$engine" == parakeet ]] && run_parakeet "$repo" || run_mlxa "$repo"
+  case "$engine" in
+    # A cactus row carries the weights path, not a repo directory name.
+    cactus)   printf '\n### %s  [%s]\n' "Cactus-Compute/whistle" "$engine"; run_cactus "$dir" ;;
+    parakeet) printf '\n### %s  [%s]\n' "${dir//--//}" "$engine"; run_parakeet "${dir//--//}" ;;
+    *)        printf '\n### %s  [%s]\n' "${dir//--//}" "$engine"; run_mlxa "${dir//--//}" ;;
+  esac
 done
 printf '\n============================================================\n'
 printf 'Cold-load times: the picker keeps a parakeet model warm, so in the app a\n'

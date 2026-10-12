@@ -40,6 +40,9 @@ local MODEL_PATH = os.getenv("HOME") .. "/.cache/huggingface/hub/models--mlx-com
 -- selected model's engine (parakeet-mlx or mlx-audio — see lib/stt_server).
 local PARAKEET_PY = os.getenv("HOME") .. "/.local/share/uv/tools/parakeet-mlx/bin/python"
 local MLXA_PY     = os.getenv("HOME") .. "/.local/share/uv/tools/mlx-audio/bin/python"
+-- cactus-needle is a library rather than a CLI, so it gets a venv in this repo
+-- instead of a uv tool environment. See README, "Whistle (cactus engine)".
+local CACTUS_PY   = os.getenv("HOME") .. "/.hammerspoon/.venv-cactus/bin/python"
 local STT_SERVER  = os.getenv("HOME") .. "/.hammerspoon/parakeet_server.py"
 local STT_PORT    = 8765
 local STT_BASE    = "http://127.0.0.1:" .. STT_PORT
@@ -185,7 +188,12 @@ setIcon("○")
 --     that streams, so these are the only models with a live preview
 --   • a `model_type` mlx-audio implements → mlx-audio, loaded once in the same
 --     server and transcribing the whole WAV on release
+--
+-- Cactus models are the exception to "cached under the HF hub". One is a single
+-- .cact file with no config and no safetensors, and cactus-needle keeps it in a
+-- cache of its own, so they are found by CACTUS_SCAN below instead.
 local HF_HUB = os.getenv("HOME") .. "/.cache/huggingface/hub"
+local CACTUS_CACHE = os.getenv("HOME") .. "/.cache/cactus-needle"
 
 -- Label and accuracy for the models worth naming. `wer` is measured HERE, on
 -- this machine, against the exact quantised snapshot the menu loads: 73
@@ -218,6 +226,17 @@ local CATALOG = {
   -- error on anything past ~30s, and MAX_RECORD allows 90, so a long dictation
   -- on this model comes back empty. Short takes only until that is fixed.
   ["mlx-community/Mega-ASR-bf16"]                      = { name = "Mega-ASR · noisy, ≤30s",       wer = 3.76 },
+  -- Here to be tried, not to win. Whistle is 16.9 MB of 2–4 bit weights decoded
+  -- on the CPU, two orders of magnitude smaller than everything above it, and
+  -- it is in this menu so the same takes can be run through the model that would
+  -- have to do the job on a phone or a wearable. On this machine it transcribes
+  -- a 60s take in 0.36s and loads in about a second; the words it gets wrong are
+  -- the price of that size, so expect to re-dictate proper nouns.
+  --
+  -- No `wer`: the column above is 73 LibriSpeech clips measured on this machine,
+  -- that corpus is not checked in, and a number from some other corpus would
+  -- read as comparable when it is not.
+  ["Cactus-Compute/whistle"]                           = { name = "Whistle · 7 langs, CPU"                     },
 }
 
 -- Disk footprint of a cached snapshot ≈ resident memory the model needs once
@@ -249,6 +268,46 @@ for d in "$HF_HUB"/models--*; do
 done
 ]==]
 
+-- One pass over the cactus-needle cache, which is laid out
+-- <family>/<engine version>/<family>.cact. Only the whistle family is listed:
+-- the sibling v2/ and v3/ folders hold Needle itself, a tool-calling LLM that
+-- cannot transcribe anything, and a menu that offered it would hand the dictate
+-- key a model with no transcribe path. Newest version wins when several are
+-- cached, the way the hub scan takes one snapshot per repo.
+local CACTUS_SCAN = [==[
+for d in "$CACTUS_CACHE"/whistle/*/; do
+  f="${d}whistle.cact"; [ -f "$f" ] || continue
+  printf '%s\t%s\n' "$f" "$(du -k "$f" 2>/dev/null | cut -f1)"
+done | sort -V | tail -1
+]==]
+
+-- One pass over the cactus-needle cache, which is laid out
+-- <family>/<engine version>/<family>.cact. Only the whistle family is listed:
+-- the sibling v2/ and v3/ folders hold Needle itself, a tool-calling LLM that
+-- cannot transcribe anything, and a menu offering it would hand the dictate key
+-- a model with no transcribe path. Newest version wins when several are cached,
+-- the way the hub scan takes one snapshot per repo.
+local CACTUS_SCAN = [==[
+for d in "$CACTUS_CACHE"/whistle/*/; do
+  f="${d}whistle.cact"; [ -f "$f" ] || continue
+  printf '%s\t%s\n' "$f" "$(du -k "$f" 2>/dev/null | cut -f1)"
+done | sort -V | tail -1
+]==]
+
+-- One menu entry. `id` is the HF repo a model came from, which is what the
+-- CATALOG is keyed on and what the selection is persisted under.
+local function entry(id, path, kb, engine)
+  local meta = CATALOG[id] or {}
+  local sizeKB = tonumber(kb) or 0
+  return {
+    id = id, path = path,
+    name = meta.name or (id:match("([^/]+)$") or id),
+    wer = meta.wer,
+    engine = engine, stream = (engine == "parakeet"),
+    sizeKB = sizeKB, sizeStr = humanSize(sizeKB),
+  }
+end
+
 -- Returns { {id=, path=, name=, wer=, engine=, stream=, sizeKB=, sizeStr=}, … }
 -- for every cached model whose config names a backend we can run.
 local function discoverModels()
@@ -258,16 +317,13 @@ local function discoverModels()
     local engine = sttServer.engineFor(types)
     if engine then
       local id = dir:gsub("^models%-%-", ""):gsub("%-%-", "/")   -- → mlx-community/…
-      local meta = CATALOG[id] or {}
-      local sizeKB = tonumber(kb) or 0
-      models[#models + 1] = {
-        id = id, path = path,
-        name = meta.name or (id:match("([^/]+)$") or id),
-        wer = meta.wer,
-        engine = engine, stream = (engine == "parakeet"),
-        sizeKB = sizeKB, sizeStr = humanSize(sizeKB),
-      }
+      models[#models + 1] = entry(id, path, kb, engine)
     end
+  end
+  -- The .cact files, whose engine the directory names rather than a config.json.
+  local cactus = hs.execute('CACTUS_CACHE="' .. CACTUS_CACHE .. '"\n' .. CACTUS_SCAN) or ""
+  for path, kb in cactus:gmatch("([^\t\n]+)\t([^\n]+)") do
+    models[#models + 1] = entry("Cactus-Compute/whistle", path, kb, "cactus")
   end
   -- Streaming models first — they are the only ones that show a live preview, so
   -- they are a different kind of choice, not just a more accurate one. Within a
@@ -852,7 +908,8 @@ end
 local function launchServer()
   local m = M.serverModel
   local l, why = sttServer.launch(m, {
-    parakeetPy = PARAKEET_PY, mlxaPy = MLXA_PY, server = STT_SERVER,
+    parakeetPy = PARAKEET_PY, mlxaPy = MLXA_PY, cactusPy = CACTUS_PY,
+    server = STT_SERVER,
     home = os.getenv("HOME"), port = STT_PORT, language = M.language,
   })
   if not l then
@@ -938,9 +995,11 @@ local function setMic(name)
   notify("Mic: " .. name, 1.6)
 end
 
--- Language for mlx-audio models. "Auto" leaves it to the model (Whisper detects
--- it per take); parakeet ignores it. A change restarts the server, because the
--- language is fixed when the model loads.
+-- Language for the mlx-audio and cactus models. "Auto" leaves it to the model
+-- (Whisper and Whistle both detect it per take); parakeet ignores it. A change
+-- restarts the server, because the language is fixed when the model loads.
+-- Whistle speaks seven languages and ignores a code outside them rather than
+-- failing to start, so a pin set for a 99-language Whisper cannot strand it.
 local LANGUAGES = { { code = nil, name = "Auto" }, { code = "en", name = "English" }, { code = "fr", name = "French" } }
 
 local function setLanguage(code)

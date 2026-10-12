@@ -134,13 +134,15 @@ so nothing in the code needs editing:
   that streams, so these are the only models with a live preview (🟢)
 - any other `model_type` mlx-audio implements runs on mlx-audio (🟡): the WAV is
   transcribed on release, with no preview
+- Whistle is the exception, found outside the hub and run on the CPU (🟡) — see
+  [Whistle (cactus engine)](#whistle-cactus-engine)
 
 Either way exactly one model is loaded. `parakeet_server.py` on port 8765 loads
 the selected model once and keeps it warm, so a dictation costs inference only
 (about 0.1–0.2s for a short take on both engines). Picking another model in the
 menu kills that server, waits for the port to free, and starts a new one on the
-new model under its engine's interpreter (`STT_ENGINE=parakeet|mlxa`,
-`STT_MODEL=<snapshot dir or repo id>`). After a reload it starts on the saved
+new model under its engine's interpreter (`STT_ENGINE=parakeet|mlxa|cactus`,
+`STT_MODEL=<snapshot dir, repo id or .cact file>`). After a reload it starts on the saved
 selection. The voice agent posts to the same `/transcribe`, so it switches with
 you. To see what is loaded:
 
@@ -171,6 +173,44 @@ mlx-audio release that adds an architecture needs a key here too, and
 The mlx-audio backend needs `soundfile` and `sentencepiece`, which mlx-audio does not
 pull in itself: `uv tool install mlx-audio --with soundfile --with sentencepiece`.
 Without them Granite fails on load and Cohere Transcribe fails on its tokenizer.
+
+### Whistle (cactus engine)
+
+Whistle is Cactus Compute's speech model: one 16.9 MB file, decoded on the CPU,
+in English, German, French, Spanish, Italian, Dutch and Polish. It is in the menu
+to be *tried* — it is here so a take can be run through the model a phone or a
+wearable would have to use, next to the models this Mac can afford. Measured on
+one 20s take: loads in under a second against parakeet's nine, transcribes in
+0.1s against 0.3s, and gets "terraform" wrong where parakeet gets it right.
+Whistle punctuates and capitalises, which parakeet does not.
+
+It is the one model the hub scan cannot find, because its weights are a single
+`.cact` file with no `config.json` and no safetensors beside it. `apps/dictation`
+globs the cactus-needle cache for it instead, and sets `engine = "cactus"`
+itself — so, unlike the other two engines, `ENGINES` in `lib/stt_server.lua` has
+no key for it. (`whisper` there is OpenAI's model on mlx-audio. One letter apart,
+different backends.)
+
+```sh
+uv venv --python 3.12 ~/.hammerspoon/.venv-cactus
+VIRTUAL_ENV=~/.hammerspoon/.venv-cactus uv pip install cactus-needle numpy
+~/.hammerspoon/.venv-cactus/bin/python -c \
+  'from needle.agent import fetch; print(fetch.fetch_weights("whistle"))'
+hs -c 'hs.reload()'   # the menu picks it up
+```
+
+`numpy` is only for the server's warm-up pass; without it the warm-up is skipped
+and the first take pays for it. The weights land in
+`~/.cache/cactus-needle/whistle/<version>/whistle.cact`, which is what the menu
+globs and what `STT_MODEL` points at — a file path, not a repo id, because
+`needle.Whistle` takes the weights directly.
+
+Two habits worth knowing. Silence comes back as an empty transcript rather than
+an invented sentence. And a language pin outside its seven is ignored with a log
+line rather than being fatal, so a code set for a 99-language Whisper cannot
+leave Whistle unable to start. `NEEDLE_TELEMETRY=0` is set on every launch:
+cactus-needle otherwise POSTs a usage ping each time a model loads, and a model
+loads on every switch.
 
 `./test_stt.sh` transcribes one clip (`/tmp/hs-dictate.wav` by default — dictate
 once and it is there) with every cached model in turn, so accuracy and speed can

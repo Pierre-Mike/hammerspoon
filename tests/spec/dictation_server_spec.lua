@@ -11,6 +11,7 @@ _G.hs = require("hs")
 local HOME = os.getenv("HOME")
 local PARAKEET_PY = HOME .. "/.local/share/uv/tools/parakeet-mlx/bin/python"
 local MLXA_PY     = HOME .. "/.local/share/uv/tools/mlx-audio/bin/python"
+local CACTUS_PY   = HOME .. "/.hammerspoon/.venv-cactus/bin/python"
 
 -- Menubar stub that keeps the menu builder, so a spec can click a model row.
 local menuFn
@@ -28,14 +29,19 @@ hs.audiodevice = {
   watcher = { setCallback = function() end, start = function() end },
 }
 
--- The hub scan sees two cached models, one per engine.
+-- The hub scan sees two cached models, one per MLX engine.
 local V3_PATH = "/hub/models--mlx-community--parakeet-tdt-0.6b-v3/snapshots/abc"
 local SCAN = table.concat({
   "models--mlx-community--parakeet-tdt-0.6b-v3\t" .. V3_PATH .. "\t1200000\tparakeet parakeet_tdt",
   "models--lyzgeorge--cohere-transcribe-03-2026-mlx-4bit\t/hub/cohere/snapshots/def\t1500000\tcohere_asr",
 }, "\n") .. "\n"
+-- Cactus keeps its weights outside the hub, so the menu finds them with a second
+-- scan: one .cact file and its size, no config and no model_type.
+local CACT_PATH = HOME .. "/.cache/cactus-needle/whistle/2.0.0/whistle.cact"
+local CACTUS_SCAN_OUT = CACT_PATH .. "\t16524\n"
 hs.execute = function(cmd)
   if cmd:find("HF_HUB", 1, true) then return SCAN, true, "exit", 0 end
+  if cmd:find("CACTUS_CACHE", 1, true) then return CACTUS_SCAN_OUT, true, "exit", 0 end
   return "", true, "exit", 0
 end
 
@@ -64,7 +70,7 @@ hs.timer.secondsSinceEpoch = function() return clock end
 local function servers()
   local out = {}
   for _, t in ipairs(tasks) do
-    if t.path == PARAKEET_PY or t.path == MLXA_PY then out[#out + 1] = t end
+    if t.path == PARAKEET_PY or t.path == MLXA_PY or t.path == CACTUS_PY then out[#out + 1] = t end
   end
   return out
 end
@@ -125,6 +131,49 @@ describe("dictation STT server", function()
     assert.equals(2, #s)
     assert.equals(MLXA_PY, s[2].path)
     assert.equals("lyzgeorge/cohere-transcribe-03-2026-mlx-4bit", s[2].env.STT_MODEL)
+  end)
+
+  -- The whole point of Whistle being in the menu: the same key, the same takes,
+  -- run through the 16.9 MB CPU model that a phone would have to use.
+  it("starts on the saved cactus model, under cactus-needle's python", function()
+    load("Cactus-Compute/whistle")
+    local s = servers()
+    assert.equals(1, #s)
+    assert.equals(CACTUS_PY, s[1].path)
+    assert.equals("cactus", s[1].env.STT_ENGINE)
+    assert.equals(CACT_PATH, s[1].env.STT_MODEL)
+  end)
+
+  it("offers Whistle in the menu and switches to it from a parakeet model", function()
+    load("mlx-community/parakeet-tdt-0.6b-v3")
+    local old = servers()[1]
+    clickModel("Whistle")
+    assert.is_true(old.terminated)
+    runPortKill()
+    local s = servers()
+    assert.equals(2, #s)
+    assert.equals(CACTUS_PY, s[2].path)
+    assert.equals("cactus", s[2].env.STT_ENGINE)
+    assert.equals(CACT_PATH, s[2].env.STT_MODEL)
+  end)
+
+  -- Cactus does not stream, so a take on it must go to /transcribe. Asking it to
+  -- /start is what the server answers 501 to.
+  it("transcribes a Whistle take through the warm server, never streaming it", function()
+    local d = load("Cactus-Compute/whistle")
+    d.toggle()
+    clock = clock + 3
+    d.toggle()
+    for _, t in ipairs(tasks) do
+      if t.path:find("ffmpeg", 1, true) then t.cb(0, "", "") end
+    end
+    local transcribes = 0
+    for _, p in ipairs(posts) do
+      if p.url:match("/transcribe$") then transcribes = transcribes + 1 end
+      assert.is_nil(p.url:match("/start$"), "a batch model was asked to stream")
+    end
+    assert.equals(1, transcribes)
+    assert.equals("bonjour", d.lastResult)
   end)
 
   it("transcribes an mlx-audio take through the warm server, with no cold process", function()
