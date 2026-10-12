@@ -4,6 +4,24 @@ My [Hammerspoon](https://www.hammerspoon.org/) setup — menu-bar tools for dict
 ambient noise, voice control, and a face-touch deterrent. This repo is the source of
 truth; `~/.hammerspoon` is a symlink to it.
 
+## Requirements
+
+- macOS on Apple silicon. Every hardcoded tool path points at `/opt/homebrew`,
+  so an Intel Mac needs those changed to `/usr/local`.
+- [Hammerspoon](https://www.hammerspoon.org/) itself: `brew install --cask hammerspoon`.
+- `ffmpeg`, which `apps/dictation` records through: `brew install ffmpeg`.
+- Python 3.13 or newer for the background servers some apps run. Each one
+  installs its own packages, listed in that app's section below.
+- Hammerspoon added to four lists in System Settings, under Privacy & Security:
+  Accessibility (hotkeys, synthetic keystrokes, the Teams mute fallback), Input
+  Monitoring (the Fn chords), Microphone (dictation), and Camera
+  (`apps/noseguard`). macOS asks on first use, and a denied prompt leaves that
+  app doing nothing with no error.
+
+The rest is per app and optional. `cloudflared` (`brew install cloudflared`),
+the LM Studio CLI, and the `dsh` launcher matter only to the app that drives
+them, and that app's tile says so when the binary is missing.
+
 ## Install
 
 ```sh
@@ -385,3 +403,8 @@ AVFoundation, so its tests need no venv and no camera:
 ```sh
 python3 -m unittest discover apps/noseguard/tests
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE). The Spoons under `Spoons/` are not in this repo
+and carry their own licenses.
