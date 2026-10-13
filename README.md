@@ -18,9 +18,10 @@ truth; `~/.hammerspoon` is a symlink to it.
   (`apps/noseguard`). macOS asks on first use, and a denied prompt leaves that
   app doing nothing with no error.
 
-The rest is per app and optional. `cloudflared` (`brew install cloudflared`),
-the LM Studio CLI, and the `dsh` launcher matter only to the app that drives
-them, and that app's tile says so when the binary is missing.
+The rest is per app and optional. The standalone [Tailscale](https://tailscale.com/download)
+client (the Mac App Store build has no Funnel and no CLI), the LM Studio CLI,
+and the `dsh` launcher matter only to the app that drives them, and that app's
+tile says so when the binary is missing.
 
 ## Install
 
@@ -42,7 +43,7 @@ Apps load themselves: anything under `apps/` with an `init.lua`, and any single
 | `apps/lmstudio` | Runs the local [LM Studio](https://lmstudio.ai) MLX server from the hub: a Server switch, a ✓ picker that switches the loaded model, and a memory panel showing what every model on disk costs and what the Mac has free. Switching unloads the resident model of the same kind first, so an embedding model keeps serving while the chat model changes. `--ttl` gives an idle model's memory back on its own. See [LM Studio](#lm-studio). |
 | `apps/dsh` | Runs the [DeepSeek Harness](https://github.com/deepseek-ai) web profile from the hub: a Server switch, Restart, and "Open the web UI" — which starts the server first when it is off, then opens the browser once it answers. See [DeepSeek Harness](#deepseek-harness). |
 | `apps/shokz_mute` | Keeps Microsoft Teams' mute in step with the headset's hardware mute button, read from the bluetoothd log. Uses the Teams local API when allowed, otherwise sends Cmd+Shift+M to Teams. Hub tile: sync switch, status, re-align, reconnect, backend picker. |
-| `apps/cloudflare_tunnel` | One `cloudflared` child, leased by whoever needs a public URL (`POST :8795/lease` with an owner, a mode and a local port; `GET /tunnel` to read it back; `POST /release` to let go). A lease is a heartbeat. It expires 120 s after the last request, so an owner that crashed gives its tunnel up by failing to ask again, and the child stops 60 s after the last lease so a caller that is restarting does not lose its URL. Callers watch the `generation` integer rather than the URL string to spot a new tunnel. A missing `cert.pem` or an unknown tunnel name stops the retries instead of burning CPU all night; anything else climbs 30 s / 2 m / 10 m, and a quota starts at 10 m. An owner can hand over a probe path and the token it expects back, and three misses in a row rebuild the tunnel. |
+| `apps/tailscale_funnel` | One public address for this Mac — `https://<machine>.<tailnet>.ts.net`, carried by [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) — leased by whoever needs it (`POST :8795/lease` with an owner, a mode and a local port; `GET /funnel` to read it back; `POST /release` to let go). The address is tied to the machine and the tailnet rather than to a process, so a daemon restart, a config reload and a reboot all leave it alone: a webhook is registered once and never again. The plugin never arms the funnel by itself — publishing a port to the internet is a menu click, and `tailscale funnel --bg` keeps it armed across reboots — and never turns one off when the last lease goes. `url` is null until the funnel really carries the leased port, so a caller is never handed an address nothing answers on; `hostname` is there as soon as the Mac is logged in, because that is the string a human pastes into a dashboard. Not installed, logged out, Funnel not granted in the tailnet policy, and a funnel pointed at the wrong port each say so in one line, rechecked every 30 s so a fix clears itself. An owner can hand over a probe path and the token it expects back; three misses in a row turn the tile red and an answer turns it green again. |
 
 ### One menu-bar button
 
@@ -381,6 +382,76 @@ every time the tile polls — the same pattern took Hammerspoon down from
 
 Nothing starts on a config reload. The Server switch and "Open the web UI" are
 the only things that turn it on.
+
+## Tailscale Funnel
+
+`apps/tailscale_funnel` owns this Mac's one public address and hands it out on
+a lease, so the thing that needs a webhook does not have to own a tunnel of its
+own. The address is `https://<machine>.<tailnet>.ts.net`, with a real
+Let's Encrypt certificate, carried by
+[Tailscale Funnel](https://tailscale.com/kb/1223/funnel). Nothing on this Mac
+listens on a public interface and no router port is opened.
+
+It replaced a Cloudflare quick tunnel, whose hostname changed on every start.
+That cost a webhook re-registration every morning, and the app-level callback
+URL in Meta's dashboard was dead from the first restart. A funnel hostname
+belongs to the machine and the tailnet, so it survives a daemon restart, a
+Hammerspoon reload and a reboot: the webhook is set once.
+
+### Setting it up, once
+
+1. Install the standalone client from
+   [tailscale.com/download](https://tailscale.com/download), or
+   `brew install tailscale` and run `tailscaled` yourself. **Not** the Mac App
+   Store build: it has no Funnel and no CLI.
+2. Sign in and create the tailnet.
+3. Pick the machine name and the tailnet name before asking for a certificate.
+   Both end up in public Certificate Transparency logs, so choose something
+   that says nothing about you. Tailscale offers a randomised tailnet name
+   (`yak-bebop.ts.net`) for exactly this.
+4. In the admin console, turn on MagicDNS and HTTPS certificates.
+5. In the tailnet policy file, grant the `funnel` node attribute to this
+   machine. Without it the tile says so in one line.
+6. Start whatever is going to answer on the local port.
+7. Open the tile and click **Turn the funnel on**. That runs
+   `tailscale funnel --bg --https=443 http://127.0.0.1:<leased port>`, which
+   writes the route into tailscaled, so it survives a reboot and this is the
+   last time you click it. Expect up to 10 minutes of DNS propagation the first
+   time.
+8. **Copy URL**, and paste the address wherever the webhook is registered.
+
+The plugin never arms a funnel by itself. Publishing a port to the public
+internet is a decision a human makes, and `--bg` means making it once.
+
+### What a caller does
+
+```sh
+curl -s 'http://127.0.0.1:8795/lease?owner=voice-agent&mode=funnel&port=8794&probe_path=/phone/ping&probe_expect=<token>'
+```
+
+Every 30 s, because a lease expires 120 s after the last one. The answer always
+carries every key:
+
+```json
+{"status":"ready","url":"https://mac.yak-bebop.ts.net",
+ "hostname":"mac.yak-bebop.ts.net","generation":1,"error":null,
+ "uptime_s":182,"mode":"funnel","port":8794,"funnel":true,
+ "leases":[{"owner":"voice-agent","expires_in":118}]}
+```
+
+`url` is null until the funnel really carries the leased port, so a caller is
+never handed an address nothing answers on — `error` says which of the five
+things is missing. `hostname` is there as soon as the Mac is logged in, because
+that is the string a human pastes into a dashboard, armed or not. Callers watch
+`generation` rather than the URL string; with Funnel it should not move for
+months, which is the point.
+
+`mode=off` is for a caller that already has a public address and only wants the
+plugin to stop deciding things on its behalf: the lease is recorded, the URL is
+shown on the tile, and no `tailscale` runs.
+
+Letting a lease expire tears nothing down. The address outliving its caller is
+the whole reason this plugin exists, so only the menu turns a funnel off.
 
 ## Tests
 

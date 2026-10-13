@@ -343,7 +343,8 @@ describe("every plugin", function()
   -- Symlinked in from ~/Github/pipecat-voice-agent, so on a clone of this repo
   -- alone it is not there. Skipped rather than failed, the same way lib/plugins
   -- skips it at load.
-  local PLUGINS = { "brown_noise", "tts", "lmstudio", "shokz_mute", "dictation" }
+  local PLUGINS = { "brown_noise", "tts", "lmstudio", "shokz_mute", "dictation",
+                    "tailscale_funnel" }
   if hs.fs.attributes and io.open("apps/voice_agent/init.lua") then
     PLUGINS[#PLUGINS + 1] = "voice_agent"
   end
