@@ -21,7 +21,9 @@ truth; `~/.hammerspoon` is a symlink to it.
 The rest is per app and optional. The standalone [Tailscale](https://tailscale.com/download)
 client (the Mac App Store build has no Funnel and no CLI), the LM Studio CLI,
 and the `dsh` launcher matter only to the app that drives them, and that app's
-tile says so when the binary is missing.
+tile says so when the binary is missing. `apps/tailscale_funnel` installs its
+own. Its Setup submenu carries the whole checklist, and it puts an Install
+Tailscale button in the menu when there is no client on the Mac.
 
 ## Install
 
@@ -43,7 +45,9 @@ Apps load themselves: anything under `apps/` with an `init.lua`, and any single
 | `apps/lmstudio` | Runs the local [LM Studio](https://lmstudio.ai) MLX server from the hub: a Server switch, a ✓ picker that switches the loaded model, and a memory panel showing what every model on disk costs and what the Mac has free. Switching unloads the resident model of the same kind first, so an embedding model keeps serving while the chat model changes. `--ttl` gives an idle model's memory back on its own. See [LM Studio](#lm-studio). |
 | `apps/dsh` | Runs the [DeepSeek Harness](https://github.com/deepseek-ai) web profile from the hub: a Server switch, Restart, and "Open the web UI" — which starts the server first when it is off, then opens the browser once it answers. See [DeepSeek Harness](#deepseek-harness). |
 | `apps/shokz_mute` | Keeps Microsoft Teams' mute in step with the headset's hardware mute button, read from the bluetoothd log. Uses the Teams local API when allowed, otherwise sends Cmd+Shift+M to Teams. Hub tile: sync switch, status, re-align, reconnect, backend picker. |
-| `apps/tailscale_funnel` | One public address for this Mac — `https://<machine>.<tailnet>.ts.net`, carried by [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) — leased by whoever needs it (`POST :8795/lease` with an owner, a mode and a local port; `GET /funnel` to read it back; `POST /release` to let go). The address is tied to the machine and the tailnet rather than to a process, so a daemon restart, a config reload and a reboot all leave it alone: a webhook is registered once and never again. The plugin never arms the funnel by itself — publishing a port to the internet is a menu click, and `tailscale funnel --bg` keeps it armed across reboots — and never turns one off when the last lease goes. `url` is null until the funnel really carries the leased port, so a caller is never handed an address nothing answers on; `hostname` is there as soon as the Mac is logged in, because that is the string a human pastes into a dashboard. Not installed, logged out, Funnel not granted in the tailnet policy, and a funnel pointed at the wrong port each say so in one line, rechecked every 30 s so a fix clears itself. An owner can hand over a probe path and the token it expects back; three misses in a row turn the tile red and an answer turns it green again. |
+| `apps/tailscale_funnel` | One public address for this Mac — `https://<machine>.<tailnet>.ts.net`, carried by [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) — leased by whoever needs it (`POST :8795/lease` with an owner, a mode and a local port; `GET /funnel` to read it back; `POST /release` to let go). The address is tied to the machine and the tailnet rather than to a process, so a daemon restart, a config reload and a reboot all leave it alone: a webhook is registered once and never again. The plugin never arms the funnel by itself — publishing a port to the internet is a menu click, and `tailscale funnel --bg` keeps it armed across reboots — and never turns one off when the last lease goes. `url` is null until the funnel really carries the leased port, so a caller is never handed an address nothing answers on; `hostname` is there as soon as the Mac is logged in, because that is the string a human pastes into a dashboard. Not installed, logged out, Funnel not granted in the tailnet policy, and a funnel pointed at the wrong port each say so in one line, rechecked every 30 s so a fix clears itself. A Setup submenu carries the whole checklist and does the four steps it can finish: it installs the standalone client with Homebrew, starts the sign-in and opens the page that command prints, opens the Tailscale app when tailscaled is not answering, and arms the funnel. Four more need a person (MagicDNS and HTTPS certificates, the funnel node attribute, the voice agent's `.env`, Meta's callback URL), and for each of those it opens the right page with the right text already on the clipboard and says in one line what is left. The next unfinished step gets a button of its own, so a Mac with no Tailscale on it opens the tile and finds Install Tailscale. An owner can hand over a probe path and the token it expects back; three misses in a row turn the tile red and an answer turns it green again. |
+| `apps/ovis_ocr` | Local OCR. A warm server (`apps/ovis_ocr/server.py`, port 8797) runs [OvisOCR2](https://huggingface.co/ATH-MaaS/OvisOCR2) through mlx-vlm and turns an image or a PDF into Markdown. LLM tools reach it through an MCP bridge (`apps/ovis_ocr/mcp.py`), scripts through `POST /ocr`, and a browser through a drop page at `http://127.0.0.1:8797/`. The tile reads a file into `<name>.ocr.md`, or reads the clipboard image. See [OCR](#ocr). |
+| `apps/wake_word` | Say "Codec" with no call open and the voice agent starts one. A second ffmpeg tails dictation's microphone, and every 1.5 s the last four seconds go to dictation's warm server on :8765 when they are loud enough to be speech. A transcript with the word in it (or "Kodak", which is what Parakeet often hears) posts `/start` to the voice agent's daemon, then hands it the sentence the word ended with on `/heard`. It stays quiet during a call, while dictation has the mic, for a few seconds after a call closes, and whenever `apps/voice_agent` is not loaded. On by default; the tile has the switch. Log: `/tmp/hs-voice-wake.log`. |
 
 ### One menu-bar button
 
@@ -398,27 +402,64 @@ URL in Meta's dashboard was dead from the first restart. A funnel hostname
 belongs to the machine and the tailnet, so it survives a daemon restart, a
 Hammerspoon reload and a reboot: the webhook is set once.
 
-### Setting it up, once
+### Setting it up, from the tile
 
-1. Install the standalone client from
-   [tailscale.com/download](https://tailscale.com/download), or
-   `brew install tailscale` and run `tailscaled` yourself. **Not** the Mac App
-   Store build: it has no Funnel and no CLI.
-2. Sign in and create the tailnet.
-3. Pick the machine name and the tailnet name before asking for a certificate.
-   Both end up in public Certificate Transparency logs, so choose something
-   that says nothing about you. Tailscale offers a randomised tailnet name
-   (`yak-bebop.ts.net`) for exactly this.
-4. In the admin console, turn on MagicDNS and HTTPS certificates.
-5. In the tailnet policy file, grant the `funnel` node attribute to this
-   machine. Without it the tile says so in one line.
-6. Start whatever is going to answer on the local port.
-7. Open the tile and click **Turn the funnel on**. That runs
+The menu carries the whole checklist under **Setup**, one row per
+prerequisite. Each row says who finishes it. A tick means done, a box means the
+plugin does this one, a person means only you can. The next unfinished step
+also gets a button of its own under the checklist, so a Mac with no Tailscale
+on it opens the tile and finds **Install Tailscale**.
+
+Four steps the plugin finishes on its own.
+
+1. **Install Tailscale.** It runs `brew install --cask --force tailscale-app`,
+   which is the standalone client. Not the Mac App Store build, which has no
+   Funnel and no CLI, and not the `tailscale` formula, which is a daemon you
+   have to run yourself. The cask is a `.pkg`, so Homebrew shells out to `sudo
+   installer`, and a menu bar plugin has no terminal for sudo to ask a password
+   on. When that happens the plugin hands the same line to a Terminal window
+   and keeps looking for the binary until it lands. With no Homebrew at all it
+   opens [tailscale.com/download](https://tailscale.com/download) and says the
+   installer is yours to run.
+2. **Sign in.** It runs `tailscale up` and reads the sign-in URL off the stream
+   while the command is still waiting, then opens that page. Choosing an
+   account and approving this Mac happen in the browser. A sign-in you walked
+   away from is reopened from `tailscale status` rather than restarted, because
+   a second `tailscale up` hands out a second URL and leaves the first one
+   dangling.
+3. **Open the Tailscale app**, when tailscaled is the thing not answering.
+4. **Turn the funnel on.** It runs
    `tailscale funnel --bg --https=443 http://127.0.0.1:<leased port>`, which
-   writes the route into tailscaled, so it survives a reboot and this is the
+   writes the route into tailscaled. That survives a reboot, so this is the
    last time you click it. Expect up to 10 minutes of DNS propagation the first
    time.
-8. **Copy URL**, and paste the address wherever the webhook is registered.
+
+Four steps are yours, because each one changes something that is not this Mac,
+behind a login this config does not have. For every one of them the plugin
+opens the right page with the right text already on the clipboard.
+
+- **MagicDNS and HTTPS certificates.** Tailnet-wide switches with no CLI behind
+  them. The row opens the admin console's DNS page. Pick the machine name and
+  the tailnet name before you ask for a certificate. Both end up in public
+  Certificate Transparency logs, so choose something that says nothing about
+  you, and take the randomised tailnet name (`yak-bebop.ts.net`) that Tailscale
+  offers for this.
+- **The `funnel` node attribute.** It lives in the tailnet policy file. The row
+  copies the snippet and opens the policy file editor. Pasting and saving it is
+  yours.
+- **The voice agent's settings.** The row copies `PHONE_TUNNEL=plugin` and the
+  rest, with this Mac's real address already in them. The plugin does not write
+  the other repo's `.env` for you. That file also holds the five `WHATSAPP_`
+  secrets only a human can fetch, so it is a file you are halfway through
+  editing.
+- **The callback URL in Meta's App Dashboard.** The row copies
+  `https://<machine>.<tailnet>.ts.net/whatsapp/webhook`. The plugin cannot see
+  the answer to this one, so it never ticks and is counted apart from the rest.
+
+All of it is reachable from a shell too. `funnelSetup()` prints the same
+checklist, `funnelInstall()` and `funnelSignIn()` run the first two steps, and
+`funnelState()`, `funnelCheck()`, `funnelOn()` and `funnelOff()` do what they
+say.
 
 The plugin never arms a funnel by itself. Publishing a port to the public
 internet is a decision a human makes, and `--bg` means making it once.
@@ -474,6 +515,51 @@ AVFoundation, so its tests need no venv and no camera:
 ```sh
 python3 -m unittest discover apps/noseguard/tests
 ```
+
+## OCR
+
+`apps/ovis_ocr` runs [OvisOCR2](https://huggingface.co/ATH-MaaS/OvisOCR2), a 0.8B
+document-parsing model, on the GPU through [mlx-vlm](https://github.com/Blaizzy/mlx-vlm).
+It reads one page image into Markdown in reading order: text, LaTeX formulas, and
+tables. The default build is `mlx-community/OvisOCR2-6bit`, which its model card
+measures as character-identical to bf16. A page takes 1 to 8 seconds on Apple silicon.
+
+```sh
+uv tool install mlx-vlm --with pypdfium2 --with pillow
+hf download mlx-community/OvisOCR2-6bit
+hs -c 'hs.reload()'
+```
+
+The server starts with Hammerspoon. It loads the model on the first request and
+drops it after 10 idle minutes, so it costs about 60 MB at rest and 1.8 GB while
+reading. An MCP client that finds the port closed has no way to open it, which is
+why the server does not wait to be asked. The Server switch persists for anyone who
+wants it off.
+
+```sh
+curl --data-binary @scan.pdf -H 'X-Filename: scan.pdf' localhost:8797/ocr   # Markdown
+curl --data-binary @page.png 'localhost:8797/ocr?pages=1-3&format=json'      # JSON
+curl -H 'Content-Type: application/json' -d '{"path":"/abs/scan.pdf","save":true}' \
+     localhost:8797/ocr                                    # also writes scan.ocr.md
+curl -s localhost:8797/health
+open 'hammerspoon://ocr?path=/abs/scan.pdf'
+```
+
+Tables come back from the model as HTML. A table without merged cells is
+rewritten as a Markdown pipe table; `tables=html` keeps the HTML. Pages of a
+multi-page PDF are marked `<!-- page N -->`. Figure placeholders are dropped
+unless `images=1` is passed.
+
+For LLM tools, `apps/ovis_ocr/mcp.py` is an MCP stdio server with one tool,
+`ocr_to_markdown(path, pages?, html_tables?)`. It uses the standard library only
+and forwards the path to the server, so it starts instantly:
+
+```sh
+claude mcp add --scope user ovis-ocr -- python3 ~/.hammerspoon/apps/ovis_ocr/mcp.py
+```
+
+Other clients take the same command in their MCP config. The tile's "Copy the MCP
+command" item puts it on the clipboard.
 
 ## License
 

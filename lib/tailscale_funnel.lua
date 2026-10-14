@@ -69,6 +69,34 @@ M.BINS = {
 }
 
 M.MODES = { funnel = true, off = true }
+-- Homebrew, where the plugin gets the client from when there is none. Apple
+-- silicon first, then Intel, which is the order every other plugin here looks
+-- in.
+M.BREWS = {
+  "/opt/homebrew/bin/brew",
+  "/usr/local/bin/brew",
+}
+
+-- The cask that carries the standalone app. Homebrew renamed it from
+-- `tailscale` to `tailscale-app` when the CLI-only formula took the shorter
+-- name, so a config written against the old name installs the wrong thing: the
+-- formula is tailscaled plus a CLI you have to run yourself, and the point of
+-- the standalone app is that it brings its own daemon.
+M.CASK = "tailscale-app"
+
+-- Where a human finishes what the plugin cannot. Each one is the deepest page
+-- that can be opened without knowing the tailnet's name.
+M.DOWNLOAD_URL  = "https://tailscale.com/download/macos"
+M.ADMIN_DNS_URL = "https://login.tailscale.com/admin/dns"
+M.ADMIN_ACL_URL = "https://login.tailscale.com/admin/acls/file"
+M.ADMIN_MACHINES_URL = "https://login.tailscale.com/admin/machines"
+M.META_APPS_URL = "https://developers.facebook.com/apps/"
+
+-- The path WhatsApp posts to, appended to the public address. Here rather than
+-- in the voice agent because this is the module that owns the address, and the
+-- string a human pastes into Meta's dashboard is the two joined.
+M.WEBHOOK_PATH = "/whatsapp/webhook"
+
 
 -- The node attribute a tailnet policy file must grant before Funnel will run.
 M.FUNNEL_CAP = "tailscale.com/cap/funnel"
@@ -85,6 +113,18 @@ M.BAD_PORT      = "Funnel only serves ports 443, 8443 and 10000"
 M.NO_STATUS     = "tailscale status did not answer"
 M.FUNNEL_OFF    = "the funnel is off — turn it on from this menu"
 M.PROBE_DEAD    = "the funnel stopped answering its own probe"
+-- The same vocabulary for the half of the job that is getting Tailscale onto
+-- this Mac at all. A line here is what the tile shows, so each one says who
+-- does what next rather than only what is wrong.
+M.NO_BREW          = "Homebrew is not here — the download page is open; running the installer is yours"
+M.NO_CASK          = "Homebrew has no " .. M.CASK .. " cask — install from tailscale.com/download"
+M.BREW_BUSY        = "Homebrew is busy with another install — try again in a minute"
+M.INSTALLING       = "installing Tailscale with Homebrew…"
+M.INSTALL_TERMINAL = "macOS wants your Mac password — finish the install in the Terminal window"
+M.INSTALL_LOST     = "Homebrew finished and there is still no tailscale CLI — install from tailscale.com/download"
+M.SIGNING_IN       = "waiting for you to finish signing in, in the browser"
+M.SIGNIN_OPENED    = "the sign-in page is open — choosing an account and approving this Mac is yours"
+
 
 -- ── JSON ───────────────────────────────────────────────────────────────────
 -- Written here rather than taken from hs.json so that route() stays pure: the
@@ -334,6 +374,55 @@ function M.offCommand()
   return { "funnel", "--https=" .. M.FUNNEL_PORT, "off" }
 end
 
+-- Signing in. `tailscale up` blocks until a human has authenticated in a
+-- browser and prints the URL to go to while it waits, which is why the plugin
+-- reads this one's output as it arrives instead of after it exits.
+function M.loginCommand() return { "up" } end
+
+-- Installing. `--force` because the plugin only offers this when there is no
+-- CLI on the Mac, so a Homebrew receipt that claims the cask is already there
+-- is stale — an app deleted out of /Applications leaves exactly that behind,
+-- and a plain `brew install` would answer "already installed" and change
+-- nothing.
+function M.installCommand(cask)
+  return { "install", "--cask", "--force", cask or M.CASK }
+end
+
+-- The same install as a shell line, for the one case that cannot be a child
+-- process: the cask is a .pkg, so Homebrew shells out to `sudo installer`, and
+-- a menu bar plugin has no terminal for sudo to ask a password on.
+function M.installLine(brew, cask)
+  return string.format("%s install --cask --force %s", brew or "brew", cask or M.CASK)
+end
+
+-- Homebrew's own switches for "nobody is watching". NONINTERACTIVE is what
+-- makes a missing password fail in a second instead of hanging on a prompt
+-- nothing can answer, and the plugin reads that failure and opens a Terminal.
+function M.brewEnv(home)
+  return {
+    HOME                    = home,
+    PATH                    = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    NONINTERACTIVE          = "1",
+    HOMEBREW_NO_AUTO_UPDATE = "1",
+    HOMEBREW_NO_ENV_HINTS   = "1",
+  }
+end
+
+-- AppleScript quoting: backslash and double quote, and nothing else, because
+-- an install line is a path and a cask name.
+local function asQuote(s)
+  return '"' .. tostring(s):gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
+end
+
+function M.terminalScript(line)
+  return table.concat({
+    'tell application "Terminal"',
+    "  activate",
+    "  do script " .. asQuote(line),
+    "end tell",
+  }, "\n")
+end
+
 -- The first of the candidate paths that is there, or nil. `exists` is a
 -- predicate so this stays pure and a spec can lay out any Mac it likes.
 function M.findBin(exists, candidates)
@@ -377,6 +466,10 @@ function M.parseStatus(text)
     hostname = dns,
     funnel   = M.funnelAllowed(text),
     online   = node.Online == true,
+    -- Set while a login is waiting to be finished in a browser. A sign-in the
+    -- human abandoned leaves it here, so the menu can offer the page again
+    -- without starting a second `tailscale up`.
+    authUrl  = type(doc.AuthURL) == "string" and doc.AuthURL ~= "" and doc.AuthURL or nil,
   }
 end
 
@@ -487,6 +580,55 @@ function M.classify(text)
   local reason = M.fatalReason(text)
   if reason then return "fatal", reason end
   return "ok", nil
+end
+
+-- The URL `tailscale up` prints while it waits. Taken off the stream rather
+-- than off the exit, because the command does not exit until the human has
+-- already been to the page — which they cannot do if nothing opened it.
+function M.authUrl(text)
+  if type(text) ~= "string" then return nil end
+  -- `tailscale status --json` hands over the bare URL, the stream hands over a
+  -- sentence with the URL in it, and both arrive here.
+  if text:match("^https://%S+$") then return text end
+  return text:match("https://login%.tailscale%.com/[%w%-%./_]+")
+      or text:match("https://[%w%-%.]+/a/%x+")
+end
+
+-- Homebrew could not ask for a password. Not a failure to report and stop on:
+-- it is the one fault the plugin recovers from by itself, by handing the same
+-- command to a Terminal window where sudo has somewhere to ask.
+local PASSWORD_LINES = {
+  "a terminal is required to read the password",
+  "no tty present",
+  "askpass",
+  "password is required",
+}
+
+function M.needsPassword(text)
+  if type(text) ~= "string" then return false end
+  local low = text:lower()
+  for _, line in ipairs(PASSWORD_LINES) do
+    if low:find(line, 1, true) then return true end
+  end
+  return false
+end
+
+-- What a Homebrew complaint means, in the same shape as fatalReason.
+local INSTALL_LINES = {
+  { "no available cask",       M.NO_CASK },
+  { "no casks found",          M.NO_CASK },
+  { "is unavailable",          M.NO_CASK },
+  { "another active homebrew", M.BREW_BUSY },
+  { "command not found",       M.NO_BREW },
+}
+
+function M.installProblem(text)
+  if type(text) ~= "string" then return nil end
+  local low = text:lower()
+  for _, pair in ipairs(INSTALL_LINES) do
+    if low:find(pair[1], 1, true) then return pair[2] end
+  end
+  return nil
 end
 
 -- Why this Mac cannot serve a funnel, from one `tailscale status --json`.
@@ -612,6 +754,11 @@ end
 --             a webhook at
 --   error     a human has to do something; the next tick says so again
 function M.computeStatus(s)
+  -- A job this plugin started and is still waiting on comes first. Installing
+  -- the client is exactly the moment `fatal` is true — there is no CLI yet —
+  -- and a red light under a progress line would be reporting the thing the
+  -- plugin is in the middle of fixing.
+  if s.busy and s.busy ~= "" then return "starting" end
   if s.fatal then return "error" end
   if s.mode == "off" then return "off" end
   if s.funnel and s.url and s.url ~= "" then return "ready" end
@@ -696,6 +843,249 @@ function M.route(target, method, path, body)
   return M.encode({ error = "no such endpoint: " .. route }) .. "\n", 404, JSON
 end
 
+-- ── Setting it up ──────────────────────────────────────────────────────────
+-- The checklist, and the only place that knows what order the prerequisites
+-- happen in. Pure, so the whole of "what is this Mac still missing" can be
+-- asserted on without a tailnet, a browser or a Homebrew.
+--
+-- Every step says who finishes it. Three of them the plugin does on its own;
+-- three of them it can only carry a human to the right page with the right
+-- text already on the clipboard; and one of them — Meta's dashboard — it
+-- cannot even see the answer to. Saying which is which is the point: a
+-- checklist that pretends it can do the last mile is worse than no checklist,
+-- because the human stops reading it.
+--
+--   done    checked, and the plugin can see it is
+--   todo    the plugin does this one; the row is a button
+--   manual  the plugin gets you to the page, you finish it
+--   wait    blocked on a step above it
+
+M.MARK = {
+  done   = "\u{2705}",
+  todo   = "\u{2B1C}",
+  manual = "\u{1F464}",
+  wait   = "\u{23F3}",
+}
+
+M.ACTION_LABEL = {
+  install       = "Install Tailscale",
+  openapp       = "Open the Tailscale app",
+  signin        = "Sign in to Tailscale",
+  check         = "Check now",
+  admindns      = "Open DNS settings",
+  adminmachines = "Open the machines page",
+  adminacl      = "Copy the snippet and open the policy file",
+  copyenv       = "Copy the voice agent's settings",
+  arm           = "Turn the funnel on",
+  copyhook      = "Copy the webhook URL",
+}
+
+-- Two actions the top-level menu already carries a row for. Hoisting the next
+-- step to the top is what makes the one thing to do next a button; doing it
+-- for these two would put the same row in the menu twice.
+M.MENU_ACTIONS = { arm = true, check = true }
+
+-- What a human pastes, built here because this is the module that owns the
+-- address and the port.
+function M.webhookUrl(hostname)
+  local base = M.hostUrl(hostname)
+  return base and (base .. M.WEBHOOK_PATH) or nil
+end
+
+-- The tailnet policy file grants Funnel per node. This is the smallest thing
+-- that works, straight out of Tailscale's own docs, and it goes on the
+-- clipboard so the admin console is a paste rather than a transcription.
+M.POLICY_SNIPPET = table.concat({
+  '"nodeAttrs": [',
+  "  {",
+  '    "target": ["autogroup:member"],',
+  '    "attr":   ["funnel"]',
+  "  }",
+  "],",
+}, "\n")
+
+-- The voice agent's four settings, with this Mac's real address already in
+-- them. The plugin does not write another repo's .env for it: that file also
+-- holds the five WHATSAPP_ secrets only a human can fetch, so a plugin editing
+-- it behind their back would be editing a file they are halfway through.
+function M.envLines(hostname)
+  return table.concat({
+    "PHONE_TUNNEL=plugin",
+    "PHONE_TUNNEL_PLUGIN=http://127.0.0.1:" .. M.PORT,
+    "PHONE_PUBLIC_URL=" .. (M.hostUrl(hostname) or "https://<machine>.<tailnet>.ts.net"),
+    "WHATSAPP_ENABLED=1",
+  }, "\n") .. "\n"
+end
+
+-- `env` is what apps/tailscale_funnel knows right now: bin, brew, the decoded
+-- status, the leased port, whether the funnel is up, and whether a job this
+-- plugin started is still running.
+function M.setupSteps(env)
+  env = env or {}
+  local st       = env.status
+  local bin      = env.bin ~= nil
+  local back     = st and st.backend or nil
+  local signedIn = back == "Running"
+  local host     = env.hostname or (st and st.hostname) or nil
+
+  local steps = {}
+  local function add(step) steps[#steps + 1] = step; return step end
+
+  -- 1. The client. The one step that has to come first, and the one the whole
+  --    tile used to say nothing useful about.
+  local install = { key = "install", label = "Tailscale installed" }
+  if bin then
+    install.state = "done"
+  elseif env.installing then
+    install.state, install.detail = "wait", env.busy or M.INSTALLING
+  elseif env.brew then
+    install.state, install.action = "todo", "install"
+    install.detail = "the plug-in installs the standalone app with Homebrew; macOS asks for your Mac password"
+  else
+    install.state, install.action = "manual", "install"
+    install.detail = "Homebrew is not here — the plug-in opens tailscale.com/download; running the installer is yours"
+  end
+  add(install)
+
+  -- 2. Signing in. The plugin starts it and opens the page; which account to
+  --    use, and the password for it, are not things a config can hold.
+  local signin = { key = "signin", label = "Signed in to a tailnet" }
+  if not bin then
+    signin.state, signin.detail = "wait", "waiting for the client"
+  elseif env.signingIn then
+    signin.state, signin.detail = "wait", env.busy or M.SIGNING_IN
+  elseif signedIn then
+    signin.state = "done"
+  elseif back == "NeedsMachineAuth" then
+    signin.state, signin.action = "manual", "adminmachines"
+    signin.detail = "this Mac is waiting to be approved — a tailnet admin approves it in the admin console"
+  elseif back == "Starting" then
+    signin.state, signin.detail = "wait", "tailscaled is starting"
+  elseif back == "NoState" then
+    signin.state, signin.action = "todo", "openapp"
+    signin.detail = "tailscaled is not answering — the plug-in opens the Tailscale app"
+  elseif st == nil then
+    signin.state, signin.action = "wait", "check"
+    signin.detail = "nothing has been read from the CLI yet"
+  else
+    signin.state, signin.action = "todo", "signin"
+    signin.detail = (st.authUrl and "a sign-in is half-finished — the plug-in reopens the page"
+                                 or "the plug-in opens the sign-in page")
+                    .. "; choosing an account and approving this Mac is yours"
+  end
+  add(signin)
+
+  -- 3. MagicDNS and HTTPS certificates. Tailnet-wide switches in the admin
+  --    console: there is no CLI for either, and there could not be, because
+  --    they are decisions about the tailnet and not about this Mac.
+  local dns = { key = "dns", label = "MagicDNS and HTTPS certificates on" }
+  if not signedIn then
+    dns.state, dns.detail = "wait", "waiting for this Mac to be signed in"
+  elseif host then
+    dns.state = "done"
+  else
+    dns.state, dns.action = "manual", "admindns"
+    dns.detail = "turn both on in the admin console — a tailnet setting is not one a Mac can change for itself"
+  end
+  add(dns)
+
+  -- 4. The funnel node attribute. Same shape: the policy file is the tailnet's,
+  --    so the plugin brings the snippet to it rather than the other way round.
+  local cap = { key = "funnel", label = "Funnel allowed in this tailnet" }
+  if not signedIn then
+    cap.state, cap.detail = "wait", "waiting for this Mac to be signed in"
+  elseif st.funnel == true then
+    cap.state = "done"
+  elseif st.funnel == false then
+    cap.state, cap.action = "manual", "adminacl"
+    cap.detail = "the plug-in copies the policy snippet and opens the policy file — pasting and saving it is yours"
+  else
+    cap.state, cap.action = "wait", "adminacl"
+    cap.detail = "this client does not report it; turning the funnel on will say"
+  end
+  add(cap)
+
+  -- 5. Something to carry. A funnel in front of a port nobody serves is an
+  --    address that answers 502, so this is a real prerequisite and not a
+  --    detail of the voice agent's.
+  local lease = { key = "lease", label = "A local port to carry" }
+  if env.port then
+    lease.state = "done"
+  else
+    lease.state, lease.action = "manual", "copyenv"
+    lease.detail = "nothing has leased the funnel — the plug-in copies the voice agent's settings; starting the daemon is yours"
+  end
+  add(lease)
+
+  -- 6. Arming it. One click, once, and deliberately still a click: publishing
+  --    a port to the public internet is not a decision a checklist makes.
+  local arm = { key = "arm", label = "The funnel is on" }
+  if env.funnel and env.url then
+    arm.state = "done"
+  elseif not (bin and signedIn and host and env.port) then
+    arm.state, arm.detail = "wait", "waiting for the steps above"
+  else
+    arm.state, arm.action = "todo", "arm"
+    arm.detail = "one click, once — the route is written into tailscaled and survives a reboot"
+  end
+  add(arm)
+
+  -- 7. Meta. Behind a login this plugin does not have, on a dashboard it
+  --    cannot read, so it is never ticked and never pretends to be.
+  local meta = { key = "meta", label = "Meta's callback URL set", checkable = false }
+  if not host then
+    meta.state, meta.detail = "wait", "waiting for this Mac's .ts.net name"
+  else
+    meta.state, meta.action = "manual", "copyhook"
+    meta.detail = "the plug-in copies " .. M.webhookUrl(host) ..
+                  " — setting it in Meta's App Dashboard is yours, and is the one step the plug-in cannot check"
+  end
+  add(meta)
+
+  return steps
+end
+
+function M.stepLine(step)
+  step = step or {}
+  return (M.MARK[step.state] or M.MARK.wait) .. "  " .. tostring(step.label or "")
+end
+
+-- The row the submenu hangs off. The steps the plugin cannot check are counted
+-- separately rather than held against the total, because a checklist that can
+-- never reach the end is one nobody finishes.
+function M.setupLine(steps)
+  local done, total, blind = 0, 0, 0
+  for _, step in ipairs(steps or {}) do
+    if step.checkable == false then
+      blind = blind + 1
+    else
+      total = total + 1
+      if step.state == "done" then done = done + 1 end
+    end
+  end
+  local line = string.format("Setup — %d of %d done", done, total)
+  if blind > 0 then line = line .. string.format(", %d only you can confirm", blind) end
+  return line
+end
+
+-- The one thing to do next, which is what the top-level menu hoists to a
+-- button so the answer to "what now" is a click and not a read.
+function M.nextStep(steps)
+  for _, step in ipairs(steps or {}) do
+    if step.state ~= "done" then return step end
+  end
+  return nil
+end
+
+-- Is every step the plugin can see finished? The ones it cannot check do not
+-- count against it, for the same reason they do not count in setupLine.
+function M.setupDone(steps)
+  for _, step in ipairs(steps or {}) do
+    if step.checkable ~= false and step.state ~= "done" then return false end
+  end
+  return true
+end
+
 -- ── Tile ───────────────────────────────────────────────────────────────────
 -- The tile's glyph is a status light. Green means the funnel is carrying the
 -- leased port; red means it is not, which covers both "off" and "broken";
@@ -730,6 +1120,9 @@ end
 function M.statusLine(s, now)
   local status = M.computeStatus(s)
   local head = M.statusDot(s) .. "  " .. M.statusLabel(s)
+  -- Same reason as computeStatus: what the plugin is doing now beats what was
+  -- wrong a second ago, and it is the line that will change on its own.
+  if s.busy and s.busy ~= "" then return head .. " · " .. s.busy end
   if status == "ready" then
     return string.format("%s · up %s · generation %d", head,
                          M.humanDuration(M.uptime(s, now)), s.generation or 0)
@@ -783,7 +1176,7 @@ end
 function M.tileKey(s)
   s = s or {}
   return table.concat({ M.computeStatus(s), s.url or "-", s.hostname or "-",
-                        tostring(s.generation or 0), s.err or "-" }, "|")
+                        tostring(s.generation or 0), s.err or "-", s.busy or "-" }, "|")
 end
 
 -- First line only: lib/menuhub takes it as the tile's status and strips the
@@ -792,6 +1185,7 @@ end
 -- `ready` leads with a word rather than with "https".
 function M.tooltip(s, now)
   local status = M.computeStatus(s)
+  if s.busy and s.busy ~= "" then return "Tailscale Funnel: " .. s.busy end
   if status == "error" then
     return "Tailscale Funnel: " .. (s.err or "error")
   end

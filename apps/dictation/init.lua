@@ -1,6 +1,14 @@
--- Dictation: hold Fn = record, release = transcribe & type at cursor.
+-- Dictation: hold Fn = record, and the words appear at the cursor as you speak.
 -- Pipeline: ffmpeg → warm STT server (the selected model) → clipboard →
 -- apps/keystroke_typer, which types the transcript one keystroke at a time.
+--
+-- On a parakeet model the server re-transcribes the growing audio once a second
+-- and reports the prefix that has settled (dictate/). This module
+-- types that prefix while the take is still running, and reconciles whatever is
+-- left when Fn comes up. Measured on a ten-take corpus, 94% of the transcript
+-- is already in the document at release, and nothing typed live ever had to be
+-- taken back. Any other model, or the LM Studio clean-up switched on, and the
+-- whole transcript still types on release the way it always did.
 --
 -- Everything this plugin builds belongs to its context, and two of those things
 -- are why it matters here more than anywhere else in apps/. The Fn tap sits in
@@ -20,6 +28,8 @@ local tfilter     = require("lib.transcript_filter")
 local llm         = require("lib.llm_cleanup")
 local takes       = require("lib.dictation_takes")
 local tapGuard    = require("lib.tap_guard")
+local dstream     = require("lib.dictate_stream")
+local synthetic   = require("lib.synthetic")
 local EARCONS_CFG = configFile.EARCONS
 
 local ctx = require("lib.context").new("Dictation")
@@ -49,6 +59,10 @@ local STT_BASE    = "http://127.0.0.1:" .. STT_PORT
 local STT_URL     = STT_BASE .. "/transcribe"  -- batch: every mlx-audio take, parakeet fallback
 local MIN_DURATION = 0.6            -- avfoundation needs ~300ms to start; below this = no audio
 local MAX_RECORD   = 90             -- watchdog: auto-stop if a key/button release is ever missed
+-- How often the live transcript is asked for. Faster than the server's own pass
+-- interval on purpose: a poll is a cheap GET, and this is what decides how soon
+-- a settled word reaches the keyboard.
+local LIVE_POLL   = 0.25
 
 local M = { recording = false, ffmpegTask = nil, fnDown = false, startedAt = 0, lastResult = nil, cancelled = false, ducked = false, preDuckVolume = nil }
 -- Where a take is recorded and kept. On M so a spec can point them at a
@@ -60,6 +74,18 @@ M.micState = "idle"
 M.llmCleanup = hs.settings.get("dictate.llmCleanup") == true
 -- Pins mlx-audio models to one language ("fr"); nil lets each model decide.
 M.language = hs.settings.get("dictate.language")
+-- Type the words as they settle, instead of the whole transcript on release.
+-- Off is the old behaviour, and is what every non-parakeet model gets anyway.
+M.liveTyping = hs.settings.get("dictate.liveTyping") ~= false
+-- Set from /health: does the warm server have the commit rule loaded?
+M.serverDictate = false
+
+-- This take's live typing. `typed` is what has gone to the keyboard, which is
+-- the only thing the reconciliation at the end can trust; `stable` and `text`
+-- are the server's last answer. `stopped` holds the reason committing was
+-- abandoned — a contradiction, the focus moving, the user typing — after which
+-- the preview keeps running and nothing more is typed until the take ends.
+M.live = { on = false, typed = "", stable = "", text = "", windowId = nil, stopped = nil }
 
 -- File logger so we can debug dictation without staring at the HS console.
 local LOG = "/tmp/hs-dictate.log"
@@ -460,18 +486,22 @@ local COLOR_PROC = { red = 1.0, green = 0.75, blue = 0.20, alpha = 1 }
 local COLOR_SETTLED = { white = 0.92, alpha = 1 }            -- earlier words (settling)
 local COLOR_DRAFT   = { red = 1.0, green = 0.78, blue = 0.25, alpha = 1 }  -- volatile tail
 
--- Live dictation preview. Every word stays provisional until you release (this
--- model commits nothing mid-stream), so the trailing word — the one most likely
--- to still change — is shown amber over the dimmer, more-settled text.
+-- Live dictation preview. Amber means "not in your document yet".
+--
+-- With live typing on, the split is where the committed text ends: everything
+-- dim is already at the cursor, everything amber is still only a hypothesis.
+-- With it off, nothing is in the document until release, and the useful thing
+-- to point at is the trailing word — the one most likely to still change.
 local PREVIEW_SIZE = 28        -- font point size for the live text
 local PREVIEW_PAD  = 24        -- inner horizontal/vertical padding
 local PREVIEW_TOP  = 50        -- text top offset (leaves room for the rec dot)
 
-local function previewStyled(text)
+-- `committed` is a byte count into `text`, or nil when nothing is being typed.
+local function previewStyled(text, committed)
   local ok, st = pcall(function()
     local s = hs.styledtext.new(text, { font = { size = PREVIEW_SIZE }, color = COLOR_SETTLED })
-    local i = text:find("%S+$")   -- byte index where the trailing word starts
-    if i then s = s:setStyle({ color = COLOR_DRAFT }, i, #text) end
+    local from = committed and (committed + 1) or text:find("%S+$")
+    if from and from <= #text then s = s:setStyle({ color = COLOR_DRAFT }, from, #text) end
     return s
   end)
   if ok then return st else return text end
@@ -479,7 +509,7 @@ end
 
 -- The panel auto-sizes to the text and is anchored at the bottom, so it grows
 -- upward as you speak. Past a screen-height cap it shows the tail (newest words).
-local function showLivePreview(text)
+local function showLivePreview(text, committed)
   local f = hs.screen.mainScreen():frame()
   local w = math.min(1000, math.floor(f.w * 0.72))
   local innerW = w - 2 * PREVIEW_PAD
@@ -492,7 +522,14 @@ local function showLivePreview(text)
   if shown then
     -- Keep only the tail that fits, so the words being spoken stay on screen.
     local maxChars = maxLines * cpl
-    if #shown > maxChars then shown = "…" .. shown:sub(#shown - maxChars + 2) end
+    if #shown > maxChars then
+      local cut = #shown - maxChars + 2        -- bytes dropped off the front
+      shown = "…" .. shown:sub(cut + 1)
+      -- The committed span moves with the text, and "…" is three bytes of its
+      -- own. A split that falls off the front means every word on screen is
+      -- already typed.
+      if committed then committed = math.max(0, committed - cut + 3) end
+    end
   end
 
   -- Count wrapped lines for the (possibly trimmed) text to size the panel.
@@ -526,7 +563,8 @@ local function showLivePreview(text)
       fillColor = (M.micState == "starting") and COLOR_PROC or COLOR_REC,
       center = { x = 30, y = 30 }, radius = 9 },
     { type = "text",
-      text = shown and previewStyled(shown) or ((M.micState == "starting") and "Starting…" or "Listening…"),
+      text = shown and previewStyled(shown, committed)
+             or ((M.micState == "starting") and "Starting…" or "Listening…"),
       textColor = COLOR_SETTLED, textSize = PREVIEW_SIZE,
       frame = { x = PREVIEW_PAD, y = PREVIEW_TOP, w = innerW, h = h - PREVIEW_TOP - 8 } }
   )
@@ -594,6 +632,151 @@ local function deliver(text)
   -- replace: a run still going belongs to the previous take, and the newest one
   -- is what the user is waiting for. quiet: the HUD already said its piece.
   typer.type(text, { replace = true, quiet = true })
+end
+
+-- ── Typing while you speak ──────────────────────────────────────────────────
+-- The server hands back two strings on every poll: `text`, the current
+-- hypothesis, and `stable`, the prefix of it that has settled (margin from the
+-- edge of the audio, agreement with the previous pass, confidence floor — the
+-- rule and its measurements are in dictate/commit.py). `stable`
+-- only ever grows, so the work here is to type what is new since last time.
+--
+-- Three things make this module stop committing mid-take, and all three end the
+-- same way: keep showing the preview, type nothing more, and put it right once
+-- at the end. Backspaces land in a document we cannot read, so the design never
+-- guesses — it gives up and reconciles.
+
+local function typerPlugin()
+  -- Asked of the registry rather than require()d, for the same reason deliver()
+  -- does: a plain require would resurrect a plugin switched off in the hub.
+  local t = plugins.loaded["keystroke_typer"]
+  if type(t) == "table" and type(t.append) == "function" then return t end
+  return nil
+end
+
+-- Called from the chord tap as well, which is why it hangs off M.
+function M.stopCommitting(why)
+  if not M.live.on or M.live.stopped then return end
+  M.live.stopped = why
+  logf("[live] stopped committing after %d characters: %s", #M.live.typed, why)
+end
+
+local function focusedWindowId()
+  local ok, id = pcall(function()
+    local w = hs.window and hs.window.focusedWindow and hs.window.focusedWindow()
+    return w and w:id() or nil
+  end)
+  if ok then return id end
+  return nil
+end
+
+-- Hand the typer whatever settled since the last poll.
+local function commitLive()
+  if not M.live.on or M.live.stopped then return end
+  local delta = dstream.delta(M.live.typed, M.live.stable)
+  if delta == nil then
+    return M.stopCommitting("the transcript contradicted itself")
+  end
+  if delta == "" then return end
+  local typer = typerPlugin()
+  if not typer then
+    return M.stopCommitting("the keystroke typer is not loaded")
+  end
+  -- Where the first word landed is where the rest belong. Without this, an app
+  -- switch at second eight splits a sentence across two windows.
+  local id = focusedWindowId() or false
+  if M.live.windowId == nil then
+    M.live.windowId = id
+  elseif id ~= M.live.windowId then
+    return M.stopCommitting("focus moved to another window")
+  end
+  typer.append(delta)
+  M.live.typed = M.live.typed .. delta
+end
+
+-- Open a live session on the server and start polling it. A /dictate/start that
+-- misses is not fatal: the polls come back empty, nothing is typed, and the
+-- /dictate/finish at the end falls through to the batch path.
+local function startLive()
+  M.live = { on = true, typed = "", stable = "", text = "", windowId = nil, stopped = nil }
+  local typer = typerPlugin()
+  -- Held for the length of the take, so the words still being spoken are typed
+  -- by the same loop at the same pace instead of a new run per phrase.
+  if typer then typer.hold(true) end
+  hs.http.asyncPost(STT_BASE .. "/dictate/start", M.paths.RAW, {}, function(status, body, _)
+    if status ~= 200 then
+      logf("[live] /dictate/start status=%s (%s) — this take types on release",
+           tostring(status), tostring(body))
+    end
+  end)
+  M.previewTimer, M.previewPoll = ctx:timer(LIVE_POLL, function()
+    hs.http.asyncGet(STT_BASE .. "/dictate/poll", nil, function(status, body, _)
+      if not M.recording or not M.live.on or status ~= 200 then return end
+      local ok, snap = pcall(hs.json.decode, body or "")
+      if not ok or type(snap) ~= "table" then return end
+      M.live.text   = snap.text or ""
+      M.live.stable = snap.stable or ""
+      commitLive()
+      if M.live.text ~= "" then
+        M.lastPartial = M.live.text
+        showLivePreview(M.live.text, dstream.committedLen(M.live.text, M.live.typed))
+      end
+    end)
+  end)
+end
+
+-- Let the typer finish what it holds and close the run.
+local function releaseLive()
+  M.live.on = false
+  local typer = typerPlugin()
+  if typer then typer.hold(false) end
+end
+
+-- Fn+C, or a tap too short to transcribe. What was typed is taken back when
+-- that is a handful of characters, and left alone when it is not: a long blind
+-- deletion lands wherever focus is now, which in vim normal mode is destructive.
+local function cancelLive()
+  hs.http.asyncPost(STT_BASE .. "/dictate/cancel", "", {}, function() end)
+  local typer = typerPlugin()
+  if typer and M.live.typed ~= "" then
+    local n = #typer.clusters(M.live.typed)
+    if n <= dstream.MAX_BACKSPACES then
+      typer.append("", { backspaces = n })
+      logf("[live] cancelled — took back %d characters", n)
+    else
+      logf("[live] cancelled — %d characters stay where they are", n)
+      notify(string.format("cancelled · %d typed characters left in place", n), 2.4)
+    end
+  end
+  releaseLive()
+end
+
+-- The take is over and `text` is the whole transcript. Everything typed live
+-- was measured to be a prefix of it; the other two outcomes are handled anyway,
+-- because "measured on ten takes" is not "cannot happen".
+local function deliverLive(text)
+  hs.pasteboard.setContents(text)
+  local typed, typer = M.live.typed, typerPlugin()
+  M.live.on = false
+  if not typer then
+    logf("[live] typer gone before the end of the take — transcript is on the clipboard")
+    notify("copied — ⌘V to paste", 1.8)
+    return
+  end
+  local plan = dstream.reconcile(typed, text, { clusters = typer.clusters })
+  if plan.action == "append" then
+    typer.append(plan.text)
+  elseif plan.action == "fix" then
+    typer.append(plan.text, { backspaces = plan.backspaces })
+    logf("[live] replaced a %d-character tail", plan.backspaces)
+  elseif plan.action == "clipboard" then
+    logf("[live] %d characters typed live disagree with the transcript; not deleting blind",
+         plan.backspaces)
+    notify("transcript differs from what was typed — ⌘V for the full text", 2.8)
+  end
+  logf("[live] %d of %d characters were already typed at release (%s%s)",
+       #typed, #text, plan.action, M.live.stopped and (", stopped: " .. M.live.stopped) or "")
+  typer.hold(false)
 end
 
 -- Duck system audio while the mic is open; unduckNoise puts it back. One duck,
@@ -669,7 +852,9 @@ local function finishTranscript(out)
   setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false)
   unduckNoise()
   logf("[dictate] result: %s", tostring(out))
+  local live = M.live.on
   if not out or out == "" then
+    if live then releaseLive() end
     notify("no transcription (see console)", 1.6)
     return
   end
@@ -678,11 +863,17 @@ local function finishTranscript(out)
   -- silence (lib/transcript_filter).
   local text = tfilter.clean(out, { stockLines = M.engine ~= "parakeet" })
   if text == "" then
+    if live then releaseLive() end
     logf("[dictate] dropped as a silence hallucination: %q", out)
     notify("nothing heard", 1.4)
     return
   end
   M.lastResult = text
+  -- The live path has its own delivery: most of this text is already on screen,
+  -- so it appends the rest instead of typing the whole thing again. LM Studio
+  -- clean-up is off whenever live typing is on — a wholesale rewrite has no
+  -- prefix to have committed against — so the two never meet.
+  if live then deliverLive(text); return end
   if not M.llmCleanup then deliver(text); return end
   polish(text, function(final)
     M.lastResult = final
@@ -730,6 +921,27 @@ local function transcribe()
         finishTranscript(nil)
       end
     end)
+end
+
+-- Live path: drain the last audio, run one final pass over the whole take, and
+-- put right whatever is still wrong. A miss here falls back to the batch path,
+-- which re-transcribes the finished WAV from scratch.
+local function finishLive()
+  hs.http.asyncPost(STT_BASE .. "/dictate/finish", "", {}, function(status, body, _)
+    local res
+    if status == 200 and body and body ~= "" then
+      local ok, dec = pcall(hs.json.decode, body)
+      if ok and type(dec) == "table" and type(dec.text) == "string" then res = dec end
+    end
+    if not res then
+      logf("[live] /dictate/finish miss (status=%s): %s", tostring(status), tostring(body))
+      releaseLive()
+      transcribe()
+      return
+    end
+    if res.contradicted then logf("[live] the server stopped committing mid-take") end
+    finishTranscript(res.text)
+  end)
 end
 
 -- ── Recent takes ────────────────────────────────────────────────────────────
@@ -833,7 +1045,16 @@ local function startRecording()
     end
   end)
   M.watchdog = stopWatchdog
-  if M.stream then
+  -- Three ways a take can go, decided here and not revisited: type as the words
+  -- settle, show a preview and type on release, or neither.
+  local liveOk, why = dstream.available({
+    on = M.liveTyping, engine = M.engine,
+    dictate = M.serverDictate, llmCleanup = M.llmCleanup,
+  })
+  if liveOk then
+    startLive()
+  elseif M.stream then
+    if M.liveTyping then logf("[live] not this take: %s", tostring(why)) end
     -- Begin streaming this recording into the warm model as it's captured.
     hs.http.asyncPost(STT_BASE .. "/start", M.paths.RAW, {}, function(status, _, _)
       if status ~= 200 then logf("[dictate] /start status=%s (will batch-fallback)", tostring(status)) end
@@ -875,17 +1096,19 @@ function stopRecording()
   if M.cancelled then
     logf("[dictate] cancelled by chord")
     M.cancelled = false; setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false); unduckNoise()
-    if M.stream then cancelStream() end
+    if M.live.on then cancelLive() elseif M.stream then cancelStream() end
     return
   end
   if dur < MIN_DURATION then
     logf("[dictate] tap too short (%.2fs), ignored", dur)
     setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false); unduckNoise()
-    if M.stream then cancelStream() end
+    if M.live.on then cancelLive() elseif M.stream then cancelStream() end
     return
   end
   setIcon("…"); showHUD("Transcribing…", COLOR_PROC)
-  if M.stream then
+  if M.live.on then
+    finishLive()
+  elseif M.stream then
     -- ffmpeg already got SIGTERM; tell the server to drain the last audio and
     -- return the transcript. The model has consumed this clip live, so only the
     -- final <1s remains. Fall back to batch (server, then CLI) on miss.
@@ -931,6 +1154,45 @@ local function launchServer()
   logf("[server] launching warm %s server (%s)", m.engine, m.name or m.id or "?")
 end
 
+-- Ask the server what it can do, until it answers. A server that has just been
+-- launched is still loading its model, and the first take can easily come
+-- before it is ready — so this retries rather than deciding on one refusal that
+-- live typing is unavailable for the rest of the session.
+local HEALTH_POLL, HEALTH_TRIES = 1.0, 60
+
+local function stopProbe()
+  if M.healthRelease then M.healthRelease() end
+  M.healthTimer, M.healthRelease = nil, nil
+end
+
+local function probeServer()
+  stopProbe()
+  M.serverDictate = false
+  local tries = 0
+  M.healthTimer, M.healthRelease = ctx:timer(HEALTH_POLL, function()
+    tries = tries + 1
+    if tries > HEALTH_TRIES then
+      logf("[live] server never reported ready; typing on release")
+      stopProbe()
+      return
+    end
+    hs.http.asyncGet(STT_BASE .. "/health", nil, function(status, body, _)
+      if status ~= 200 then return end
+      local ok, h = pcall(hs.json.decode, body or "")
+      if not ok or type(h) ~= "table" or not h.ready then return end
+      stopProbe()
+      M.serverDictate = h.dictate == true
+      if M.serverDictate then
+        logf("[live] server offers live dictation (margin=%ss confidence=%s interval=%ss)",
+             tostring(h.dictate_margin_s), tostring(h.dictate_confidence),
+             tostring(h.dictate_interval_s))
+      else
+        logf("[live] server has no live dictation: %s", tostring(h.dictate_why))
+      end
+    end)
+  end)
+end
+
 -- (Re)launch the warm server on M.serverModel. Kills whatever holds :8765 and
 -- waits for the port to free before launching, so the previous model's memory
 -- is released before the next one loads: never two models resident at once.
@@ -941,7 +1203,7 @@ local function restartServer()
   if M.serverRelease then M.serverRelease() end
   M.serverTask, M.serverRelease = nil, nil
   local k, done
-  k, done = ctx:task("/bin/sh", function() done(); launchServer() end,
+  k, done = ctx:task("/bin/sh", function() done(); launchServer(); probeServer() end,
     {"-c", sttServer.freePortCommand(STT_PORT)})
   k:start()
 end
@@ -1018,6 +1280,12 @@ local function setLlmCleanup(on)
   logf("[llm] clean-up %s", M.llmCleanup and "on" or "off")
 end
 
+local function setLiveTyping(on)
+  M.liveTyping = on and true or false
+  hs.settings.set("dictate.liveTyping", M.liveTyping)
+  logf("[live] typing while you speak %s", M.liveTyping and "on" or "off")
+end
+
 -- Run a kept take through whatever model is loaded now, and put the result on
 -- the clipboard rather than typing it: the cursor has moved on since.
 local function retranscribe(name)
@@ -1089,6 +1357,15 @@ local function buildMenu()
       fn = function() setLanguage(l.code) end }
   end
   items[#items + 1] = { title = "Language (batch models): " .. (M.language or "auto"), menu = langItems }
+  -- Only parakeet carries the token timestamps the commit rule needs, and only
+  -- a server with dictate/ loaded can apply it. The row says which
+  -- of those is missing rather than going quiet.
+  local liveOk, liveWhy = dstream.available({
+    on = true, engine = M.engine, dictate = M.serverDictate, llmCleanup = M.llmCleanup,
+  })
+  items[#items + 1] = { title = "Type while you speak" .. (liveOk and "" or "  (" .. tostring(liveWhy) .. ")"),
+    switch = true, checked = M.liveTyping, disabled = not liveOk,
+    fn = function() setLiveTyping(not M.liveTyping) end }
   items[#items + 1] = { title = "Clean up with LM Studio", switch = true, checked = M.llmCleanup,
     fn = function() setLlmCleanup(not M.llmCleanup) end }
   items[#items + 1] = { title = "Retranscribe recent take", menu = takesMenu() }
@@ -1126,8 +1403,22 @@ end)
 --   Fn+C  cancel current recording and recall last
 --   Fn+S  speak the current selection through the TTS queue (no dictation)
 
+local HS_PID = (hs.processInfo and hs.processInfo.processID) or 0
+local SRC_PID = hs.eventtap.event.properties
+                and hs.eventtap.event.properties.eventSourceUnixProcessID
+
 M.keyWatcher = ctx:eventtap(hs.eventtap.event.types.keyDown, function(e)
   if not M.fnDown then return false end
+  -- Our own keystrokes are not chords. Fn is held for the whole of a take, and
+  -- live typing puts text at the cursor the whole time, so without this every
+  -- "c" it types cancels the take that is producing it and every "s" hands the
+  -- selection to the TTS. CGEventPost stamps the posting process on the event,
+  -- which is what makes this reliable where checking modifiers is not: a bare
+  -- synthetic "c" carries none.
+  if SRC_PID and synthetic.isOurs(e:getProperty(SRC_PID), HS_PID) then return false end
+  -- A real keystroke during a take means the user is typing into the same place
+  -- we are. Stop committing rather than interleave with them.
+  if M.live.on and not M.live.stopped then M.stopCommitting("the user typed") end
   -- Bare Fn+<key> only. Without this guard the synthetic ⌘C that Fn+S fires to
   -- grab the selection comes straight back through this tap as Fn+C, cancelling
   -- the chord that just sent it — and Fn+⌘C would never reach the focused app.
@@ -1212,6 +1503,8 @@ M.toggle = function()
   if M.recording then stopRecording() else startRecording() end
 end
 
+probeServer()
+
 notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+S speak selection", 2.0)
 logf("[dictate] init complete")
 
@@ -1222,6 +1515,7 @@ logf("[dictate] init complete")
 -- knows what it was.
 function M.dispose()
   if M.recording then M.cancelled = true; stopRecording() end
+  releaseLive()
   unduckNoise()
   ctx:dispose()
   M.listeners, M.listenerOrder = {}, {}

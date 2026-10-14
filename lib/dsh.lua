@@ -72,9 +72,13 @@ end
 -- down from apps/voice_agent before it was fixed there. The pid guard is belt
 -- and braces over that. The sleep gives node its SIGTERM shutdown — under a
 -- second in practice — before anything tries to bind the port again.
+--
+-- Full lsof path: /usr/sbin is not on the tile's PATH, and a bare `lsof` there
+-- failed silently, so Restart left the old server running and the new one died
+-- on EADDRINUSE.
 function M.killCmd(port, selfPid)
   return string.format(
-    "lsof -tiTCP:%d -sTCP:LISTEN | grep -vx %d | xargs kill 2>/dev/null; sleep 0.6; true",
+    "/usr/sbin/lsof -tiTCP:%d -sTCP:LISTEN | grep -vx %d | xargs kill 2>/dev/null; sleep 0.6; true",
     port or M.DEFAULT_PORT, selfPid or 0)
 end
 

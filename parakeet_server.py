@@ -19,13 +19,25 @@
 # overrides the port. PARAKEET_MODEL_PATH / PARAKEET_PORT / argv[1] still work, so
 # an old launcher keeps getting a parakeet server.
 #
-#   POST /transcribe  body=<wav path>  -> batch transcription (text back)
-#   POST /start       body=<raw path>  -> stream a growing headerless s16le/16k
-#                                          mono PCM file as it records
-#   POST /finish                        -> drain remaining audio, return text
-#   POST /cancel                        -> abort the current streaming session
-#   GET  /partial                       -> live hypothesis of the stream
-#   GET  /health                        -> JSON: engine, model, ready, streams
+#   POST /transcribe      body=<wav path>  -> batch transcription (text back)
+#   POST /start           body=<raw path>  -> stream a growing headerless
+#                                             s16le/16k mono PCM file as it records
+#   POST /finish                            -> drain remaining audio, return text
+#   POST /cancel                            -> abort the current session
+#   GET  /partial                           -> live hypothesis of the stream
+#   GET  /health                            -> JSON: engine, model, ready, streams
+#
+# Live dictation (parakeet only), which types at the cursor WHILE you speak:
+#
+#   POST /dictate/start   body=<raw path>  -> same growing PCM file
+#   GET  /dictate/poll                      -> JSON: audio_s, text, stable, …
+#   POST /dictate/finish                    -> JSON: text (final), stable
+#   POST /dictate/cancel                    -> abort
+#
+# `stable` is the prefix that is safe to put at the cursor; `text` is the live
+# hypothesis, which is not. The rule that separates them lives in
+# dictate/, the package next to this file, so the commit logic has specs of its
+# own instead of hiding in this file.
 #
 # Errors come back as a non-200 status with a body starting "__ERROR__". Only the
 # parakeet engine streams: on an mlx-audio model /start and /finish fail at once,
@@ -62,6 +74,30 @@ SR = 16000
 BLOCK = SR          # 1.0s feed blocks: smaller first chunks drop the leading word
 CONTEXT = (256, 256)
 DEPTH = 2
+
+# ── Live dictation ──────────────────────────────────────────────────────────
+# The commit rule is the dictate/ package beside this file: pure, specced, and
+# testable without a model. Running this file as a script puts its directory on
+# sys.path. The import is allowed to fail: dictation reads `dictate: false` off
+# /health and falls back to transcribing on release.
+# Seconds a word must sit back from the end of the audio before it is typed,
+# the lowest token confidence it may carry, and how often a pass is attempted.
+DICTATE_MARGIN_S = float(os.environ.get("DICTATE_MARGIN_S", "1.2"))
+DICTATE_CONFIDENCE = float(os.environ.get("DICTATE_CONFIDENCE", "0.80"))
+DICTATE_INTERVAL_S = float(os.environ.get("DICTATE_INTERVAL_S", "0.4"))
+
+_dictate_why = "parakeet only" if ENGINE != "parakeet" else "not imported"
+DICTATE = False
+if ENGINE == "parakeet":
+    try:
+        from dictate import (  # noqa: E402
+            StreamingTranscriber,
+            Token,
+            pcm_to_float32,
+        )
+        DICTATE = True
+    except Exception as e:  # noqa: BLE001
+        _dictate_why = f"{type(e).__name__}: {e}"
 
 if ENGINE not in ("parakeet", "mlxa", "cactus") or not MODEL:
     sys.exit(f"usage: STT_ENGINE=parakeet|mlxa|cactus STT_MODEL=<path or repo> {sys.argv[0]}")
@@ -106,18 +142,21 @@ def _mlx():
 
 class Session:
     def __init__(self, kind, path):
-        self.kind = kind          # 'stream' | 'batch'
+        self.kind = kind          # 'stream' | 'batch' | 'dictate'
         self.path = path
         self.abort = threading.Event()
         self.finish = threading.Event()
         self.done = threading.Event()
         self.text = None
         self.partial = ""        # latest live hypothesis, polled via GET /partial
+        # 'dictate' only: the StreamingTranscriber, so /dictate/poll can read
+        # its snapshot from an HTTP thread while the worker runs passes.
+        self.dictator = None
 
 
 _lock = threading.Lock()
 _wake = threading.Event()
-_current = {"sess": None}   # the live stream session (what /finish, /cancel act on)
+_current = {"sess": None}   # the live session (what /finish, /cancel act on)
 _queue = deque()            # sessions waiting for the worker, oldest first
 # What /health reports. `error` is set when the model failed to load, after which
 # every request is answered with it instead of hanging until its timeout.
@@ -131,10 +170,10 @@ def _new_session(kind, path):
             s.text = f"__ERROR__ model failed to load: {_state['error']}"
             s.done.set()
             return s
-        if kind == "stream":
+        if kind in ("stream", "dictate"):
             prev = _current["sess"]
             if prev is not None and not prev.done.is_set():
-                prev.abort.set()    # preempt any in-flight stream
+                prev.abort.set()    # preempt any in-flight capture
             _current["sess"] = s
         _queue.append(s)
     _wake.set()
@@ -218,6 +257,92 @@ def _run_stream(backend, s):
             st.add_audio(pending)
         s.text = (st.result.text or "").strip()
     log(f"stream done: feeds={feeds} {len(s.text)} chars in {time.time()-t0:.2f}s")
+    s.done.set()
+
+
+def _read_bytes(fh, leftover):
+    """Whole int16 samples read so far, plus any half-sample tail to carry on."""
+    data = leftover + fh.read()
+    usable = len(data) - (len(data) % 2)
+    return data[:usable], data[usable:]
+
+
+def _dictator(backend):
+    """A StreamingTranscriber wired to this process's warm parakeet model.
+
+    `generate` is handed a mel computed straight from the sample buffer, so a
+    pass costs inference and nothing else: no temp WAV, no re-read from disk.
+    Measured on parakeet-tdt-0.6b-v2, roughly 10ms per second of audio on top of
+    a 30ms floor.
+    """
+    import mlx.core as mx
+    from parakeet_mlx.audio import get_logmel
+    model = backend.model
+    pc = model.preprocessor_config
+
+    def transcribe(samples):
+        mel = get_logmel(mx.array(samples), pc)
+        result = model.generate(mel)[0]
+        return [Token(t.text, t.start, t.end, float(t.confidence))
+                for t in result.tokens]
+
+    return StreamingTranscriber(
+        transcribe,
+        margin_s=DICTATE_MARGIN_S,
+        confidence_floor=DICTATE_CONFIDENCE,
+        interval_s=DICTATE_INTERVAL_S,
+    )
+
+
+def _run_dictate(backend, s):
+    """Live dictation: tail the growing PCM file, re-transcribe, publish.
+
+    The same loop as _run_stream — including serving a voice-agent batch job
+    between passes, so a turn never waits for a dictation to end — but the model
+    is the ordinary batch one, run again over everything heard so far.
+    """
+    st = _dictator(backend)
+    s.dictator = st
+    for _ in range(50):                     # wait for ffmpeg to create the file
+        if os.path.exists(s.path):
+            break
+        time.sleep(0.02)
+    t0, leftover = time.time(), b""
+    with open(s.path, "rb") as fh:
+        while not s.finish.is_set() and not s.abort.is_set():
+            b = _next_batch()
+            if b is not None:               # a voice-agent turn mid-dictation
+                _run_batch(backend, b)
+                continue
+            chunk, leftover = _read_bytes(fh, leftover)
+            if chunk:
+                st.feed(pcm_to_float32(chunk))
+            if st.due():
+                st.step()
+                s.partial = st.text
+            else:
+                time.sleep(0.02)
+        if s.abort.is_set():
+            log("dictate aborted"); s.done.set(); return
+        # /dictate/finish: ffmpeg got SIGTERM and runs with -flush_packets 1, so
+        # the file is nearly current. Short grace to catch its last bytes.
+        deadline = time.time() + 0.12
+        while time.time() < deadline:
+            chunk, leftover = _read_bytes(fh, leftover)
+            if chunk:
+                st.feed(pcm_to_float32(chunk))
+                deadline = time.time() + 0.05
+            else:
+                time.sleep(0.015)
+    s.text = st.finish()
+    s.partial = st.text
+    if st.contradicted:
+        log(f"dictate contradiction: {st.contradiction}")
+    snap = st.snapshot()
+    pct = (100 * len(st.stable) / len(s.text)) if s.text else 0
+    log(f"dictate done: {snap.audio_s:.1f}s audio, {snap.passes} passes, "
+        f"{len(st.stable)}/{len(s.text)} chars typed live ({pct:.0f}%) "
+        f"in {time.time() - t0:.2f}s")
     s.done.set()
 
 
@@ -364,6 +489,8 @@ def worker():
             try:
                 if s.kind == "batch":
                     _run_batch(backend, s)
+                elif s.kind == "dictate":
+                    _run_dictate(backend, s)
                 else:
                     _run_stream(backend, s)
             except Exception as e:  # noqa: BLE001
@@ -390,9 +517,52 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _dictate(self, verb, body):
+        """The live-dictation verbs. 501 when this model cannot drive them, so
+        apps/dictation falls back to transcribing on release."""
+        if not DICTATE:
+            self._reply(501, f"__ERROR__ no live dictation on {MODEL_ID} "
+                             f"({_dictate_why})")
+            return
+        if verb == "start":
+            _new_session("dictate", body)
+            self._reply(200, "started")
+            return
+        with _lock:
+            s = _current["sess"]
+        if verb == "cancel":
+            if s is not None:
+                s.abort.set()
+            self._reply(200, "cancelled")
+            return
+        if verb != "finish":
+            self._reply(404, "no")
+            return
+        if s is None or s.kind != "dictate":
+            self._reply(500, "__ERROR__ no dictation session")
+            return
+        s.finish.set()
+        if not s.done.wait(timeout=30):
+            self._reply(500, "__ERROR__ timeout")
+            return
+        text = s.text or ""
+        if text.startswith("__ERROR__"):
+            self._reply(500, text)
+            return
+        st = s.dictator
+        self._reply(200, json.dumps({
+            "text": text,
+            # What the user already has at the cursor, so the caller can see
+            # what is left to type without trusting its own last poll.
+            "stable": st.stable if st else "",
+            "contradicted": bool(st and st.contradicted),
+        }), "application/json")
+
     def do_POST(self):
         body = self._body()
-        if self.path in ("/start", "/finish") and not STREAMS:
+        if self.path.startswith("/dictate/"):
+            self._dictate(self.path[len("/dictate/"):], body)
+        elif self.path in ("/start", "/finish") and not STREAMS:
             # Fail fast: dictation treats any non-200 here as "use /transcribe".
             self._reply(501, f"__ERROR__ {MODEL_ID} does not stream; use /transcribe")
         elif self.path == "/start":
@@ -425,7 +595,16 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, "no")
 
     def do_GET(self):
-        if self.path == "/partial":
+        if self.path == "/dictate/poll":
+            with _lock:
+                s = _current["sess"]
+            live = s is not None and s.kind == "dictate" and not s.done.is_set()
+            st = s.dictator if live else None
+            snap = (st.snapshot().as_dict() if st is not None else
+                    {"audio_s": 0.0, "text": "", "stable": "",
+                     "contradicted": False, "passes": 0, "pass_ms": 0})
+            self._reply(200, json.dumps(snap), "application/json")
+        elif self.path == "/partial":
             with _lock:
                 s = _current["sess"]
             txt = s.partial if (s is not None and not s.done.is_set()) else ""
@@ -436,6 +615,10 @@ class Handler(BaseHTTPRequestHandler):
                 "streams": STREAMS, "ready": _state["ready"],
                 "error": _state["error"], "load_s": _state["load_s"],
                 "pid": os.getpid(),
+                "dictate": DICTATE, "dictate_why": None if DICTATE else _dictate_why,
+                "dictate_margin_s": DICTATE_MARGIN_S,
+                "dictate_confidence": DICTATE_CONFIDENCE,
+                "dictate_interval_s": DICTATE_INTERVAL_S,
             }), "application/json")
         else:
             self._reply(200, "ok")

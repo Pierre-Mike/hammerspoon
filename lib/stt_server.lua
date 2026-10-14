@@ -59,8 +59,9 @@ end
 
 -- How the server is started for model `m` (an entry from the menu's model list:
 -- { id, path, engine }). `rt` names the runtime: { parakeetPy, mlxaPy, cactusPy,
--- server, home, port, language }. Each engine needs its own interpreter, since
--- parakeet-mlx, mlx-audio and cactus-needle live in separate environments.
+-- server, home, port, language }. Each engine needs its own
+-- interpreter, since parakeet-mlx, mlx-audio and cactus-needle live in separate
+-- environments.
 --
 -- Returns { python, args, env, streams } or nil, reason.
 function M.launch(m, rt)

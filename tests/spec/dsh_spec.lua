@@ -49,6 +49,13 @@ describe("dsh.killCmd", function()
     assert.truthy(cmd:find("-sTCP:LISTEN", 1, true))
   end)
 
+  it("calls lsof by its full path", function()
+    -- lsof lives in /usr/sbin, which the tile's PATH leaves out. A bare `lsof`
+    -- fails silently, the old server keeps the port, and the restart dies on
+    -- EADDRINUSE while the old one goes on holding its sessions.
+    assert.truthy(cmd:find("^/usr/sbin/lsof "))
+  end)
+
   it("never kills Hammerspoon itself", function()
     assert.truthy(cmd:find("grep -vx 4242", 1, true))
   end)

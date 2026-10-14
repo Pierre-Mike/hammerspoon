@@ -28,7 +28,8 @@ local DELAY    = 0.012
 local NEWLINE  = "return"
 local MAXCHARS = 20000
 
-local context = require("lib.context")
+local context   = require("lib.context")
+local synthetic = require("lib.synthetic")
 
 local M = { delay = DELAY, newline = NEWLINE, maxChars = MAXCHARS }
 
@@ -94,6 +95,15 @@ function M.clusters(text)
     i = i + len
   end
   return out
+end
+
+-- hs.eventtap.event:setFlags wants the modifiers by name — { shift = true } —
+-- while a step carries them the way newKeyEvent takes them, as a list. Pure, so
+-- the conversion is asserted on rather than inferred from what got typed.
+function M.flagTable(mods)
+  local t = {}
+  for _, m in ipairs(mods or {}) do t[m] = true end
+  return t
 end
 
 -- The characters this layout can produce by pressing one key, Shift at most.
@@ -204,25 +214,47 @@ end
 
 -- ── Posting ─────────────────────────────────────────────────────────────────
 
-function M.post(step)
-  if step.kind == "key" then
-    -- 0 microseconds between down and up: the pacing is the timer's job, and a
-    -- blocking sleep here would freeze every other Hammerspoon callback.
-    hs.eventtap.keyStroke(step.mods, step.key, 0)
-    return
+-- Stamp the event as ours, so apps/dictation's chord tap can tell this module's
+-- output from a person at the keyboard. Wrapped in a pcall: a Hammerspoon build
+-- without the property must cost a mark, not a keystroke.
+local function mark(e)
+  local props = hs.eventtap.event.properties
+  if props and props.eventSourceUserData then
+    pcall(function() e:setProperty(props.eventSourceUserData, synthetic.TYPER) end)
   end
-  -- A key event carrying a unicode string is how a character with no key on
-  -- this layout still arrives as a keypress. The receiving app sees a keydown
-  -- and a keyup with that character attached, which is exactly what it would
-  -- see from a dead-key sequence or an input method.
-  --
-  -- Flags are cleared on every event. Without that, a modifier still physically
-  -- held turns the next character into a shortcut, and the first thing typed
-  -- after the trigger chord would be Cmd+whatever.
+  return e
+end
+
+-- Both kinds of step go out as a keydown and a keyup built here rather than
+-- through hs.eventtap.keyStroke, for one reason: flags.
+--
+-- A key event is born with no modifiers, but it is posted to the HID tap, where
+-- whatever the user is physically holding is in play. Live dictation types for
+-- the whole length of a take, with Fn held down the entire time, so every
+-- character it sends is a character sent under a modifier it never asked for.
+-- Setting the flags explicitly says what this keypress is and nothing else:
+-- Shift when the layout needs Shift, nothing otherwise.
+--
+-- A key event carrying a unicode string is how a character with no key on this
+-- layout still arrives as a keypress. The receiving app sees a keydown and a
+-- keyup with that character attached, which is exactly what it would see from a
+-- dead-key sequence or an input method.
+--
+-- 0 microseconds between down and up: the pacing is the timer's job, and a
+-- blocking sleep here would freeze every other Hammerspoon callback.
+function M.post(step)
+  local flags = M.flagTable(step.mods)
   for _, down in ipairs({ true, false }) do
-    local e = hs.eventtap.event.newKeyEvent(0, down)
-    e:setFlags({})
-    e:setUnicodeString(step.text)
+    local e
+    if step.kind == "key" then
+      e = hs.eventtap.event.newKeyEvent(step.mods, step.key, down)
+      e:setFlags(flags)
+    else
+      e = hs.eventtap.event.newKeyEvent(0, down)
+      e:setFlags(flags)
+      e:setUnicodeString(step.text)
+    end
+    mark(e)
     e:post()
   end
 end
@@ -231,11 +263,17 @@ end
 
 local ctx = context.new("keystroke_typer")
 local esc                                   -- cancel key, live only while typing
-local run = { active = false, steps = nil, i = 0, release = nil }
+-- `keymap` is built once per run rather than once per call, so appending to a
+-- run four times a second does not re-probe the whole layout four times a
+-- second. `hold` keeps a drained run alive: live dictation has more to type, it
+-- just has not heard it yet.
+local run = { active = false, steps = nil, i = 0, release = nil,
+              keymap = nil, hold = false }
 
 local function stop(message)
   if run.release then run.release(); run.release = nil end
   run.active, run.steps, run.i = false, nil, 0
+  run.keymap, run.hold = nil, false
   if esc then esc:disable() end
   if message then hs.alert.show(message, 1.2) end
 end
@@ -246,7 +284,12 @@ end
 
 local function tick()
   local step = run.steps and run.steps[run.i + 1]
-  if not step then return stop(nil) end
+  if not step then
+    -- Held open: the take is still going and the next words are still being
+    -- spoken. Idling costs one no-op timer callback every M.delay.
+    if run.hold and run.active then return end
+    return stop(nil)
+  end
   run.i = run.i + 1
   local ok, err = pcall(M.post, step)
   if not ok then stop("Keystroke typer: " .. tostring(err)) end
@@ -290,13 +333,14 @@ function M.type(text, opts)
     return hs.alert.show("Nothing to type", 1.2)
   end
 
-  local steps = M.plan(text, M.newline, M.layout())
+  local keymap = M.layout()
+  local steps = M.plan(text, M.newline, keymap)
   if #steps > M.maxChars then
     return hs.alert.show(string.format("Too long: %d characters (limit %d)",
       #steps, M.maxChars), 2)
   end
 
-  run.active, run.steps, run.i = true, steps, 0
+  run.active, run.steps, run.i, run.keymap = true, steps, 0, keymap
   if esc then esc:enable() end
   if not opts.quiet then
     hs.alert.show(string.format("Typing %d characters — esc to cancel", #steps), 1.2)
@@ -307,6 +351,77 @@ function M.type(text, opts)
     local _, release = ctx:timer(M.delay, tick)
     run.release = release
   end)
+end
+
+-- Add to what is being typed instead of replacing it.
+--
+-- M.type drops a run in flight, which is right for a finished take: the newest
+-- transcript is the one the user wants. Live dictation is the other case. Its
+-- words arrive a few at a time for the whole length of a take, and each one
+-- goes AFTER the ones already queued — a replace there would throw away the
+-- half-typed sentence the user is watching.
+--
+-- opts.backspaces  Presses of Delete to queue before the text. Only the end of
+--                  a take uses it, to take back a short wrong tail, and the two
+--                  go in together so nothing can be typed between the deletion
+--                  and its replacement.
+--
+-- Returns how many steps were queued, so a caller can log what it asked for.
+function M.append(text, opts)
+  opts = opts or {}
+  local steps = {}
+  for _ = 1, math.max(0, math.floor(tonumber(opts.backspaces) or 0)) do
+    steps[#steps + 1] = { kind = "key", key = "delete", mods = {} }
+  end
+  if type(text) == "string" and text ~= "" then
+    -- The layout is the run's, not a fresh probe: this is called several times
+    -- a second while the user talks.
+    local keymap = (run.active and run.keymap) or M.layout()
+    for _, s in ipairs(M.plan(text, M.newline, keymap)) do steps[#steps + 1] = s end
+  end
+  if #steps == 0 then return 0 end
+
+  if run.active then
+    if #run.steps - run.i + #steps > M.maxChars then
+      hs.alert.show("Typing queue is full", 1.6)
+      return 0
+    end
+    for _, s in ipairs(steps) do run.steps[#run.steps + 1] = s end
+    return #steps
+  end
+
+  if #steps > M.maxChars then
+    hs.alert.show(string.format("Too long: %d characters (limit %d)",
+      #steps, M.maxChars), 2)
+    return 0
+  end
+  run.active, run.steps, run.i = true, steps, 0
+  run.keymap = run.keymap or M.layout()
+  if esc then esc:enable() end
+  whenHandsAreOff(function()
+    if not run.active then return end
+    local _, release = ctx:timer(M.delay, tick)
+    run.release = release
+  end)
+  return #steps
+end
+
+-- Keep a drained run alive (or let it end). Live dictation holds the run open
+-- for the length of the take, so the words it has not heard yet are typed by
+-- the same loop, at the same pace, without a stop and a restart between every
+-- phrase. Releasing the hold lets the queue finish and the run close itself.
+function M.hold(on)
+  run.hold = on and true or false
+  if not run.hold and run.active and run.steps and run.i >= #run.steps then
+    stop(nil)
+  end
+end
+
+-- Steps queued and not yet posted. A caller that wants to know whether the
+-- screen has caught up asks this.
+function M.pending()
+  if not run.active or not run.steps then return 0 end
+  return #run.steps - run.i
 end
 
 function M.typeClipboard()
@@ -323,6 +438,8 @@ function M.status()
   return {
     hotkey   = table.concat(HOTKEY.mods, "+") .. "+" .. HOTKEY.key,
     typing   = run.active,
+    holding  = run.hold,
+    pending  = M.pending(),
     progress = run.steps and string.format("%d/%d", run.i, #run.steps) or "idle",
     delay    = M.delay,
     newline  = M.newline,

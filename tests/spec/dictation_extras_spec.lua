@@ -137,11 +137,13 @@ local KEYTEXT = { ["return"] = "\n", tab = "\t", space = " " }
 local function typedText()
   local out = {}
   for _, e in ipairs(hs.eventtap._sent) do
-    if e.kind == "key" then
+    if not e.down then
+      -- a keyup: the same character again
+    elseif e.kind == "key" then
       local shift = false
       for _, m in ipairs(e.mods or {}) do if m == "shift" then shift = true end end
       out[#out + 1] = KEYTEXT[e.key] or hs.keycodes.charFor(e.key, shift) or "?"
-    elseif e.down then
+    else
       out[#out + 1] = e.text
     end
   end

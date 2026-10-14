@@ -39,7 +39,12 @@ hs.pasteboard = {
 
 hs.eventtap = {
   new = function(_, _) return { start = function() end, stop = function() end } end,
-  event = { types = { flagsChanged = 1, keyDown = 2, systemDefined = 3 } },
+  event = {
+    types = { flagsChanged = 1, keyDown = 2, systemDefined = 3 },
+    -- The two marks that survive CGEventPost. The pid is set by the system on
+    -- anything this process posts; the user data is set by whoever posts it.
+    properties = { eventSourceUserData = 42, eventSourceUnixProcessID = 41 },
+  },
   -- Every synthetic keystroke lands here in order instead of going to the
   -- window server, so a spec can read back exactly what a module tried to type.
   -- Specs that care clear it first; the paste path only needs the call not to
@@ -64,24 +69,37 @@ function hs.eventtap.checkKeyboardModifiers() return {} end
 -- job: the short form to carry a unicode string, the long form to ask the
 -- layout what a key gives under Shift. The stub takes both.
 function hs.eventtap.event.newKeyEvent(a, b, c)
-  local mods, keycode, isdown
-  if type(a) == "table" then mods, keycode, isdown = a, b, c
-  else mods, keycode, isdown = {}, a, b end
+  local mods, rawKey, isdown
+  if type(a) == "table" then mods, rawKey, isdown = a, b, c
+  else mods, rawKey, isdown = {}, a, b end
+  local keycode = rawKey
   if type(keycode) == "string" then keycode = hs.keycodes.map[keycode] end
 
   local shift = false
   for _, m in ipairs(mods) do if m == "shift" then shift = true end end
 
-  local e = { keycode = keycode, isdown = isdown, mods = mods }
+  local e = { keycode = keycode, isdown = isdown, mods = mods, props = {} }
   function e:setFlags(f) self.flags = f; return self end
   function e:setUnicodeString(s) self.unicode = s; return self end
+  function e:setProperty(k, v) self.props[k] = v; return self end
+  function e:getProperty(k) return self.props[k] end
   -- The layout's answer, which is what the real one returns for an event that
   -- was built and never posted.
   function e:getCharacters(_) return hs.keycodes.charFor(keycode, shift) end
+  -- A posted event carries the posting process's pid whether or not anyone
+  -- asked for it. That is what apps/dictation's chord tap reads to know it is
+  -- looking at Hammerspoon's own output.
   function e:post()
-    hs.eventtap._sent[#hs.eventtap._sent + 1] =
-      { kind = "text", down = self.isdown, text = self.unicode,
-        flags = self.flags, keycode = self.keycode }
+    self.props[hs.eventtap.event.properties.eventSourceUnixProcessID] =
+      hs.processInfo.processID
+    local rec = { down = self.isdown, mods = mods, flags = self.flags,
+                  keycode = self.keycode, props = self.props }
+    -- A unicode string is a character the layout has no key for. Anything else
+    -- is a real key press, and is read back by keycode the way a remote desktop
+    -- in scancode mode reads it.
+    if self.unicode then rec.kind, rec.text = "text", self.unicode
+    else rec.kind, rec.key = "key", rawKey end
+    hs.eventtap._sent[#hs.eventtap._sent + 1] = rec
     return self
   end
   return e
@@ -299,6 +317,27 @@ hs.execute = function(_) return "", true, "exit", 0 end
 hs.json = { decode = function(s) return {} end, encode = function(_) return "{}" end }
 hs.notify = { new = function(_) return { send = function() end } end }
 hs.processInfo = { processID = 4242 }
+
+-- AppleScript. The funnel plugin hands Homebrew to a Terminal window when sudo
+-- has nowhere to ask for a password, and a spec that really opened Terminal
+-- would open one on whoever ran the suite. Every script run lands here instead.
+hs.osascript = {
+  _scripts = {},
+  applescript = function(source)
+    hs.osascript._scripts[#hs.osascript._scripts + 1] = source
+    return true, nil, nil
+  end,
+}
+
+-- launchOrFocus records rather than launches, for the same reason. Specs that
+-- need hs.application.get or frontmostApplication replace the whole table.
+hs.application = {
+  _launched = {},
+  launchOrFocus = function(name)
+    hs.application._launched[#hs.application._launched + 1] = name
+    return true
+  end,
+}
 
 -- Inject into globals so `require("hs.ipc")` etc. resolve without error.
 hs.ipc = {}

@@ -15,6 +15,11 @@ _G.hs = require("hs")
 
 local context = require("lib.context")
 
+-- apps/wake_word deletes its capture file when it starts a capture, and the
+-- live one under /tmp belongs to the Hammerspoon running on this Mac. It takes
+-- the path from the lib when it loads, so the lib is pointed elsewhere first.
+require("lib.wake_word").RAW = os.tmpname()
+
 -- One hub for all of them, recording what was made and what was given back.
 local hub = { made = {}, deleted = {} }
 package.loaded["lib.menuhub"] = {
@@ -339,12 +344,66 @@ end)
 -- Two full rounds, because the failures worth catching only show on the second:
 -- a hotkey or a port claimed again while the first is still held, a tile drawn
 -- beside the one that never left.
+describe("ovis_ocr dispose", function()
+  before_each(function()
+    reset()
+    hs.fs._files[os.getenv("HOME") .. "/.local/share/uv/tools/mlx-vlm/bin/python"] =
+      { mode = "file" }
+  end)
+  after_each(function() context.resetAtExit() end)
+
+  it("terminates the OCR server it started", function()
+    local ocr = load("ovis_ocr")
+    -- The port-freeing shell runs first; its exit is what launches the server.
+    tasks[#tasks].cb(0, "", "")
+    local server = tasks[#tasks]
+    assert.truthy(server.args[2]:find("server.py", 1, true))
+    assert.is_true(server.started)
+
+    ocr.dispose()
+    assert.is_true(server.terminated)
+    assert.equals(0, #running())
+  end)
+
+  it("stops answering hammerspoon://ocr", function()
+    local bound = {}
+    local realBind = hs.urlevent.bind
+    hs.urlevent.bind = function(name, fn) bound[name] = fn; return realBind(name, fn) end
+    local ocr = load("ovis_ocr")
+    assert.is_function(bound.ocr)
+    ocr.dispose()
+    hs.urlevent.bind = realBind
+    assert.equals(0, held())
+  end)
+
+  it("stays off when it was switched off", function()
+    hs.settings._v["ovis_ocr.server"] = false
+    local ocr = load("ovis_ocr")
+    assert.equals(0, #tasks)
+    ocr.dispose()
+  end)
+end)
+
+describe("quit_guard dispose", function()
+  before_each(reset)
+  after_each(function() context.resetAtExit() end)
+
+  -- A tap left behind would keep swallowing Cmd+W in Windows App with no tile
+  -- left to switch it off.
+  it("stops its key tap", function()
+    local qg = load("quit_guard")
+    assert.is_true(qg.tap.running)
+    qg.dispose()
+    assert.is_false(qg.tap.running)
+  end)
+end)
+
 describe("every plugin", function()
   -- Symlinked in from ~/Github/pipecat-voice-agent, so on a clone of this repo
   -- alone it is not there. Skipped rather than failed, the same way lib/plugins
   -- skips it at load.
   local PLUGINS = { "brown_noise", "tts", "lmstudio", "shokz_mute", "dictation",
-                    "tailscale_funnel" }
+                    "ovis_ocr", "tailscale_funnel", "wake_word", "quit_guard" }
   if hs.fs.attributes and io.open("apps/voice_agent/init.lua") then
     PLUGINS[#PLUGINS + 1] = "voice_agent"
   end

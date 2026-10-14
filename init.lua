@@ -1,4 +1,6 @@
 require("hs.ipc")  -- enables `hs -c '<lua>'` from a shell
+-- A killed `hs -c` must not break print for every plugin: see lib/ipc_guard.lua.
+require("lib.ipc_guard").install(hs.ipc)
 
 -- Plugins find themselves: anything under apps/ with an init.lua, and any single
 -- .lua file there, is loaded. Dropping a folder in is enough — this file does not
@@ -19,6 +21,7 @@ plugins.loadAll({
   "dsh",
   "shokz_mute",
   "keystroke_typer",
+  "ovis_ocr",
   -- Before voice_agent, which is the thing that leases the public address:
   -- the service reads better above its caller in the hub.
   "tailscale_funnel",

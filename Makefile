@@ -1,9 +1,9 @@
-.PHONY: test test-lua test-noseguard install-deps
+.PHONY: test test-lua test-noseguard test-dictate install-deps
 
 install-deps:
 	luarocks install busted
 
-test: test-lua test-noseguard
+test: test-lua test-noseguard test-dictate
 
 # Both suites run against the checkout this Makefile lives in, never
 # $HOME/.hammerspoon — otherwise `make test` from a git worktree would silently
@@ -20,3 +20,8 @@ test-lua:
 
 test-noseguard:
 	cd $(REPO) && python3 -m unittest discover apps/noseguard/tests
+
+# The live-dictation commit rule. stream.py needs numpy, so the run brings its
+# own rather than borrowing parakeet-mlx's interpreter.
+test-dictate:
+	cd $(REPO) && uv run --no-project --with pytest --with numpy python -m pytest -q dictate/tests

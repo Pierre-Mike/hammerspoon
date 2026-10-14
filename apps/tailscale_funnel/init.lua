@@ -17,6 +17,20 @@
 -- daemon restart, a Hammerspoon reload and a reboot all leave it alone. That
 -- is the whole point: set the webhook in Meta's dashboard once, never again.
 --
+-- WHAT IT SETS UP, AND WHAT IT CANNOT. Installing the client, signing this Mac
+-- in and arming the funnel used to be eight numbered steps in a document, and
+-- a tile that said "no tailscale CLI" and stopped there. The menu now carries
+-- the checklist and does the steps it can actually finish: Homebrew installs
+-- the standalone app, `tailscale up` starts the sign-in and the page it prints
+-- is opened, the Tailscale app is launched when tailscaled is not answering,
+-- and the funnel is armed. Four steps are somebody else's to finish — MagicDNS
+-- and HTTPS certificates, the funnel node attribute, the voice agent's .env,
+-- and Meta's callback URL — because each is a change to something that is not
+-- this Mac, behind a login this plugin does not have. For those it opens the
+-- right page with the right text already on the clipboard and says in one line
+-- what is left. It never claims a step it cannot see: Meta's callback URL is
+-- counted separately and never ticks itself.
+--
 -- WHAT THIS PLUGIN WILL NOT DO. It never arms the funnel by itself. Publishing
 -- a port to the public internet is a decision a human makes, from this menu,
 -- once — `tailscale funnel --bg` writes the route into tailscaled, so it
@@ -72,6 +86,16 @@ local M = {
   leases     = {},    -- owner -> { expires, taken, req }
   binPath    = nil,   -- the tailscale CLI, found at run time
   candidates = T.BINS,
+  brewPath   = nil,   -- Homebrew, which is how the CLI gets here when it is not
+
+  -- A job this plugin started and is still waiting on, in words. Not an error
+  -- and not a state: installing the client happens while `fatal` is true, and
+  -- a red light under a progress line would be reporting the very thing the
+  -- plugin is in the middle of fixing.
+  busy       = nil,
+  installing = false,
+  signingIn  = false,
+  authOpened = nil,   -- the sign-in page already opened, so it opens once
 
   -- What the last two read-only commands said. Observations only: nothing is
   -- decided here, so a stale one is a stale fact and not a stale decision.
@@ -102,6 +126,11 @@ local M = {
   tileKey    = nil,   -- what the tile last drew, so a real change is spottable
   tileDraws  = 0,     -- how many times that has actually changed
   runs       = {},    -- the argument lists run so far, for the log and for specs
+  brewRuns   = {},    -- the same for Homebrew, which is a different binary
+  opened     = {},    -- the pages handed to the browser, for the log and for specs
+  scripts    = {},    -- the AppleScripts run, same reason
+  launched   = {},    -- the apps asked for, same reason
+  copied     = nil,   -- what last went on the clipboard
 }
 
 -- Seams. A spec drives the clock and the filesystem rather than waiting on
@@ -127,6 +156,7 @@ function M.raw()
     fatal = M.fatal, mode = M.mode, url = M.url, hostname = M.hostname,
     funnel = M.funnel, pending = M.pending, generation = M.generation,
     err = M.err, startedAt = M.startedAt, port = M.port, leases = M.leases,
+    busy = M.busy,
   }
 end
 
@@ -175,6 +205,12 @@ end
 -- of waiting for somebody to press Retry.
 function M.settle()
   local now = M.now()
+  -- A sign-in that landed while `tailscale up` is still finishing. The read is
+  -- the authority on whether this Mac is in a tailnet, so the moment it says
+  -- Running the plugin stops saying "waiting for you".
+  if M.signingIn and M.statusInfo and M.statusInfo.backend == "Running" then
+    M.signingIn, M.busy = false, nil
+  end
   local req, owner = T.primary(M.leases, now)
   M.owner = owner
   M.mode  = req and req.mode or nil
@@ -232,23 +268,54 @@ end
 -- One short-lived child per call, released as it finishes: a context that kept
 -- a handle for every `tailscale status` since the config loaded would grow a
 -- teardown list for the life of the session.
-function M.run(args, done)
+--
+-- `stream` is for the one command that answers before it exits: `tailscale up`
+-- prints the sign-in URL and then waits for a human to visit it, so reading it
+-- only on exit would mean opening the page after it was no longer needed.
+function M.run(args, done, stream)
   local bin = M.binPath
   if not bin then return done(nil, "") end
   M.runs[#M.runs + 1] = args
   local task, release
-  task, release = ctx:task(bin, function(code, out, errOut)
+  local function finished(code, out, errOut)
     if release then release() end
     local text = (out or "") .. (errOut or "")
     if code ~= 0 then logf("[tailscale] %s -> %s: %s", args[1], tostring(code), firstLine(text)) end
     done(code, text)
-  end, args)
+  end
+  if stream then
+    task, release = ctx:task(bin, finished, stream, args)
+  else
+    task, release = ctx:task(bin, finished, args)
+  end
   M.task = task
   task:start()
+  return task
 end
 
+-- Homebrew is a different binary in a different place with a different
+-- environment, so it gets its own runner rather than a flag on M.run. Keeping
+-- its calls out of M.runs also keeps "what did this plugin ask tailscale" a
+-- question with an unambiguous answer.
+function M.brew(args, done)
+  if not M.brewPath then return done(nil, "") end
+  M.brewRuns[#M.brewRuns + 1] = args
+  local task, release
+  task, release = ctx:task(M.brewPath, function(code, out, errOut)
+    if release then release() end
+    done(code, (out or "") .. (errOut or ""))
+  end, args)
+  M.brewTask = task
+  if task.setEnvironment then task:setEnvironment(T.brewEnv(os.getenv("HOME"))) end
+  task:start()
+  return task
+end
+
+-- Both binaries, because "is Tailscale here" and "is there anything that could
+-- put it here" are asked at the same moment and neither costs a process.
 function M.findBinary()
-  M.binPath = T.findBin(M.exists, M.candidates)
+  M.binPath  = T.findBin(M.exists, M.candidates)
+  M.brewPath = T.findBin(M.exists, T.BREWS)
   return M.binPath
 end
 
@@ -337,6 +404,234 @@ function M.turnOff()
     M.ask()
   end)
 end
+
+-- ── Getting Tailscale onto this Mac ────────────────────────────────────────
+-- Everything above here assumed a Mac that was already installed, signed in
+-- and allowed. This is the part that gets it there, and the rule it keeps is
+-- the same one the funnel keeps: the plugin does every step it can actually
+-- finish, and for the rest it opens the right page with the right text already
+-- on the clipboard and says, in one line, what is left for a person.
+--
+-- Three seams, so a spec can watch what was opened, run and copied without a
+-- browser, a Terminal or a pasteboard.
+function M.openUrl(url)
+  M.opened[#M.opened + 1] = url
+  if hs.urlevent and hs.urlevent.openURL then hs.urlevent.openURL(url) end
+  return url
+end
+
+function M.copy(text)
+  M.copied = text
+  if hs.pasteboard and hs.pasteboard.setContents then hs.pasteboard.setContents(text) end
+  return text
+end
+
+function M.runScript(script)
+  M.scripts[#M.scripts + 1] = script
+  if not (hs.osascript and hs.osascript.applescript) then return false end
+  local ok, _, err = hs.osascript.applescript(script)
+  if not ok then logf("[install] Terminal refused it: %s", tostring(err)) end
+  return ok
+end
+
+-- How long to keep looking for a binary somebody else's process is installing.
+-- Five minutes is longer than the download and shorter than giving up matters.
+M.INSTALL_POLL_S = 5
+M.INSTALL_TRIES  = 60
+
+-- Installing. One click when Homebrew is here, one page when it is not.
+function M.install()
+  if M.findBinary() then return M.settle() end
+  if M.installing then return end
+
+  if not M.brewPath then
+    -- Nothing here can drive an install, and bootstrapping Homebrew is a
+    -- bigger decision than a menu bar tile gets to make on someone's behalf.
+    -- The download page is as far as this goes, and it says so.
+    M.openUrl(T.DOWNLOAD_URL)
+    M.cliErr = T.NO_BREW
+    return M.settle()
+  end
+
+  M.installing, M.busy, M.cliErr = true, T.INSTALLING, nil
+  M.redraw()
+  logf("[install] %s", T.installLine(M.brewPath))
+
+  M.brew(T.installCommand(), function(code, out)
+    M.installing = false
+    if M.findBinary() then
+      M.busy, M.cliErr = nil, nil
+      logf("[install] tailscale landed at %s", M.binPath)
+      return M.ask()
+    end
+
+    -- The cask is a .pkg, so Homebrew shells out to `sudo installer`, and a
+    -- menu bar plugin has no terminal for sudo to ask a password on. That is
+    -- not a dead end: the same line in a Terminal window is one, the human
+    -- types one password, and the binary turning up finishes the job from
+    -- here either way.
+    if T.needsPassword(out) then
+      M.runScript(T.terminalScript(T.installLine(M.brewPath)))
+      M.busy, M.cliErr = T.INSTALL_TERMINAL, nil
+      M.settle()
+      return M.awaitBinary()
+    end
+
+    M.busy = nil
+    M.cliErr = T.installProblem(out)
+                 or (code == 0 and T.INSTALL_LOST)
+                 or ("Homebrew refused: " .. firstLine(out))
+    logf("[install] failed: %s", M.cliErr)
+    M.settle()
+  end)
+end
+
+-- Waiting on an install that is happening in somebody else's process. There is
+-- no child to watch and no exit code to read, so the only honest signal is the
+-- binary appearing, and the only thing to do is keep looking for a while.
+function M.awaitBinary(tries)
+  tries = tries or M.INSTALL_TRIES
+  if M.findBinary() then
+    M.busy, M.cliErr = nil, nil
+    logf("[install] tailscale landed at %s", M.binPath)
+    return M.ask()
+  end
+  if tries <= 1 then
+    M.busy, M.cliErr = nil, T.INSTALL_LOST
+    return M.settle()
+  end
+  ctx:after(M.INSTALL_POLL_S, function() M.awaitBinary(tries - 1) end)
+end
+
+-- Opens the page `tailscale up` is waiting on, once per URL. The command
+-- reprints it while it waits, and a browser tab per reprint is not help.
+function M.openAuth(text)
+  local url = T.authUrl(text)
+  if not url or url == M.authOpened then return nil end
+  M.authOpened = url
+  M.busy = T.SIGNIN_OPENED
+  logf("[signin] %s", url)
+  M.openUrl(url)
+  M.redraw()
+  return url
+end
+
+-- Signing in. The plugin starts it, catches the URL off the stream and opens
+-- it; which account to use and the password for it are not things a config
+-- holds. `tailscale up` does not exit until the human is done, so this runs on
+-- its own flag and never on M.pending — the watchdog has to keep reading
+-- status while it waits, because that read is what notices the sign-in landed.
+function M.signIn()
+  if not M.findBinary() then
+    M.cliErr = T.NOT_INSTALLED
+    return M.settle()
+  end
+  if M.signingIn then return end
+
+  -- A sign-in somebody walked away from leaves its page in `tailscale status`.
+  -- Reopening that beats starting a second `tailscale up`, which would hand
+  -- out a different URL and leave the first one dangling.
+  local pending = M.statusInfo and M.statusInfo.authUrl
+
+  M.signingIn, M.busy, M.cliErr, M.authOpened = true, T.SIGNING_IN, nil, nil
+  M.redraw()
+  if pending then M.openAuth(pending) end
+
+  M.run(T.loginCommand(), function(code, out)
+    M.signingIn, M.busy = false, nil
+    if code ~= 0 then
+      local _, why = T.classify(out)
+      M.cliErr = why or ("tailscale up refused: " .. firstLine(out))
+      return M.settle()
+    end
+    M.cliErr = nil
+    logf("[signin] this Mac is signed in")
+    M.ask()
+  end, function(_, out, errOut)
+    M.openAuth((out or "") .. (errOut or ""))
+    return true              -- keep reading: it runs until a human is finished
+  end)
+end
+
+-- tailscaled not answering is usually the app not being open, and opening an
+-- app is something a plugin can just do.
+function M.openApp()
+  M.launched[#M.launched + 1] = "Tailscale"
+  if hs.application and hs.application.launchOrFocus then
+    hs.application.launchOrFocus("Tailscale")
+  end
+  logf("[funnel] opened the Tailscale app")
+  M.ask()
+end
+
+-- ── The three a person finishes ────────────────────────────────────────────
+-- MagicDNS, the funnel node attribute and Meta's callback URL are all changes
+-- to something that is not this Mac, behind a login this plugin does not have.
+-- What it can do is make each of them a paste instead of a transcription.
+function M.openAdminDns()  return M.openUrl(T.ADMIN_DNS_URL) end
+function M.openMachines()  return M.openUrl(T.ADMIN_MACHINES_URL) end
+
+function M.grantFunnel()
+  M.copy(T.POLICY_SNIPPET)
+  logf("[funnel] policy snippet copied; opening the policy file")
+  return M.openUrl(T.ADMIN_ACL_URL)
+end
+
+function M.copyEnv()
+  local lines = T.envLines(M.hostname)
+  M.copy(lines)
+  logf("[funnel] copied the voice agent's settings")
+  return lines
+end
+
+-- No page is opened for this one. The place a human actually has to be is
+-- inside one Meta app's WhatsApp configuration, and the plugin knows neither
+-- the app nor the login, so a tab on a generic app list would be noise.
+function M.copyWebhook()
+  local url = T.webhookUrl(M.hostname)
+  if not url then return nil end
+  M.copy(url)
+  logf("[funnel] copied %s", url)
+  return url
+end
+
+-- ── The checklist ──────────────────────────────────────────────────────────
+-- What the plugin knows right now, in the shape lib/tailscale_funnel reads.
+function M.env()
+  return {
+    bin = M.binPath, brew = M.brewPath, status = M.statusInfo,
+    hostname = M.hostname, port = M.port, funnel = M.funnel, url = M.url,
+    installing = M.installing, signingIn = M.signingIn, busy = M.busy,
+  }
+end
+
+-- Two stats before every answer, because nothing is timing them and a client
+-- a human installed by hand between two ticks should be noticed the moment the
+-- menu is opened rather than on the next watchdog round. A client that did turn
+-- up changes what the rows above the checklist say as well, and settle is the
+-- only thing that decides those.
+function M.setup()
+  local was = M.binPath
+  M.findBinary()
+  if was ~= M.binPath then M.settle() end
+  return T.setupSteps(M.env())
+end
+
+-- A step names its action; this is the only place that knows what the name
+-- means. Declared after every one of them, because a Lua table literal reads
+-- the values as it is built.
+M.ACTIONS = {
+  install       = function() M.install() end,
+  openapp       = function() M.openApp() end,
+  signin        = function() M.signIn() end,
+  check         = function() M.ask() end,
+  admindns      = function() M.openAdminDns() end,
+  adminmachines = function() M.openMachines() end,
+  adminacl      = function() M.grantFunnel() end,
+  copyenv       = function() M.copyEnv() end,
+  arm           = function() M.turnOn() end,
+  copyhook      = function() M.copyWebhook() end,
+}
 
 -- ── The watchdog ───────────────────────────────────────────────────────────
 -- Every 30s: drop dead leases, re-read the truth from the CLI, and check that
@@ -471,6 +766,21 @@ ctx:global("funnelState", function() return T.encodeState(M.state()) end)
 ctx:global("funnelCheck", function() M.ask() end)
 ctx:global("funnelOn",    function() M.turnOn() end)
 ctx:global("funnelOff",   function() M.turnOff() end)
+ctx:global("funnelInstall", function() M.install() end)
+ctx:global("funnelSignIn",  function() M.signIn() end)
+
+-- The checklist as lines rather than JSON, because the thing a shell does with
+-- it is read it: `hs -c 'funnelSetup()'` is the same answer the menu gives.
+ctx:global("funnelSetup", function()
+  local steps = M.setup()
+  local out = { T.setupLine(steps) }
+  for _, step in ipairs(steps) do
+    out[#out + 1] = T.stepLine(step)
+    if step.detail then out[#out + 1] = "        " .. step.detail end
+  end
+  return table.concat(out, "\n") .. "\n"
+end)
+
 ctx:url("funnelCheck", function() M.ask() end)
 
 -- ── Menu ───────────────────────────────────────────────────────────────────
@@ -479,16 +789,33 @@ ctx:url("funnelCheck", function() M.ask() end)
 function M.copyUrl()
   local url = T.copyable(M.raw())
   if not url then return nil end
-  if hs.pasteboard and hs.pasteboard.setContents then
-    hs.pasteboard.setContents(url)
-  end
+  M.copy(url)
   logf("[funnel] copied %s to the clipboard", url)
   return url
+end
+
+-- One row per prerequisite, and a second greyed row under the ones that are
+-- not finished saying who finishes them. A step the plugin can act on is the
+-- button for its own action, so the checklist is also the thing that works it
+-- through rather than a list to read and then go elsewhere.
+function M.setupMenu(steps)
+  local items = {}
+  for _, step in ipairs(steps or M.setup()) do
+    local act = step.action and M.ACTIONS[step.action] or nil
+    items[#items + 1] = { title = T.stepLine(step), disabled = act == nil, fn = act }
+    if step.detail then
+      items[#items + 1] = { title = "        " .. step.detail, disabled = true }
+    end
+  end
+  return items
 end
 
 -- Rebuilt every time it opens, so it shows the funnel as it is now rather than
 -- as it was when the tile was last drawn.
 function M.buildMenu()
+  -- The checklist first: reading it is what re-finds the binaries, and every
+  -- row below has to agree with what it found.
+  local steps = M.setup()
   local now  = M.now()
   local raw  = M.raw()
   local snap = M.state()
@@ -503,6 +830,19 @@ function M.buildMenu()
       fn = function() M.copyUrl() end },
     { title = "-" },
   }
+
+  -- The checklist, and under it the one thing to do next as a button. Which is
+  -- the whole point: "install Tailscale" was a paragraph in a report nobody
+  -- had open, and it is now a row that says what it will do and does it.
+  items[#items + 1] = { title = T.setupLine(steps), menu = M.setupMenu(steps) }
+  local nextStep = T.nextStep(steps)
+  -- Two of the actions already have a row of their own further down, and the
+  -- same row twice in one menu is worse than no shortcut at all.
+  if nextStep and nextStep.action and not T.MENU_ACTIONS[nextStep.action] then
+    items[#items + 1] = { title = T.ACTION_LABEL[nextStep.action],
+                          fn = M.ACTIONS[nextStep.action] }
+  end
+  items[#items + 1] = { title = "-" }
 
   local leases = snap.leases or {}
   if #leases == 0 then

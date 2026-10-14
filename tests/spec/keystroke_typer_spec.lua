@@ -4,8 +4,8 @@ local typer = require("apps.keystroke_typer")
 
 -- Replay what the module posted as the text an app would end up holding, so a
 -- failure reads as "you typed the wrong thing" rather than as a diff of event
--- records. Only keydowns count: a keyup carries the same character and would
--- double everything.
+-- records. Only keydowns count: every keypress goes out as a down and an up,
+-- and counting both would double everything.
 --
 -- A key press resolves through the layout, from its keycode and its modifiers,
 -- and never from a character attached to the event. That is what a remote
@@ -24,13 +24,22 @@ end
 local function typed()
   local out = {}
   for _, e in ipairs(hs.eventtap._sent) do
-    if e.kind == "key" then
+    if not e.down then
+      -- a keyup: the same character again
+    elseif e.kind == "key" then
       out[#out + 1] = pressed(e)
-    elseif e.down then
+    else
       out[#out + 1] = e.text
     end
   end
   return table.concat(out)
+end
+
+-- Keydowns only, which is one per keypress.
+local function downs()
+  local n = 0
+  for _, e in ipairs(hs.eventtap._sent) do if e.down then n = n + 1 end end
+  return n
 end
 
 -- One tick per step, plus one more for the loop to find nothing left and stop.
@@ -114,6 +123,7 @@ end)
 
 describe("keystroke_typer typing", function()
   before_each(function()
+    typer.cancel()
     hs.eventtap._sent = {}
     hs.timer._every = {}
   end)
@@ -125,9 +135,43 @@ describe("keystroke_typer typing", function()
 
   it("presses a real key for every character the keyboard has", function()
     run("abc")
-    assert.equals(3, #hs.eventtap._sent)
+    assert.equals(3, downs())
     for _, e in ipairs(hs.eventtap._sent) do
       assert.equals("key", e.kind)
+    end
+  end)
+
+  -- A key event is posted to the HID tap, where whatever the user is holding is
+  -- in play. Live dictation types for a whole take with Fn held down, so every
+  -- event has to say what it is and nothing else.
+  it("posts a keydown and a keyup for a real key too", function()
+    run("a")
+    assert.equals(2, #hs.eventtap._sent)
+    assert.is_true(hs.eventtap._sent[1].down)
+    assert.is_false(hs.eventtap._sent[2].down)
+  end)
+
+  it("sets the flags a key needs and no others", function()
+    run("aA\t")
+    for _, e in ipairs(hs.eventtap._sent) do
+      assert.is_table(e.flags)
+    end
+    -- "a" and Tab carry nothing; "A" carries Shift and only Shift.
+    assert.same({}, hs.eventtap._sent[1].flags)
+    assert.same({ shift = true }, hs.eventtap._sent[3].flags)
+    assert.same({}, hs.eventtap._sent[5].flags)
+  end)
+
+  -- apps/dictation's chord tap is live for the whole take and fires on a bare
+  -- Fn+C. Without a mark on our own events, typing the letter "c" cancels the
+  -- take that is producing it.
+  it("stamps every event as the typer's own", function()
+    local synthetic = require("lib.synthetic")
+    local USER_DATA = hs.eventtap.event.properties.eventSourceUserData
+    run("cé")
+    assert.is_true(#hs.eventtap._sent > 0)
+    for _, e in ipairs(hs.eventtap._sent) do
+      assert.is_true(synthetic.isTyper(e.props[USER_DATA]))
     end
   end)
 
@@ -146,7 +190,7 @@ describe("keystroke_typer typing", function()
   it("clears modifier flags on every synthesised event", function()
     run("éà")
     for _, e in ipairs(hs.eventtap._sent) do
-      if e.kind == "text" then assert.same({}, e.flags) end
+      assert.same({}, e.flags)
     end
   end)
 
