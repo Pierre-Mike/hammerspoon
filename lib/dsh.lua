@@ -9,6 +9,8 @@
 -- not the CLI — which is also the only way to notice a server someone started
 -- in a terminal.
 
+local T = require("lib.tailscale_funnel")
+
 local M = {}
 
 M.DEFAULT_HOST = "127.0.0.1"
@@ -18,9 +20,30 @@ M.DEFAULT_PORT = 3080
 -- recognize starts the arguments it hands to the booted app, so `--profile` has
 -- to lead. `--no-open` because the tile decides when a browser opens — a start
 -- from the menu bar should not hijack the front window.
-function M.args(profile, port)
-  return { "--profile", profile or "web",
-           "--no-open", "--port", tostring(port or M.DEFAULT_PORT) }
+--
+-- `trusted` lists the extra names the /api fence lets in. dsh reads them only
+-- off its command line, so a server started without them answers 403 to a
+-- phone that reached it through `tailscale serve`. A bare host matches any
+-- port, so the name alone covers whichever HTTPS port serve listens on.
+function M.args(profile, port, trusted)
+  local argv = { "--profile", profile or "web",
+                 "--no-open", "--port", tostring(port or M.DEFAULT_PORT) }
+  for _, h in ipairs(trusted or {}) do
+    if type(h) == "string" and h ~= "" then
+      argv[#argv + 1] = "--trusted-host"
+      argv[#argv + 1] = h
+    end
+  end
+  return argv
+end
+
+-- This Mac's `<machine>.<tailnet>.ts.net` name from `tailscale status --json`,
+-- or nil when tailscaled is not running: a name nobody can reach this Mac by
+-- has no business in the fence.
+function M.tailnetHost(statusJson)
+  local info = T.parseStatus(statusJson)
+  if not info or info.backend ~= "Running" then return nil end
+  return info.hostname
 end
 
 local function quote(s)
@@ -70,16 +93,30 @@ end
 -- sockets whose *remote* port is PORT, and Hammerspoon holds one of those every
 -- time the tile polls the server's health; the same pattern took Hammerspoon
 -- down from apps/voice_agent before it was fixed there. The pid guard is belt
--- and braces over that. The sleep gives node its SIGTERM shutdown — under a
--- second in practice — before anything tries to bind the port again.
+-- and braces over that.
+--
+-- The shell does not return until the server is gone. dsh gives its SIGTERM
+-- shutdown up to 5 s to dispose every live session before it forces an exit,
+-- and a server carrying a few dozen of them uses most of that. A fixed
+-- `sleep 0.6` returned while it was still answering: Stop's follow-up polls
+-- saw it up and put the switch back on, and Restart launched into EADDRINUSE.
+-- So: TERM, wait up to KILL_WAIT_TICKS × 0.2 s for every pid to exit, then KILL
+-- whatever is left.
 --
 -- Full lsof path: /usr/sbin is not on the tile's PATH, and a bare `lsof` there
 -- failed silently, so Restart left the old server running and the new one died
 -- on EADDRINUSE.
+M.KILL_WAIT_TICKS = 40   -- 8 s, past dsh's own 5 s grace
+
 function M.killCmd(port, selfPid)
   return string.format(
-    "/usr/sbin/lsof -tiTCP:%d -sTCP:LISTEN | grep -vx %d | xargs kill 2>/dev/null; sleep 0.6; true",
-    port or M.DEFAULT_PORT, selfPid or 0)
+    "pids=$(/usr/sbin/lsof -tiTCP:%d -sTCP:LISTEN | grep -vx %d); "
+    .. "[ -n \"$pids\" ] || exit 0; kill $pids 2>/dev/null; i=0; "
+    .. "while [ $i -lt %d ]; do alive=; "
+    .. "for p in $pids; do kill -0 $p 2>/dev/null && alive=1; done; "
+    .. "[ -n \"$alive\" ] || exit 0; sleep 0.2; i=$((i+1)); done; "
+    .. "kill -9 $pids 2>/dev/null; sleep 0.3; true",
+    port or M.DEFAULT_PORT, selfPid or 0, M.KILL_WAIT_TICKS)
 end
 
 -- The address to open: what the server reported, else where it was told to bind.

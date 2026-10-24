@@ -5,8 +5,9 @@
 -- from Hammerspoon (lib/dsh.detachCmd), so a reload, a restart or a Hammerspoon
 -- crash leaves it serving; as an hs.task child it went down with every reload.
 -- The tile never holds a handle to it. Stop is a SIGTERM to whatever listens on
--- the port (lib/dsh.killCmd), which node shuts down cleanly on, and every start
--- frees the port first, so a server started in a terminal does not collide.
+-- the port (lib/dsh.killCmd), which waits for node's shutdown to finish and
+-- SIGKILLs it if that runs long. Every start frees the port the same way, so a
+-- server started in a terminal does not collide.
 -- "Is it up?" is answered by asking the address — a 15 s HTTP poll, which is
 -- also what notices a server that died on its own.
 --
@@ -19,6 +20,7 @@
 -- its lifetime is the user's call, not Hammerspoon's.
 
 local D     = require("lib.dsh")
+local T     = require("lib.tailscale_funnel")
 local utils = require("lib.utils")
 
 local ctx = require("lib.context").new("DSH")
@@ -35,6 +37,7 @@ local M = {
   fast    = nil,     -- release() for the quick poll that runs while booting
   spawn   = nil,     -- the detaching shell, held so it is not collected
   kill    = nil,     -- the port-freeing shell, held so it is not collected
+  lookup  = nil,     -- `tailscale status`, held so it is not collected
   timer   = nil,
   open    = false,   -- open a browser as soon as the server answers
 }
@@ -108,9 +111,8 @@ local function openNow()
 end
 
 local function notifyStopped()
-  hs.notify.new({ title = "DeepSeek Harness",
-                  subTitle = "The web server stopped",
-                  informativeText = "See " .. SERVER_LOG }):send()
+  ctx:ui():notify("See " .. SERVER_LOG,
+                  { title = "DeepSeek Harness", subtitle = "The web server stopped" })
 end
 
 function M.poll()
@@ -149,9 +151,29 @@ local function settle()
 end
 
 -- ── Actions ────────────────────────────────────────────────────────────────
+-- This Mac's tailnet name, asked fresh on every start so a Tailscale that came
+-- up or changed names since the last one is picked up. No Tailscale, or one
+-- that is not running, starts the server loopback-only rather than not at all.
+local function tailnetHost(after)
+  local bin = T.findBin(function(p) return hs.fs.attributes(p) ~= nil end)
+  if not bin then return after(nil) end
+  local task, done
+  task, done = ctx:task(bin, function(_, out)
+    done()
+    M.lookup = nil
+    after(D.tailnetHost(out))
+  end, T.statusCommand())
+  M.lookup = task
+  -- The first candidate is the app bundle's binary, which launched from
+  -- Hammerspoon tries to start the GUI and prints an error instead of status.
+  -- TAILSCALE_BE_CLI makes it act as the CLI.
+  task:setEnvironment({ HOME = HOME, TAILSCALE_BE_CLI = "1" })
+  task:start()
+end
+
 -- The shell backgrounds the server and exits at once, so its exit says nothing
 -- about the server; the polls in settle() and the address in SERVER_LOG do.
-local function launch()
+local function spawnServer(host)
   local bin = dshBin()
   if not bin then setBusy(nil); return end
 
@@ -167,12 +189,13 @@ local function launch()
     if M.fast then M.fast() end
     local _, release = ctx:timer(FAST_SECS, function() M.poll() end)
     M.fast = release
-  end, { "-c", D.detachCmd(bin, D.args(PROFILE, M.port), SERVER_LOG) })
+  end, { "-c", D.detachCmd(bin, D.args(PROFILE, M.port, { host }), SERVER_LOG) })
   M.spawn = spawn
   spawn:setEnvironment(ENV)
   spawn:start()
-  logf("launching %s --profile %s --port %d (detached, output in %s)",
-       bin, PROFILE, M.port, SERVER_LOG)
+  logf("launching %s --profile %s --port %d%s (detached, output in %s)",
+       bin, PROFILE, M.port, host and (" --trusted-host " .. host) or "",
+       SERVER_LOG)
 
   ctx:after(START_TIMEOUT, function()
     if M.launch ~= id or not M.booting then return end
@@ -182,6 +205,12 @@ local function launch()
     logf("no answer after %ds — %s has what the server is doing",
          START_TIMEOUT, SERVER_LOG)
   end)
+end
+
+-- Every start trusts this Mac's tailnet name, so a phone that reaches the
+-- server through `tailscale serve` gets past the /api fence.
+local function launch()
+  tailnetHost(spawnServer)
 end
 
 -- Kill whatever is holding the port, then run `after`. Everything that starts
@@ -218,7 +247,13 @@ function M.stop()
   if M.busy then return end
   M.open = false
   setBusy("Stopping the server…")
-  freePort(function() M.running, M.url = false, nil; setBusy(nil); settle() end)
+  logf("stopping whatever listens on :%d", M.port)
+  freePort(function()
+    logf("stopped")
+    M.running, M.url = false, nil
+    setBusy(nil)
+    settle()
+  end)
 end
 
 function M.restart()

@@ -16,6 +16,36 @@ describe("dsh.args", function()
     assert.same({ "--profile", "tui", "--no-open", "--port", "8080" },
                 D.args("tui", 8080))
   end)
+
+  it("trusts each extra host after the rest", function()
+    -- Without it the /api fence answers 403 to any browser that reached the
+    -- server through a name other than loopback — a phone over Tailscale.
+    assert.same({ "--profile", "web", "--no-open", "--port", "3080",
+                  "--trusted-host", "mac.tail1.ts.net",
+                  "--trusted-host", "other.example" },
+                D.args("web", 3080, { "mac.tail1.ts.net", "other.example" }))
+  end)
+
+  it("skips empty hosts", function()
+    assert.same({ "--profile", "web", "--no-open", "--port", "3080" },
+                D.args("web", 3080, { "", false }))
+  end)
+end)
+
+describe("dsh.tailnetHost", function()
+  it("is this Mac's name in the tailnet, without the trailing dot", function()
+    assert.equals("mac.tail1.ts.net", D.tailnetHost(
+      '{"BackendState":"Running","Self":{"DNSName":"mac.tail1.ts.net."}}'))
+  end)
+
+  it("is nil while tailscaled is not serving", function()
+    -- A name the tailnet does not answer for would only widen the fence.
+    assert.is_nil(D.tailnetHost(
+      '{"BackendState":"Stopped","Self":{"DNSName":"mac.tail1.ts.net."}}'))
+    assert.is_nil(D.tailnetHost('{"BackendState":"Running","Self":{}}'))
+    assert.is_nil(D.tailnetHost(""))
+    assert.is_nil(D.tailnetHost(nil))
+  end)
 end)
 
 describe("dsh.parseUrl", function()
@@ -53,15 +83,23 @@ describe("dsh.killCmd", function()
     -- lsof lives in /usr/sbin, which the tile's PATH leaves out. A bare `lsof`
     -- fails silently, the old server keeps the port, and the restart dies on
     -- EADDRINUSE while the old one goes on holding its sessions.
-    assert.truthy(cmd:find("^/usr/sbin/lsof "))
+    assert.truthy(cmd:find("$(/usr/sbin/lsof ", 1, true))
   end)
 
   it("never kills Hammerspoon itself", function()
     assert.truthy(cmd:find("grep -vx 4242", 1, true))
   end)
 
-  it("waits for the shutdown before the port is reused", function()
-    assert.truthy(cmd:find("sleep", 1, true))
+  it("waits for every pid to exit, not a fixed sleep", function()
+    -- dsh takes up to 5 s to dispose its sessions on SIGTERM. Returning early
+    -- let Stop's follow-up poll see it up and flip the switch back on.
+    assert.truthy(cmd:find("kill -0 $p", 1, true))
+    assert.truthy(cmd:find("-lt " .. D.KILL_WAIT_TICKS, 1, true))
+    assert.is_true(D.KILL_WAIT_TICKS * 0.2 > 5)
+  end)
+
+  it("escalates to SIGKILL once the wait runs out", function()
+    assert.truthy(cmd:find("kill -9 $pids", 1, true))
   end)
 
   it("succeeds when nothing is listening", function()
