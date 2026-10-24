@@ -35,3 +35,8 @@ apps/noseguard/overlay/overlay
 # Agent scratch: nested git worktrees, and a symlink into the ignored .claude/
 /.worktrees/
 /.agents/skills
+
+# Your own plugins: `make plugin NAME=mine DIR=plugins` puts one here. Kept out of
+# the repo so a fork stays clean; keep them in their own repo or symlink them in.
+/plugins/*
+!/plugins/README.md

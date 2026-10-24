@@ -55,14 +55,18 @@ end)
 
 describe("the plugin template", function()
   local menuhub = require("lib.menuhub")
-  local plugin
+  local plugins = require("lib.plugins")
+  local plugin, p
 
   before_each(function()
+    hs.settings._v = {}
     package.loaded["templates.plugin.init"] = nil
-    plugin = require("templates.plugin.init")
+    local entry = require("templates.plugin.init")
+    local manifest = assert(plugins.check("template", dofile("templates/plugin/plugin.lua")))
+    plugin, p = plugins.activate("template", entry, manifest)
   end)
 
-  after_each(function() plugin.dispose() end)
+  after_each(function() p.ctx:dispose() end)
 
   it("loads as a plugin with a tile built from ui.menu rows", function()
     local entry = plugin.tile._e
@@ -77,10 +81,15 @@ describe("the plugin template", function()
     assert.equals(1, plugin.count)
   end)
 
+  it("registers its hello as an action other code can run", function()
+    plugins.run("template.hello")
+    assert.equals(1, plugin.count)
+  end)
+
   it("goes away completely when switched off", function()
     plugin.busy()
     local before = #menuhub.entries
-    plugin.dispose()
+    p.ctx:dispose()
     assert.equals(before - 1, #menuhub.entries)
   end)
 end)
