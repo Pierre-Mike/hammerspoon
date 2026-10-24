@@ -2,14 +2,14 @@ require("hs.ipc")  -- enables `hs -c '<lua>'` from a shell
 -- A killed `hs -c` must not break print for every plugin: see lib/ipc_guard.lua.
 require("lib.ipc_guard").install(hs.ipc)
 
--- Plugins find themselves: anything under apps/ with an init.lua, and any single
--- .lua file there, is loaded. Dropping a folder in is enough — this file does not
--- name it — and a plugin that throws on require now fails alone instead of taking
--- down everything after it in a require list.
+-- Plugins find themselves: anything under apps/ (or the optional plugins/) with
+-- an init.lua, and any single .lua file in apps/, is loaded. Dropping a folder
+-- in is enough, and a plugin that throws on require fails alone.
 --
--- The list below is only the ones whose sequence matters. It is also tile order,
--- because menuhub draws in load order, so it keeps the hub reading the way it
--- always has. Anything not named here loads after them, alphabetically.
+-- Order comes from each plugin's plugin.lua manifest (`after`, `needs`). The
+-- list below is the fallback: it fixes the sequence for plugins that say
+-- nothing, which is also tile order because menuhub draws in load order.
+-- Anything not named here loads after them, alphabetically.
 local plugins = require("lib.plugins")
 
 plugins.loadAll({
