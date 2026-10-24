@@ -1,611 +1,258 @@
-# Hammerspoon config
+# Hammerspoon plugins
 
-My [Hammerspoon](https://www.hammerspoon.org/) setup — menu-bar tools for dictation,
-ambient noise, voice control, and a face-touch deterrent. This repo is the source of
-truth; `~/.hammerspoon` is a symlink to it.
+A [Hammerspoon](https://www.hammerspoon.org/) config built from small plugins. Each
+plugin adds one tool to a shared menu-bar hub: dictation, ambient noise, local
+speech and OCR servers, live lyrics, a face-touch deterrent and more. Drop a
+folder in, reload, and it has a tile. Take it out and it leaves nothing behind.
 
-## Requirements
+The repo is two things. It is a working setup you can run as is, and it is a
+plugin system you can build on: a manifest per plugin, a versioned API, one shared
+look, and a registry that keeps a broken plugin from breaking the rest.
 
-- macOS on Apple silicon. Every hardcoded tool path points at `/opt/homebrew`,
-  so an Intel Mac needs those changed to `/usr/local`.
-- [Hammerspoon](https://www.hammerspoon.org/) itself: `brew install --cask hammerspoon`.
-- `ffmpeg`, which `apps/dictation` records through: `brew install ffmpeg`.
-- Python 3.13 or newer for the background servers some apps run. Each one
-  installs its own packages, listed in that app's section below.
-- Hammerspoon added to four lists in System Settings, under Privacy & Security:
-  Accessibility (hotkeys, synthetic keystrokes, the Teams mute fallback), Input
-  Monitoring (the Fn chords), Microphone (dictation), and Camera
-  (`apps/noseguard`). macOS asks on first use, and a denied prompt leaves that
-  app doing nothing with no error.
+## What you get
 
-The rest is per app and optional. The standalone [Tailscale](https://tailscale.com/download)
-client (the Mac App Store build has no Funnel and no CLI), the LM Studio CLI,
-and the `dsh` launcher matter only to the app that drives them, and that app's
-tile says so when the binary is missing. `apps/tailscale_funnel` installs its
-own. Its Setup submenu carries the whole checklist, and it puts an Install
-Tailscale button in the menu when there is no client on the Mac.
+- **One menu-bar button.** A 🔨 panel with a tile per plugin, in light and dark
+  mode. A tile opens a menu with switches, pickers, sliders and actions.
+- **Plugins that load themselves.** Anything in `apps/` or `plugins/` with an
+  `init.lua` is found at startup. A plugin that throws fails alone and says why
+  on its row.
+- **A switch per plugin.** The 🧩 Plugins tile turns each one off and on without
+  editing a file. A plugin built on the plugin object really goes away: timers
+  stop, tiles disappear, child processes end.
+- **One look.** Plugins pick a component (toast, HUD, button bar, menu rows) and
+  never write a color. Five designs ship, and a change to one file restyles
+  everything. See [DESIGN.md](DESIGN.md).
+- **Tests that run anywhere.** Specs run against a mock of `hs.*`, so they need
+  no Mac. The CI runs them on Linux.
+
+Plugins that ship with the repo:
+
+| Plugin | What it does |
+|---|---|
+| `dictation` | Hold Fn, speak, release. The transcript is typed at the cursor. |
+| `brown_noise` | A noise machine with five colors and a volume slider. |
+| `tts` | A spoken-text queue any app can post to, using a local voice model. |
+| `karaoke` | Synced lyrics of the playing song in a notch-style island. |
+| `lmstudio` | Start LM Studio and switch its loaded model from the hub. |
+| `ovis_ocr` | Local OCR: an image or PDF in, Markdown out. |
+| `noseguard` | Uses the camera to interrupt you when a finger rests on your nose. |
+| `quit_guard` | Cmd+Q and Cmd+W need a double press in the apps you pick. |
+| `tailscale_funnel` | One public address for this Mac, leased by whichever plugin needs it. |
+
+The rest, and the details of each, are in [docs/apps.md](docs/apps.md).
 
 ## Install
+
+You need macOS on Apple silicon and [Hammerspoon](https://www.hammerspoon.org/):
+
+```sh
+brew install --cask hammerspoon
+```
+
+Clone the repo and point Hammerspoon at it. If you already have a
+`~/.hammerspoon`, move it aside first.
 
 ```sh
 git clone https://github.com/Pierre-Mike/hammerspoon.git ~/Github/hammerspoon
 ln -s ~/Github/hammerspoon ~/.hammerspoon
-# then reload Hammerspoon:  hs -c 'hs.reload()'
 ```
 
-Apps load themselves: anything under `apps/` with an `init.lua`, and any single
-`.lua` file there, is picked up at startup — see [Plugins](#plugins).
+Open Hammerspoon and choose Reload Config. The 🔨 button appears in the menu bar.
 
-| App | What it does |
-|-----|--------------|
-| `apps/dictation` | Hold **Fn** (or headset MFB) to record; release to transcribe with the speech model picked in the menu and type the transcript at the cursor, one keystroke at a time (`apps/keystroke_typer`), so it lands in terminals, remote desktops and anything else that refuses a paste. The transcript also stays on the clipboard, so ⌘V is there if typing is the wrong answer. One warm server (`parakeet_server.py`, port 8765) holds that model and nothing else; the voice agent transcribes through the same server. Parakeet models stream a live preview. `Fn+C` cancels & recalls the last result. `Fn+S` cancels and reads the current *selection* aloud through `apps/tts`. Menu-bar picker switches speech models. Other apps subscribe to the take with `onState(name, fn)`; the voice agent uses it to stop listening while the mic is ours. |
-| `apps/brown_noise` | Noise machine in the hub: a Play switch, volume slider, and color picker (white/pink/brown/blue/violet). |
-| `apps/noseguard` | Nose-touch deterrent — a headless Python daemon (`noseguard.py`) watches the camera via AVFoundation + Apple Vision and disrupts you when a fingertip rests on your nose. Only the nose landmarks count, the contact radius scales to your interpupillary distance rather than the frame, and contact has to hold still for half a second — so beards, eating, and hands merely raised near the face don't fire. Geometry and debounce live in `nose_geom.py` (pure, unit-tested). |
-| `apps/tts` | Spoken-text queue any app can post to. Text arrives over HTTP (`POST :8790/speak`), the `hs -c 'speak("…")'` CLI, or a `hammerspoon://speak?text=…` URL; a FIFO queue plays chunks serially so nothing talks over itself. Long text is split into sentences so playback starts on the first one. `Fn+S` reads the current selection aloud. Voice comes from a warm [Kyutai pocket-tts](https://github.com/kyutai-labs/pocket-tts) server (`pocket_tts_server.py`, port 8791) kept resident on CPU. Menu-bar item shows queue depth + Stop. |
-| `apps/lmstudio` | Runs the local [LM Studio](https://lmstudio.ai) MLX server from the hub: a Server switch, a ✓ picker that switches the loaded model, and a memory panel showing what every model on disk costs and what the Mac has free. Switching unloads the resident model of the same kind first, so an embedding model keeps serving while the chat model changes. `--ttl` gives an idle model's memory back on its own. See [LM Studio](#lm-studio). |
-| `apps/dsh` | Runs the [DeepSeek Harness](https://github.com/deepseek-ai) web profile from the hub: a Server switch, Restart, and "Open the web UI" — which starts the server first when it is off, then opens the browser once it answers. See [DeepSeek Harness](#deepseek-harness). |
-| `apps/shokz_mute` | Keeps Microsoft Teams' mute in step with the headset's hardware mute button, read from the bluetoothd log. Uses the Teams local API when allowed, otherwise sends Cmd+Shift+M to Teams. Hub tile: sync switch, status, re-align, reconnect, backend picker. |
-| `apps/tailscale_funnel` | One public address for this Mac — `https://<machine>.<tailnet>.ts.net`, carried by [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) — leased by whoever needs it (`POST :8795/lease` with an owner, a mode and a local port; `GET /funnel` to read it back; `POST /release` to let go). The address is tied to the machine and the tailnet rather than to a process, so a daemon restart, a config reload and a reboot all leave it alone: a webhook is registered once and never again. The plugin never arms the funnel by itself — publishing a port to the internet is a menu click, and `tailscale funnel --bg` keeps it armed across reboots — and never turns one off when the last lease goes. `url` is null until the funnel really carries the leased port, so a caller is never handed an address nothing answers on; `hostname` is there as soon as the Mac is logged in, because that is the string a human pastes into a dashboard. Not installed, logged out, Funnel not granted in the tailnet policy, and a funnel pointed at the wrong port each say so in one line, rechecked every 30 s so a fix clears itself. A Setup submenu carries the whole checklist and does the four steps it can finish: it installs the standalone client with Homebrew, starts the sign-in and opens the page that command prints, opens the Tailscale app when tailscaled is not answering, and arms the funnel. Four more need a person (MagicDNS and HTTPS certificates, the funnel node attribute, the voice agent's `.env`, Meta's callback URL), and for each of those it opens the right page with the right text already on the clipboard and says in one line what is left. The next unfinished step gets a button of its own, so a Mac with no Tailscale on it opens the tile and finds Install Tailscale. An owner can hand over a probe path and the token it expects back; three misses in a row turn the tile red and an answer turns it green again. |
-| `apps/ovis_ocr` | Local OCR. A warm server (`apps/ovis_ocr/server.py`, port 8797) runs [OvisOCR2](https://huggingface.co/ATH-MaaS/OvisOCR2) through mlx-vlm and turns an image or a PDF into Markdown. LLM tools reach it through an MCP bridge (`apps/ovis_ocr/mcp.py`), scripts through `POST /ocr`, and a browser through a drop page at `http://127.0.0.1:8797/`. The tile reads a file into `<name>.ocr.md`, or reads the clipboard image. See [OCR](#ocr). |
-| `apps/wake_word` | Say "Codec" with no call open and the voice agent starts one. A second ffmpeg tails dictation's microphone, and every 1.5 s the last four seconds go to dictation's warm server on :8765 when they are loud enough to be speech. A transcript with the word in it (or "Kodak", which is what Parakeet often hears) posts `/start` to the voice agent's daemon, then hands it the sentence the word ended with on `/heard`. It stays quiet during a call, while dictation has the mic, for a few seconds after a call closes, and whenever `apps/voice_agent` is not loaded. On by default; the tile has the switch. Log: `/tmp/hs-voice-wake.log`. |
-| `apps/karaoke` | Shows the lyrics of whatever is playing, one line at a time, in a black island that hangs from the top of the screen like the MacBook notch. `media-control` (`brew install media-control`) reads the macOS Now Playing center, so Spotify, Music and a YouTube tab in Safari or Chrome all work. Without it, the plugin asks Spotify and Music over AppleScript once a second and cannot see a browser. Synced lyrics come from [LRCLIB](https://lrclib.net), which is free and needs no key. The plugin splits and cleans a YouTube title such as "Artist - Song (Official Video)" before the lookup. The line being sung turns from grey to white as it goes, and the next line shows underneath. On a notched screen the text sits below the notch. The tile has the switch, a choice between the main and the built-in screen, and a timing nudge for lyrics that run early or late. Cmd+Alt+Shift+K shows or hides the island. Log: `/tmp/hs-karaoke.log`. |
+Some plugins need more: `ffmpeg` for dictation, a Python environment for the speech
+servers, and camera, microphone and accessibility permission for the plugins that
+use them. [docs/apps.md](docs/apps.md) lists the requirements per plugin. A plugin
+whose tool is missing says so on its tile and does nothing else.
 
-### One menu-bar button
+To see which plugins are running, or to switch one off, open the 🧩 Plugins tile.
 
-All apps share a single 🔨 menu-bar item (`lib/menuhub.lua`). Clicking it opens a
-Control Center-style panel (`lib/menuhub_panel.html`): one tile per app with its live
-icon and status, in light and dark mode. A tile opens that app's menu in the same
-design: grouped lists, ✓ pickers, switches, sliders, drill-in submenus, and actions
-that run in place.
-Option-click 🔨 for the plain dropdown. A new app gets a tile, not a new icon:
+Run the tests with `make install-deps` (installs `busted`) and then `make test`.
 
-```lua
-local ctx = require("lib.context").new("My app")
+## Write a plugin
 
-M.menu = ctx:tile("My app")                       -- instead of hs.menubar.new()
-M.menu:setTitle("✅")                             -- same setTitle/setIcon/setMenu/
-M.menu:setMenu(function() return { ... } end)     -- setTooltip/setClickCallback API
+Start from the template:
+
+```sh
+make plugin NAME=hello TITLE="Hello"
 ```
 
-## Plugins
+This creates `apps/hello/plugin.lua` and `apps/hello/init.lua`. To keep your plugin
+out of the repo, add `DIR=plugins` and it goes in the git-ignored `plugins/` folder
+instead. Reload Hammerspoon and the tile is there.
 
-Each app is a plugin: a folder `apps/<name>/init.lua`, or a single
-`apps/<name>.lua`. Dropping one in is enough, no file lists it, and one that
-throws on require fails alone instead of taking down everything after it.
-`init.lua` names only the few whose load order matters, which is also the tile
-order in the hub.
+A plugin is a folder with two files.
 
-An app builds everything through its own context (`lib/context.lua`), which
-remembers how to undo it:
+`plugin.lua` is the manifest. It is plain data and is read before the plugin runs:
 
 ```lua
-local ctx = require("lib.context").new("My app")
-
-ctx:tile("My app")                      -- a hub tile, removed on dispose
-ctx:timer(15, poll)                     -- doEvery, stopped on dispose
-ctx:after(2, once)                      -- doAfter, and it forgets itself as it fires
-ctx:task(bin, onExit, args)             -- hs.task, terminated on dispose
-ctx:hotkey({ "cmd" }, "d", fn)          -- deleted on dispose
-ctx:url("myapp", fn)                    -- hammerspoon://myapp, unbound on dispose
-ctx:atExit(cleanup)                     -- instead of hs.shutdownCallback
-ctx:ui():toast("Copied")                -- shared components, see "One look" below
-
-function M.dispose() ctx:dispose() end  -- what makes the app switchable
+return {
+  id          = "hello",
+  name        = "Hello",
+  version     = "1.0.0",
+  api         = 1,
+  author      = "you",
+  description = "Greets you from the hub.",
+  after       = { "dictation" },
+  settings    = {
+    greeting = { type = "string", default = "Hello" },
+    volume   = { type = "number", default = 50, min = 0, max = 100 },
+  },
+}
 ```
 
-`make plugin NAME=my_app TITLE="My app"` starts a new plugin from
-`templates/plugin/init.lua`, which already does all of the above.
-
-Every constructor returns `handle, release`. The handle is the real `hs` object,
-so calling code reads as it always did; `release()` tears that one effect down
-early and forgets it, which is what an app calls when it kills its own task
-instead of `task:terminate()`.
-
-`ctx:atExit` exists because `hs.shutdownCallback` is a single global slot: the
-last app to set it wins and the one it replaced silently stops running at quit.
-Contexts share one callback that fans out.
-
-The 🧩 **Plugins** tile carries a switch per app, and what is switched off
-persists across reloads. Switching off is only as good as the app: one with a
-`dispose()` genuinely goes away, while one without can only be stopped from
-loading next time, and its row says `(reload to remove)` rather than pretending
-otherwise.
-
-### One look
-
-Plugins do not draw their own UI. Each one picks components from `lib/ui.lua`
-through its context, and every component takes its colors, type sizes, corners
-and spacing from `lib/theme.lua`. The hub panel reads the same tokens, so one
-change to the theme restyles every plugin and the hub together.
+`init.lua` returns a function. The registry calls it with one `plugin` object:
 
 ```lua
-local ui   = ctx:ui()
 local menu = require("lib.ui").menu
 
-ui:toast("Copied", { tone = "success" })              -- one at a time, across all plugins
-local _, hide = ui:hud("Recording", { tone = "recording" })
-local bar = ui:bar("bar", { pick = run })             -- buttons that never take focus
-bar:show({ title = "Rewrite", buttons = { { id = "short", label = "Shorter" } } })
-ui:notify("Model loaded")                             -- Notification Center
+return function(plugin)
+  local count = 0
+  local tile = plugin.tile()
 
-tile:setMenu(function() return {
-  menu.switch("Enabled", on, toggle),
-  menu.choice("Brown", color == "brown", pick),
-  menu.slider("Volume", 40, { max = 100, unit = "%" }, setVolume),
-} end)
+  local function greet()
+    count = count + 1
+    plugin.ui:toast(plugin.settings.get("greeting"), { tone = "success" })
+    tile:setTooltip("Said hello " .. count .. " times")
+  end
+
+  plugin.action("greet", greet)
+
+  tile:setTitle("👋")
+  tile:setMenu(function()
+    return {
+      menu.text("Said hello " .. count .. " times"),
+      menu.separator(),
+      menu.action("Say hello", greet),
+    }
+  end)
+
+  plugin.ctx:timer(3600, function()
+    plugin.ui:toast("An hour has passed")
+  end)
+
+  return {
+    start = function() plugin.log("ready") end,
+    stop  = function() plugin.log("bye") end,
+  }
+end
 ```
 
-A plugin passes a meaning (`success`, `working`, `danger`), never a color.
-`tests/spec/design_rules_spec.lua` fails on a plugin that writes a color, a
-radius, a point size or `hs.alert` itself. [DESIGN.md](DESIGN.md) has the
-full brief: which component fits which job, tones, placement, wording and menus.
-`hs -c 'uiGallery()'`, or "Preview the UI kit" in the 🧩 Plugins tile, shows
-every component on screen.
+Reload, open the 🔨 panel, click the Hello tile and choose Say hello. From a shell,
+`hs -c 'plugins = require("lib.plugins"); plugins.run("hello.greet")'` does the same.
 
-The look itself is a design: one file in `designs/` that overrides only the
-tokens it changes. Five come with the repo (default, warm, light, compact and
-terminal). Switch with the Design submenu in the 🧩 Plugins tile, or with
-`hs -c 'return uiDesign("warm")'`, which reloads and shows the gallery.
-The default design follows the system's light and dark mode, and switches
-live when macOS does. `designs/default.lua` lists every key a design can set, and
-`tests/spec/design_spec.lua` fails on a design whose text doesn't read.
+When the plugin is switched off, `stop` runs (if you wrote one), then everything made
+through `plugin.ctx` is undone: the tile, the timer and the action. You write no
+cleanup code for those.
 
-### Spoons
+Two rules keep plugins switchable and consistent. Build through `plugin.ctx`, not
+raw `hs.timer.new` and friends. Draw through `plugin.ui`, and never write a color,
+font size or corner radius. A spec fails the build if a plugin does.
 
-[Spoons](https://www.hammerspoon.org/Spoons/) load into a context too, so one
-written by anyone else gets a tile and a teardown:
+### Older plugins still work
 
-```lua
-local ctx = require("lib.spoon").load("Caffeine", {
-  hotkeys = { toggleWhileLocked = { { "cmd", "alt" }, "c" } },
-  icon    = "☕️",
-})
-```
+A plugin with no `plugin.lua` loads as before. It `require`s what it needs and
+returns a table, optionally with a `dispose()` function. Nothing about it has to
+change. It just gets no manifest features: no ordering hints, no settings schema,
+no plugin object.
 
-`:stop()` is registered as the teardown, and the `hs.*` constructors are swapped
-for recording ones while `:bindHotkeys()` and `:start()` run, so handles a
-careless `:stop()` forgets are tracked anyway. That capture only sees
-constructors called during those two calls — a Spoon that arms a timer later
-from its own callback escapes it — so it makes a careless Spoon survivable, not
-safe.
+## API reference
 
-`apps/voice_agent` is optional: it lives in
-[pipecat-voice-agent](https://github.com/Pierre-Mike/pipecat-voice-agent), whose
-`hammerspoon/install.sh` symlinks it (and `lib/voice_toggle.lua`) in here. On a
-fresh clone it is simply not there, and discovery skips it.
+The current API version is **1**. It is `plugins.API` in `lib/plugins.lua`. A manifest
+names the version it was written for in `api`. A plugin that asks for a newer version
+than the config provides does not load, and the Plugins tile shows why. The version
+only goes up when a change would break an existing plugin.
 
-## Assets not in git
+### Manifest fields
 
-Large binaries are `.gitignore`d (see `.gitignore`) — they live on disk but aren't versioned:
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `id` | string | no | Must equal the folder name. Defaults to it. |
+| `name` | string | no | Display name. Defaults to the id. |
+| `version` | string | no | Your version of the plugin. Defaults to `0.0.0`. |
+| `api` | whole number | no | The plugin API version it targets. Defaults to 1. |
+| `author` | string | no | Who wrote it. |
+| `description` | string | no | One line. |
+| `after` | list of ids | no | Load after these, when they are installed. |
+| `needs` | list of ids | no | Same ordering, and do not load unless these are running. |
+| `settings` | table | no | Schema for the plugin's settings, below. |
 
-- **Noise WAVs** (`*.wav`) — `noise_{white,pink,brown,blue,violet}.wav`, `brown_noise*.wav`.
-  Any 16-bit PCM WAV of the corresponding noise color works; generate e.g. with
-  `ffmpeg -f lavfi -i anoisesrc=color=pink:d=600 -ar 44100 noise_pink.wav`.
-- **MediaPipe models** (`*.task`) — `apps/noseguard/{hand,face}_landmarker.task`,
-  downloadable from the [MediaPipe model zoo](https://ai.google.dev/edge/mediapipe/solutions/vision).
-- **Swift overlay binary** (`apps/noseguard/overlay/overlay`) — build from source:
-  `swiftc -O apps/noseguard/overlay/overlay.swift -o apps/noseguard/overlay/overlay`.
-- **noseguard venv** (`apps/noseguard/.venv/`) — recreate with
-  `python3 -m venv apps/noseguard/.venv && apps/noseguard/.venv/bin/pip install pyobjc`.
-  Detection runs on Apple Vision, so `pyobjc` is the only requirement.
+A manifest with a wrong field fails that one plugin, with the reason on its row.
+The manifest is read in an empty Lua environment, so it cannot call anything.
 
-## Speech models
+Load order starts from the list in `init.lua`, then alphabetical. `after` and `needs`
+move a plugin to follow what it names and move nothing else. A circle of
+dependencies cannot be ordered: those plugins keep their default place and a
+warning goes to the console. Order is also tile order in the hub.
 
-The dictation menubar lists every speech model cached under
-`~/.cache/huggingface/hub`, with its published English WER and its RAM footprint.
-A model joins the list by being downloaded and leaves it by being deleted —
-`apps/dictation` reads each model's `config.json` to decide which backend runs it,
-so nothing in the code needs editing:
+### Settings schema
 
-- a **NeMo** config (the parakeet family) runs on parakeet-mlx, the only backend
-  that streams, so these are the only models with a live preview (🟢)
-- any other `model_type` mlx-audio implements runs on mlx-audio (🟡): the WAV is
-  transcribed on release, with no preview
-- Whistle is the exception, found outside the hub and run on the CPU (🟡) — see
-  [Whistle (cactus engine)](#whistle-cactus-engine)
+Each entry is `name = { type = ..., default = ... }`. Types:
 
-Either way exactly one model is loaded. `parakeet_server.py` on port 8765 loads
-the selected model once and keeps it warm, so a dictation costs inference only
-(about 0.1–0.2s for a short take on both engines). Picking another model in the
-menu kills that server, waits for the port to free, and starts a new one on the
-new model under its engine's interpreter (`STT_ENGINE=parakeet|mlxa|cactus`,
-`STT_MODEL=<snapshot dir, repo id or .cact file>`). After a reload it starts on the saved
-selection. The voice agent posts to the same `/transcribe`, so it switches with
-you. To see what is loaded:
-
-```sh
-curl -s localhost:8765/health   # {"engine": "mlxa", "model": "lyzgeorge/…", "ready": true, …}
-```
-
-On an mlx-audio model `/start` and `/finish` answer 501 at once, which sends
-dictation straight to `/transcribe`. The server passes mlx-audio's CLI defaults
-to `generate()`, including `language="en"`; Cohere Transcribe still returns
-French as French.
-
-```sh
-hf download mlx-community/parakeet-tdt-0.6b-v2      # streaming, English
-hf download mlx-community/whisper-large-v3-asr-8bit # batch, 99 languages
-hs -c 'hs.reload()'                                 # the menu picks them up
-```
-
-Add the model to `CATALOG` in `apps/dictation/init.lua` to give it a readable
-name and a WER; without an entry it still appears, under its bare repo name. The
-WER there is measured locally against the exact quantised snapshot, not copied
-from a leaderboard, because quantisation moves it: the 4-bit Qwen3-ASR build
-measures 3.93 where the full-precision original tops the Open ASR Leaderboard.
-`ENGINES` in `lib/stt_server.lua` is the list of architectures the picker will run — an
-mlx-audio release that adds an architecture needs a key here too, and
-`test_stt.sh` keeps its own copy in step.
-
-The mlx-audio backend needs `soundfile` and `sentencepiece`, which mlx-audio does not
-pull in itself: `uv tool install mlx-audio --with soundfile --with sentencepiece`.
-Without them Granite fails on load and Cohere Transcribe fails on its tokenizer.
-
-### Whistle (cactus engine)
-
-Whistle is Cactus Compute's speech model: one 16.9 MB file, decoded on the CPU,
-in English, German, French, Spanish, Italian, Dutch and Polish. It is in the menu
-to be *tried* — it is here so a take can be run through the model a phone or a
-wearable would have to use, next to the models this Mac can afford. Measured on
-one 20s take: loads in under a second against parakeet's nine, transcribes in
-0.1s against 0.3s, and gets "terraform" wrong where parakeet gets it right.
-Whistle punctuates and capitalises, which parakeet does not.
-
-It is the one model the hub scan cannot find, because its weights are a single
-`.cact` file with no `config.json` and no safetensors beside it. `apps/dictation`
-globs the cactus-needle cache for it instead, and sets `engine = "cactus"`
-itself — so, unlike the other two engines, `ENGINES` in `lib/stt_server.lua` has
-no key for it. (`whisper` there is OpenAI's model on mlx-audio. One letter apart,
-different backends.)
-
-```sh
-uv venv --python 3.12 ~/.hammerspoon/.venv-cactus
-VIRTUAL_ENV=~/.hammerspoon/.venv-cactus uv pip install cactus-needle numpy
-~/.hammerspoon/.venv-cactus/bin/python -c \
-  'from needle.agent import fetch; print(fetch.fetch_weights("whistle"))'
-hs -c 'hs.reload()'   # the menu picks it up
-```
-
-`numpy` is only for the server's warm-up pass; without it the warm-up is skipped
-and the first take pays for it. The weights land in
-`~/.cache/cactus-needle/whistle/<version>/whistle.cact`, which is what the menu
-globs and what `STT_MODEL` points at — a file path, not a repo id, because
-`needle.Whistle` takes the weights directly.
-
-Two habits worth knowing. Silence comes back as an empty transcript rather than
-an invented sentence. And a language pin outside its seven is ignored with a log
-line rather than being fatal, so a code set for a 99-language Whisper cannot
-leave Whistle unable to start. `NEEDLE_TELEMETRY=0` is set on every launch:
-cactus-needle otherwise POSTs a usage ping each time a model loads, and a model
-loads on every switch.
-
-`./test_stt.sh` transcribes one clip (`/tmp/hs-dictate.wav` by default — dictate
-once and it is there) with every cached model in turn, so accuracy and speed can
-be compared on your own voice and microphone rather than on a benchmark corpus.
-
-## TTS service setup
-
-`apps/tts` needs a Python venv with [pocket-tts](https://github.com/kyutai-labs/pocket-tts)
-installed (kept out of git, see `.gitignore`):
-
-```sh
-python3 -m venv ~/.hammerspoon/.venv-tts
-~/.hammerspoon/.venv-tts/bin/pip install pocket-tts
-hs -c 'hs.reload()'
-```
-
-On reload Hammerspoon frees port 8791 and launches the warm server; the model
-downloads on first run. Then any app can talk:
-
-```sh
-curl -sX POST localhost:8790/speak -d 'hello from any app'
-curl -s     localhost:8790/stop              # cancel + flush the queue (no body)
-curl -s     localhost:8790/status            # {"speaking":…,"queued":…,"voice":…}
-curl -s     localhost:8790/voices            # profile → voice map
-hs -c 'speak("or straight from a shell")'
-open 'hammerspoon://speak?text=or%20via%20url&voice=marius'
-```
-
-### Speak the selection — `Fn+S`
-
-Select text anywhere, press **Fn+S**, and it reads aloud. Same chord family as
-`Fn+C`: holding Fn opens the mic as usual, and `Fn+S` cancels that
-capture before handing the selection to the queue, so nothing is recorded.
-
-macOS has no API for "the current selection", so the chord copies it (⌘C), reads
-the pasteboard, and puts your clipboard back — including images and rich text.
-A copy only counts if the pasteboard's change count actually moves, so pressing
-`Fn+S` with nothing selected says *nothing selected* rather than re-reading
-whatever was already on your clipboard.
-
-```sh
-hs -c 'speakSelection()'            # same thing without the chord
-hs -c 'speakSelection("alerts")'    # in another voice
-open 'hammerspoon://speakSelection?profile=code'
-```
-
-Read-aloud uses the `reading` voice (vera) by default — change it, or the copy
-timeout, under `TTS_SELECTION` in `lib/config.lua`. Long selections stream: the
-first sentence starts talking while the rest is still synthesising, and
-`curl -s localhost:8790/stop` (or the menu-bar **Stop**) kills it mid-sentence.
-
-### Different voices for different work
-
-Every entry point takes a **selector** — a profile key, a raw pocket-tts voice
-name (26 built-ins: `alba`, `marius`, `vera`, `george`, `michael`, `jane`,
-`eve`, `paul`, …), or a path / `hf://` URL to clone. The queue carries the voice
-per chunk, so each caller can sound different:
-
-```sh
-curl -sX POST 'localhost:8790/speak?profile=alerts' -d 'disk almost full'   # marius
-curl -sX POST 'localhost:8790/speak?voice=vera'     -d 'chapter one'         # raw name
-curl -sX POST  localhost:8790/speak -H 'X-Voice: george' -d 'build passed'   # header
-hs -c 'speak("tests are green", "code")'                                     # CLI, profile
-open 'hammerspoon://speak?text=done&profile=system'                          # URL
-```
-
-Profiles live in `lib/config.lua` (`TTS_PROFILES`) — map any "kind of work" to a
-voice (defaults: `default`=alba, `alerts`=marius, `code`=george, `reading`=vera,
-`system`=michael). Header `X-Profile` / `X-Voice` and query `?profile=` / `?voice=`
-both work; header wins. The menu-bar **Default voice** submenu switches the
-fallback voice used when no selector is given. First use of a voice downloads its
-prompt from HF (cached after). Set the language in `lib/config.lua` (`TTS_LANGUAGE`).
-Logs: `/tmp/hs-tts.log` (queue) and the server's stdout.
-
-## LM Studio
-
-`apps/lmstudio` drives the local LM Studio server from the 🧠 tile: start and
-stop it, switch the loaded model, and read what each model costs in memory
-before you load it.
-
-Needs LM Studio's CLI at `~/.lmstudio/bin/lms` (LM Studio → Developer → Install
-CLI). Without it the tile says so and offers nothing else.
-
-Clicking a model switches to it — the loaded model of the **same kind** is
-unloaded first, then the new one loads. Two 15 GB chat models do not fit in
-32 GB, so a switch has to be a swap; an embedding model is a different kind and
-keeps serving while the chat model changes under it.
-
-The memory section reads the machine the way Activity Monitor does (app + wired
-+ compressed pages; see `lib/lmstudio.memory`). A model whose weights plus
-2 GB of working headroom would not fit, even counting the memory the swap gives
-back, is marked ⚠︎ — a warning, not a block.
-
-"Auto-unload when idle" passes `--ttl` to the next load, so an idle 15 GB model
-gives its memory back on its own. It is a load-time flag: it binds the model you
-load next, not the one already resident.
-
-Three sources feed the tile, because none of them has everything:
-
-| source | gives | cost |
-|---|---|---|
-| `GET /api/v0/models` | which models are loaded, at what context | ~8 ms |
-| `lms ls --json` | every model on disk, and the only byte counts | ~250 ms |
-| `lms ps --json` | models loaded with the server off, and unload identifiers | ~160 ms |
-
-`lib/lmstudio.catalog` joins them on the model key. Nothing is queried while the
-menu is being built — menuhub rebuilds an app's menu on every open and every
-redraw behind it, and a 250 ms spawn on that path would be felt. A 15 s poll
-keeps the state current and the menu renders what is already cached. Only the
-cheap HTTP call runs at that rate; the disk catalog refreshes every 5 minutes,
-and the down-state probe (which costs two spawns) no more than every 45 s.
-
-When the HTTP call goes unanswered the tile asks `lms server status` for the
-real port before concluding the server is off, so a server restarted on another
-port is picked back up instead of showing as dead.
-
-## DeepSeek Harness
-
-`apps/dsh` drives the harness's web profile from the 🐋 tile: start it, stop it,
-restart it, and open its browser UI.
-
-Needs the `dsh` launcher on `/opt/homebrew/bin`, `/usr/local/bin` or
-`~/.local/bin` (`npm i -g @deepseek-ai/dsh`). Without it the tile says so.
-
-The tile runs `dsh --profile web --no-open --port 3080` detached from
-Hammerspoon (`nohup … &`, output in `/tmp/hs-dsh-server.log`), so a reload, a
-restart or a Hammerspoon crash leaves the server running. The next poll finds it
-again and reads its address back from that file. Stop is a SIGTERM to whatever
-listens on the port, which the node server shuts down cleanly on, and switching
-the plugin off removes the tile but leaves the server up. `--no-open`
-matters: starting a server from the menu bar should not pull a browser window to
-the front. "Open the web UI" is the item that opens one, and from a cold start it
-starts the server first and waits for it to answer, so the browser never loads a
-dead address.
-
-The tile holds no handle on the server, and a server started in a terminal can
-hold port 3080 too. So every start frees the port first, and the running state
-comes from asking the address rather than from our own bookkeeping:
-
-| question | answer |
+| Type | Extra keys |
 |---|---|
-| is it up? | a 15 s `GET` on the bound address; any status means something answered |
-| where is it? | the `dsh web: http://…` line in `/tmp/hs-dsh-server.log` |
-| what still holds the port? | `lsof -tiTCP:3080 -sTCP:LISTEN` |
+| `boolean` | none |
+| `number` | `min`, `max` |
+| `string` | none |
+| `choice` | `options`, a list of allowed values |
 
-`-sTCP:LISTEN` is what makes that last one safe. A bare `lsof -ti :3080` also
-matches sockets whose *remote* port is 3080, and Hammerspoon holds one of those
-every time the tile polls — the same pattern took Hammerspoon down from
-`apps/voice_agent` before it was fixed there.
+Values are stored in `hs.settings` under `plugin.<id>.<name>`, so they survive reloads.
+A stored value that no longer fits the schema is ignored and the default is used.
 
-Nothing starts on a config reload. The Server switch and "Open the web UI" are
-the only things that turn it on.
+### The plugin object
 
-## Tailscale Funnel
+| Member | What it does |
+|---|---|
+| `plugin.id`, `plugin.manifest`, `plugin.api` | Who you are and which API is running. The manifest is `nil` for plugins without one. |
+| `plugin.ctx` | The context. `ctx:timer`, `ctx:after`, `ctx:hotkey`, `ctx:task`, `ctx:url`, `ctx:watcher`, `ctx:eventtap`, `ctx:httpserver`, `ctx:atExit` and `ctx:effect(fn)` for anything else. Everything is undone on switch-off. See `lib/context.lua`. |
+| `plugin.ui` | Shared components: `toast`, `hud`, `bar`, `notify`, `surface`. Pass a tone such as `success`, `working` or `danger`, never a color. See [DESIGN.md](DESIGN.md). |
+| `plugin.tile(title)` | Adds a hub tile. It has `setTitle`, `setTooltip`, `setMenu` and `setClickCallback`. Build menu rows with `require("lib.ui").menu`. |
+| `plugin.action(name, fn)` | Registers `<id>.<name>`. Anyone can run it with `plugins.run("<id>.<name>", ...)`. |
+| `plugin.settings.get(key)` | The stored value, or the default. `nil` for a key not in the schema. |
+| `plugin.settings.set(key, value)` | Returns `true`, or `false` and why. Fires the `settings` event. |
+| `plugin.log(fmt, ...)` | A `string.format` line in the Hammerspoon console, tagged `[id]`. |
+| `plugin.on(event, fn)` | Listens for an event and returns a function that stops listening. |
 
-`apps/tailscale_funnel` owns this Mac's one public address and hands it out on
-a lease, so the thing that needs a webhook does not have to own a tunnel of its
-own. The address is `https://<machine>.<tailnet>.ts.net`, with a real
-Let's Encrypt certificate, carried by
-[Tailscale Funnel](https://tailscale.com/kb/1223/funnel). Nothing on this Mac
-listens on a public interface and no router port is opened.
+### Events
 
-It replaced a Cloudflare quick tunnel, whose hostname changed on every start.
-That cost a webhook re-registration every morning, and the app-level callback
-URL in Meta's dashboard was dead from the first restart. A funnel hostname
-belongs to the machine and the tailnet, so it survives a daemon restart, a
-Hammerspoon reload and a reboot: the webhook is set once.
+| Event | When | Arguments |
+|---|---|---|
+| `start` | After your entry function and `start` hook ran. | none |
+| `stop` | When the plugin is switched off. | none |
+| `settings` | After `plugin.settings.set` accepted a value. | key, value |
+| `plugin:loaded` | Another plugin finished loading. | its id |
+| `plugin:unloaded` | Another plugin was switched off. | its id |
 
-### Setting it up, from the tile
+A listener that throws is logged and does not stop the others.
 
-The menu carries the whole checklist under **Setup**, one row per
-prerequisite. Each row says who finishes it. A tick means done, a box means the
-plugin does this one, a person means only you can. The next unfinished step
-also gets a button of its own under the checklist, so a Mac with no Tailscale
-on it opens the tile and finds **Install Tailscale**.
+### What your entry function returns
 
-Four steps the plugin finishes on its own.
+A table, or nothing. Two optional functions are used if present:
 
-1. **Install Tailscale.** It runs `brew install --cask --force tailscale-app`,
-   which is the standalone client. Not the Mac App Store build, which has no
-   Funnel and no CLI, and not the `tailscale` formula, which is a daemon you
-   have to run yourself. The cask is a `.pkg`, so Homebrew shells out to `sudo
-   installer`, and a menu bar plugin has no terminal for sudo to ask a password
-   on. When that happens the plugin hands the same line to a Terminal window
-   and keeps looking for the binary until it lands. With no Homebrew at all it
-   opens [tailscale.com/download](https://tailscale.com/download) and says the
-   installer is yours to run.
-2. **Sign in.** It runs `tailscale up` and reads the sign-in URL off the stream
-   while the command is still waiting, then opens that page. Choosing an
-   account and approving this Mac happen in the browser. A sign-in you walked
-   away from is reopened from `tailscale status` rather than restarted, because
-   a second `tailscale up` hands out a second URL and leaves the first one
-   dangling.
-3. **Open the Tailscale app**, when tailscaled is the thing not answering.
-4. **Turn the funnel on.** It runs
-   `tailscale funnel --bg --https=443 http://127.0.0.1:<leased port>`, which
-   writes the route into tailscaled. That survives a reboot, so this is the
-   last time you click it. Expect up to 10 minutes of DNS propagation the first
-   time.
+- `start(plugin)` runs after the entry function. If it throws, the plugin is torn
+  down and marked failed.
+- `stop(plugin)` runs on switch-off, before the context is cleaned up. You do not
+  need it for anything the context owns.
 
-Four steps are yours, because each one changes something that is not this Mac,
-behind a login this config does not have. For every one of them the plugin
-opens the right page with the right text already on the clipboard.
+Anything else on the table is yours. Other plugins can read it through
+`plugins.loaded["your_id"]`.
 
-- **MagicDNS and HTTPS certificates.** Tailnet-wide switches with no CLI behind
-  them. The row opens the admin console's DNS page. Pick the machine name and
-  the tailnet name before you ask for a certificate. Both end up in public
-  Certificate Transparency logs, so choose something that says nothing about
-  you, and take the randomised tailnet name (`yak-bebop.ts.net`) that Tailscale
-  offers for this.
-- **The `funnel` node attribute.** It lives in the tailnet policy file. The row
-  copies the snippet and opens the policy file editor. Pasting and saving it is
-  yours.
-- **The voice agent's settings.** The row copies `PHONE_TUNNEL=plugin` and the
-  rest, with this Mac's real address already in them. The plugin does not write
-  the other repo's `.env` for you. That file also holds the five `WHATSAPP_`
-  secrets only a human can fetch, so it is a file you are halfway through
-  editing.
-- **The callback URL in Meta's App Dashboard.** The row copies
-  `https://<machine>.<tailnet>.ts.net/whatsapp/webhook`. The plugin cannot see
-  the answer to this one, so it never ticks and is counted apart from the rest.
+### Discovery
 
-All of it is reachable from a shell too. `funnelSetup()` prints the same
-checklist, `funnelInstall()` and `funnelSignIn()` run the first two steps, and
-`funnelState()`, `funnelCheck()`, `funnelOn()` and `funnelOff()` do what they
-say.
+The registry looks in `apps/` first, then in `plugins/`. A plugin is a folder with
+an `init.lua`, or, for `apps/` only, a single `.lua` file. If a name exists in both
+folders, the one in `apps/` loads. A folder with no `init.lua` is ignored.
 
-The plugin never arms a funnel by itself. Publishing a port to the public
-internet is a decision a human makes, and `--bg` means making it once.
+### Registry functions
 
-### What a caller does
+For scripts and tests: `plugins.loaded`, `plugins.failed`, `plugins.order`,
+`plugins.run(name, ...)`, `plugins.enable(name)`, `plugins.disable(name)`,
+`plugins.check(id, table)` to validate a manifest, and `plugins.activate(id, entry,
+manifest)` to run an entry function directly in a spec.
 
-```sh
-curl -s 'http://127.0.0.1:8795/lease?owner=voice-agent&mode=funnel&port=8794&probe_path=/phone/ping&probe_expect=<token>'
-```
+## Contributing
 
-Every 30 s, because a lease expires 120 s after the last one. The answer always
-carries every key:
-
-```json
-{"status":"ready","url":"https://mac.yak-bebop.ts.net",
- "hostname":"mac.yak-bebop.ts.net","generation":1,"error":null,
- "uptime_s":182,"mode":"funnel","port":8794,"funnel":true,
- "leases":[{"owner":"voice-agent","expires_in":118}]}
-```
-
-`url` is null until the funnel really carries the leased port, so a caller is
-never handed an address nothing answers on — `error` says which of the five
-things is missing. `hostname` is there as soon as the Mac is logged in, because
-that is the string a human pastes into a dashboard, armed or not. Callers watch
-`generation` rather than the URL string; with Funnel it should not move for
-months, which is the point.
-
-`mode=off` is for a caller that already has a public address and only wants the
-plugin to stop deciding things on its behalf: the lease is recorded, the URL is
-shown on the tile, and no `tailscale` runs.
-
-Letting a lease expire tears nothing down. The address outliving its caller is
-the whole reason this plugin exists, so only the menu turns a funnel off.
-
-## Tests
-
-```sh
-make install-deps   # luarocks install busted
-make test           # busted specs under tests/, plus the noseguard geometry
-```
-
-`tests/spec/dictation_state_spec.lua` guards the contract other apps hang off
-dictation: one `true` when a take starts and one `false` when it ends, whichever
-way it ends. The short-tap and cancel paths produce no transcript and are the
-ones most likely to forget the release, which would leave the voice agent deaf
-with nothing coming to free it. A listener that throws is wrapped, because
-dictation is what the user is actually doing and a subscriber is not allowed to
-cost them a sentence.
-
-`apps/noseguard/nose_geom.py` deliberately imports nothing from Vision or
-AVFoundation, so its tests need no venv and no camera:
-
-```sh
-python3 -m unittest discover apps/noseguard/tests
-```
-
-## OCR
-
-`apps/ovis_ocr` runs [OvisOCR2](https://huggingface.co/ATH-MaaS/OvisOCR2), a 0.8B
-document-parsing model, on the GPU through [mlx-vlm](https://github.com/Blaizzy/mlx-vlm).
-It reads one page image into Markdown in reading order: text, LaTeX formulas, and
-tables. The default build is `mlx-community/OvisOCR2-6bit`, which its model card
-measures as character-identical to bf16. A page takes 1 to 8 seconds on Apple silicon.
-
-```sh
-uv tool install mlx-vlm --with pypdfium2 --with pillow
-hf download mlx-community/OvisOCR2-6bit
-hs -c 'hs.reload()'
-```
-
-The server starts with Hammerspoon. It loads the model on the first request and
-drops it after 10 idle minutes, so it costs about 60 MB at rest and 1.8 GB while
-reading. An MCP client that finds the port closed has no way to open it, which is
-why the server does not wait to be asked. The Server switch persists for anyone who
-wants it off.
-
-```sh
-curl --data-binary @scan.pdf -H 'X-Filename: scan.pdf' localhost:8797/ocr   # Markdown
-curl --data-binary @page.png 'localhost:8797/ocr?pages=1-3&format=json'      # JSON
-curl -H 'Content-Type: application/json' -d '{"path":"/abs/scan.pdf","save":true}' \
-     localhost:8797/ocr                                    # also writes scan.ocr.md
-curl -s localhost:8797/health
-open 'hammerspoon://ocr?path=/abs/scan.pdf'
-```
-
-Tables come back from the model as HTML. A table without merged cells is
-rewritten as a Markdown pipe table; `tables=html` keeps the HTML. Pages of a
-multi-page PDF are marked `<!-- page N -->`. Figure placeholders are dropped
-unless `images=1` is passed.
-
-For LLM tools, `apps/ovis_ocr/mcp.py` is an MCP stdio server with one tool,
-`ocr_to_markdown(path, pages?, html_tables?)`. It uses the standard library only
-and forwards the path to the server, so it starts instantly:
-
-```sh
-claude mcp add --scope user ovis-ocr -- python3 ~/.hammerspoon/apps/ovis_ocr/mcp.py
-```
-
-Other clients take the same command in their MCP config. The tile's "Copy the MCP
-command" item puts it on the clipboard.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The Spoons under `Spoons/` are not in this repo
-and carry their own licenses.
+MIT. See [LICENSE](LICENSE).
