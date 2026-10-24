@@ -254,7 +254,7 @@ ctx:url("noseguard", function(_, params)
     flash()
     refresh()
   elseif ev == "error" then
-    hs.notify.new({ title = "Nose Guard", informativeText = "Camera unavailable" }):send()
+    ctx:ui():notify("Camera unavailable", { title = "Nose Guard" })
     M.stop()
   elseif ev == "ready" then
     logf("daemon ready")

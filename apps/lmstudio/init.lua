@@ -82,8 +82,7 @@ local function firstLine(s)
 end
 
 local function notify(subtitle, text)
-  hs.notify.new({ title = "LM Studio", subTitle = subtitle,
-                  informativeText = text or "" }):send()
+  ctx:ui():notify(text or "", { subtitle = subtitle })
 end
 
 -- Every lms call is async: a blocking one would freeze the menu, and a load can

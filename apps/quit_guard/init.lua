@@ -45,9 +45,11 @@ local function onKey(e)
   if verdict == "allow" then M.last = nil; return false end
 
   M.last = { bundleID = press.bundleID, key = press.key, at = press.now }
-  hs.alert.closeAll()
-  hs.alert.show(string.format("⌘%s blocked in %s · press again to %s",
-    press.key:upper(), app:name(), press.key == "q" and "quit" or "close"), 1)
+  -- A toast replaces the one before it, so a third press does not stack a
+  -- second message under the first.
+  ctx:ui():toast(string.format("⌘%s blocked in %s · press again to %s",
+    press.key:upper(), app:name(), press.key == "q" and "quit" or "close"),
+    { seconds = 1, tone = "warning" })
   return true
 end
 

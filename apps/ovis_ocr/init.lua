@@ -71,10 +71,7 @@ local function redraw()
 end
 
 local function notify(title, text, onClick)
-  local attrs = { title = title, informativeText = text }
-  local n = onClick and hs.notify.new(function() onClick() end, attrs)
-                     or hs.notify.new(attrs)
-  if n then n:send() end
+  ctx:ui():notify(text, { title = title, onClick = onClick })
 end
 
 -- hs.json.decode throws on anything that is not JSON, and an error page is not.

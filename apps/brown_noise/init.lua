@@ -64,7 +64,7 @@ end
 local function play()
   local s = ensureSound()
   if not s then
-    hs.alert.show("noise_" .. B.color .. ".wav not found")
+    ctx:ui():toast("noise_" .. B.color .. ".wav not found", { tone = "danger" })
     return
   end
   s:volume(B.volume)

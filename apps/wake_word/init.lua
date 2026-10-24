@@ -285,7 +285,7 @@ local function wakeStart(heard, startByte)
                       ww.settled(now, M.callEndedAt)) then return end
   M.lastFired = now
   logf("heard %q in %q", ww.WORD, heard)
-  hs.alert.show(ww.WORD .. " — starting a call", 1.2)
+  ctx:ui():toast(ww.WORD .. " · starting a call", { seconds = 1.2, tone = "working" })
   hs.http.asyncPost(BASE .. "/start", "{}", { ["Content-Type"] = "application/json" },
     function(code, body, _)
       -- /start answers with the same payload as /status, so the call is known

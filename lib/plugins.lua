@@ -17,6 +17,7 @@
 -- rather than pretending the switch means the same thing in both cases.
 
 local context = require("lib.context")
+local design  = require("lib.design")
 
 local M = {
   loaded = {},   -- name -> the module table it returned
@@ -189,8 +190,62 @@ function M.install()
   local tile = M.ctx:tile("Plugins")
   tile:setTitle("🧩")
   tile:setTooltip(string.format("%d plugins", #M.order))
-  tile:setMenu(function() return M.rows(M.state(), M.toggle) end)
+  -- Every component of the shared look, drawn once, so a change to
+  -- lib/theme.lua can be looked at: from here, or `hs -c 'uiGallery()'`.
+  local function gallery() require("lib.ui").gallery(M.ctx:ui()) end
+  M.ctx:global("uiGallery", gallery)
+  M.ctx:global("uiDesign", M.useDesign)
+  M.ctx:global("uiShoot", function(dir) return require("lib.ui").shoot(M.ctx:ui(), dir or "/tmp/hs-design") end)
+  tile:setMenu(function()
+    local rows = M.rows(M.state(), M.toggle)
+    table.insert(rows, #rows, require("lib.ui").menu.submenu("Design", M.designRows))
+    table.insert(rows, #rows, { title = "Preview the UI kit", fn = gallery })
+    return rows
+  end)
+  -- macOS switching between light and dark. A design that follows the system
+  -- rebuilds its overlay colors in place, no reload; the short wait is because
+  -- the notification can arrive before interfaceStyle() reports the new value.
+  local dn = hs.distributednotifications
+  if dn and dn.new then
+    local watcher = dn.new(function()
+      M.ctx:after(0.3, function() require("lib.theme").refresh() end)
+    end, "AppleInterfaceThemeChangedNotification")
+    watcher:start()
+    M.ctx:effect(function() watcher:stop() end)
+  end
+  -- A reload that uiDesign() asked for: show the new look straight away.
+  if design.takePreview() then M.ctx:after(1.5, gallery) end
   return M.ctx
+end
+
+-- ── Designs ────────────────────────────────────────────────────────────────
+-- The Design submenu: one row per file in designs/, the active one ticked.
+-- Picking one switches and reloads (lib/design.use).
+function M.designRows()
+  local menu = require("lib.ui").menu
+  local current, rows = design.current(), {}
+  for _, name in ipairs(design.list()) do
+    local d = design.overrides(name)
+    local label = d.name or name
+    if d.description then label = label .. "  ·  " .. d.description end
+    rows[#rows + 1] = menu.choice(label, name == current, function() design.use(name) end)
+  end
+  rows[#rows + 1] = menu.separator()
+  rows[#rows + 1] = menu.text("Edit or add files in designs/, then pick one here")
+  return rows
+end
+
+-- hs -c 'uiDesign()'          the active design and the ones on disk
+-- hs -c 'uiDesign("warm")'    switch to designs/warm.lua and reload
+function M.useDesign(name)
+  local list = design.list()
+  if name == nil then
+    return string.format("design: %s (available: %s)", design.current(), table.concat(list, ", "))
+  end
+  for _, n in ipairs(list) do
+    if n == name then design.use(name); return "switching to " .. name end
+  end
+  return string.format("no design %q in designs/ (available: %s)", tostring(name), table.concat(list, ", "))
 end
 
 function M.warn(msg) print(msg) end

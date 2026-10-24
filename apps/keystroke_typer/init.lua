@@ -270,12 +270,18 @@ local esc                                   -- cancel key, live only while typin
 local run = { active = false, steps = nil, i = 0, release = nil,
               keymap = nil, hold = false }
 
-local function stop(message)
+-- Every message this plugin shows is a toast from lib/ui, so it looks like
+-- the rest of the config and replaces the last one instead of stacking.
+local function toast(message, seconds, tone)
+  ctx:ui():toast(message, { seconds = seconds, tone = tone })
+end
+
+local function stop(message, tone)
   if run.release then run.release(); run.release = nil end
   run.active, run.steps, run.i = false, nil, 0
   run.keymap, run.hold = nil, false
   if esc then esc:disable() end
-  if message then hs.alert.show(message, 1.2) end
+  if message then toast(message, 1.2, tone) end
 end
 
 function M.cancel()
@@ -292,7 +298,7 @@ local function tick()
   end
   run.i = run.i + 1
   local ok, err = pcall(M.post, step)
-  if not ok then stop("Keystroke typer: " .. tostring(err)) end
+  if not ok then stop("Keystroke typer: " .. tostring(err), "danger") end
 end
 
 local function holding()
@@ -320,9 +326,9 @@ end
 --               without this a caller handing over fresh text would hit that
 --               toggle and get silence. apps/dictation passes it: the take the
 --               user just spoke is the one they want at the cursor.
--- opts.quiet    No "Typing N characters" alert. For a caller that already shows
+-- opts.quiet    No "Typing N characters" toast. For a caller that already shows
 --               the user what is happening; apps/dictation has its own HUD, and
---               an alert per utterance is noise.
+--               a toast per utterance is noise.
 function M.type(text, opts)
   opts = opts or {}
   if run.active then
@@ -330,20 +336,20 @@ function M.type(text, opts)
     stop(nil)
   end
   if type(text) ~= "string" or text == "" then
-    return hs.alert.show("Nothing to type", 1.2)
+    return toast("Nothing to type", 1.2)
   end
 
   local keymap = M.layout()
   local steps = M.plan(text, M.newline, keymap)
   if #steps > M.maxChars then
-    return hs.alert.show(string.format("Too long: %d characters (limit %d)",
-      #steps, M.maxChars), 2)
+    return toast(string.format("Too long: %d characters (limit %d)",
+      #steps, M.maxChars), 2, "warning")
   end
 
   run.active, run.steps, run.i, run.keymap = true, steps, 0, keymap
   if esc then esc:enable() end
   if not opts.quiet then
-    hs.alert.show(string.format("Typing %d characters — esc to cancel", #steps), 1.2)
+    toast(string.format("Typing %d characters · esc to cancel", #steps), 1.2, "working")
   end
 
   whenHandsAreOff(function()
@@ -383,7 +389,7 @@ function M.append(text, opts)
 
   if run.active then
     if #run.steps - run.i + #steps > M.maxChars then
-      hs.alert.show("Typing queue is full", 1.6)
+      toast("Typing queue is full", 1.6, "warning")
       return 0
     end
     for _, s in ipairs(steps) do run.steps[#run.steps + 1] = s end
@@ -391,8 +397,8 @@ function M.append(text, opts)
   end
 
   if #steps > M.maxChars then
-    hs.alert.show(string.format("Too long: %d characters (limit %d)",
-      #steps, M.maxChars), 2)
+    toast(string.format("Too long: %d characters (limit %d)",
+      #steps, M.maxChars), 2, "warning")
     return 0
   end
   run.active, run.steps, run.i = true, steps, 0
@@ -428,7 +434,7 @@ function M.typeClipboard()
   if run.active then return M.cancel() end
   local text = hs.pasteboard.getContents()
   if type(text) ~= "string" or text == "" then
-    return hs.alert.show("Clipboard holds no text", 1.2)
+    return toast("Clipboard holds no text", 1.2)
   end
   M.type(text)
 end

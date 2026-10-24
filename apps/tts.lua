@@ -185,11 +185,11 @@ function M.speakSelection(sel)
       restore()
       if not text then
         logf("[tts] selection: nothing to speak (copy landed=%s)", tostring(landed))
-        hs.alert.show("nothing selected")
+        ctx:ui():toast("Nothing selected")
         return
       end
       logf("[tts] selection: %d chars", #text)
-      hs.alert.show("🔊 " .. utils.truncate(core.sanitize(text), 60))
+      ctx:ui():toast("🔊 " .. utils.truncate(core.sanitize(text), 60))
       M.speak(text, sel or SEL.PROFILE)
     end)
     stopPoll = release

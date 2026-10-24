@@ -193,3 +193,21 @@ describe("menuhub.items switch and slider", function()
     assert.equals("info", hub.items({ { title = "Play", switch = true } })[1].kind)
   end)
 end)
+
+-- The panel's colors live in lib/theme, not in the HTML, so the hub and the
+-- overlays cannot drift apart.
+describe("menuhub.themed", function()
+  it("puts the theme's variables where the panel's marker is", function()
+    local out = hub.themed("<style>/*@theme*/ body {}</style>")
+    assert.is_nil(out:find("@theme", 1, true))
+    assert.truthy(out:find(require("lib.theme").css(), 1, true))
+  end)
+
+  it("ships a panel that carries the marker", function()
+    local f = assert(io.open(hub.PANEL_HTML, "r"))
+    local html = f:read("*a"); f:close()
+    assert.truthy(html:find("/*@theme*/", 1, true))
+    -- Nothing left over from before: the panel names no accent of its own.
+    assert.is_nil(html:find("--accent:", 1, true))
+  end)
+end)

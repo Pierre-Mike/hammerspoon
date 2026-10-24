@@ -48,6 +48,7 @@ Apps load themselves: anything under `apps/` with an `init.lua`, and any single
 | `apps/tailscale_funnel` | One public address for this Mac — `https://<machine>.<tailnet>.ts.net`, carried by [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) — leased by whoever needs it (`POST :8795/lease` with an owner, a mode and a local port; `GET /funnel` to read it back; `POST /release` to let go). The address is tied to the machine and the tailnet rather than to a process, so a daemon restart, a config reload and a reboot all leave it alone: a webhook is registered once and never again. The plugin never arms the funnel by itself — publishing a port to the internet is a menu click, and `tailscale funnel --bg` keeps it armed across reboots — and never turns one off when the last lease goes. `url` is null until the funnel really carries the leased port, so a caller is never handed an address nothing answers on; `hostname` is there as soon as the Mac is logged in, because that is the string a human pastes into a dashboard. Not installed, logged out, Funnel not granted in the tailnet policy, and a funnel pointed at the wrong port each say so in one line, rechecked every 30 s so a fix clears itself. A Setup submenu carries the whole checklist and does the four steps it can finish: it installs the standalone client with Homebrew, starts the sign-in and opens the page that command prints, opens the Tailscale app when tailscaled is not answering, and arms the funnel. Four more need a person (MagicDNS and HTTPS certificates, the funnel node attribute, the voice agent's `.env`, Meta's callback URL), and for each of those it opens the right page with the right text already on the clipboard and says in one line what is left. The next unfinished step gets a button of its own, so a Mac with no Tailscale on it opens the tile and finds Install Tailscale. An owner can hand over a probe path and the token it expects back; three misses in a row turn the tile red and an answer turns it green again. |
 | `apps/ovis_ocr` | Local OCR. A warm server (`apps/ovis_ocr/server.py`, port 8797) runs [OvisOCR2](https://huggingface.co/ATH-MaaS/OvisOCR2) through mlx-vlm and turns an image or a PDF into Markdown. LLM tools reach it through an MCP bridge (`apps/ovis_ocr/mcp.py`), scripts through `POST /ocr`, and a browser through a drop page at `http://127.0.0.1:8797/`. The tile reads a file into `<name>.ocr.md`, or reads the clipboard image. See [OCR](#ocr). |
 | `apps/wake_word` | Say "Codec" with no call open and the voice agent starts one. A second ffmpeg tails dictation's microphone, and every 1.5 s the last four seconds go to dictation's warm server on :8765 when they are loud enough to be speech. A transcript with the word in it (or "Kodak", which is what Parakeet often hears) posts `/start` to the voice agent's daemon, then hands it the sentence the word ended with on `/heard`. It stays quiet during a call, while dictation has the mic, for a few seconds after a call closes, and whenever `apps/voice_agent` is not loaded. On by default; the tile has the switch. Log: `/tmp/hs-voice-wake.log`. |
+| `apps/karaoke` | Shows the lyrics of whatever is playing, one line at a time, in a black island that hangs from the top of the screen like the MacBook notch. `media-control` (`brew install media-control`) reads the macOS Now Playing center, so Spotify, Music and a YouTube tab in Safari or Chrome all work. Without it, the plugin asks Spotify and Music over AppleScript once a second and cannot see a browser. Synced lyrics come from [LRCLIB](https://lrclib.net), which is free and needs no key. The plugin splits and cleans a YouTube title such as "Artist - Song (Official Video)" before the lookup. The line being sung turns from grey to white as it goes, and the next line shows underneath. On a notched screen the text sits below the notch. The tile has the switch, a choice between the main and the built-in screen, and a timing nudge for lyrics that run early or late. Cmd+Alt+Shift+K shows or hides the island. Log: `/tmp/hs-karaoke.log`. |
 
 ### One menu-bar button
 
@@ -87,9 +88,13 @@ ctx:task(bin, onExit, args)             -- hs.task, terminated on dispose
 ctx:hotkey({ "cmd" }, "d", fn)          -- deleted on dispose
 ctx:url("myapp", fn)                    -- hammerspoon://myapp, unbound on dispose
 ctx:atExit(cleanup)                     -- instead of hs.shutdownCallback
+ctx:ui():toast("Copied")                -- shared components, see "One look" below
 
 function M.dispose() ctx:dispose() end  -- what makes the app switchable
 ```
+
+`make plugin NAME=my_app TITLE="My app"` starts a new plugin from
+`templates/plugin/init.lua`, which already does all of the above.
 
 Every constructor returns `handle, release`. The handle is the real `hs` object,
 so calling code reads as it always did; `release()` tears that one effect down
@@ -105,6 +110,45 @@ persists across reloads. Switching off is only as good as the app: one with a
 `dispose()` genuinely goes away, while one without can only be stopped from
 loading next time, and its row says `(reload to remove)` rather than pretending
 otherwise.
+
+### One look
+
+Plugins do not draw their own UI. Each one picks components from `lib/ui.lua`
+through its context, and every component takes its colors, type sizes, corners
+and spacing from `lib/theme.lua`. The hub panel reads the same tokens, so one
+change to the theme restyles every plugin and the hub together.
+
+```lua
+local ui   = ctx:ui()
+local menu = require("lib.ui").menu
+
+ui:toast("Copied", { tone = "success" })              -- one at a time, across all plugins
+local _, hide = ui:hud("Recording", { tone = "recording" })
+local bar = ui:bar("bar", { pick = run })             -- buttons that never take focus
+bar:show({ title = "Rewrite", buttons = { { id = "short", label = "Shorter" } } })
+ui:notify("Model loaded")                             -- Notification Center
+
+tile:setMenu(function() return {
+  menu.switch("Enabled", on, toggle),
+  menu.choice("Brown", color == "brown", pick),
+  menu.slider("Volume", 40, { max = 100, unit = "%" }, setVolume),
+} end)
+```
+
+A plugin passes a meaning (`success`, `working`, `danger`), never a color.
+`tests/spec/design_rules_spec.lua` fails on a plugin that writes a color, a
+radius, a point size or `hs.alert` itself. [DESIGN.md](DESIGN.md) has the
+full brief: which component fits which job, tones, placement, wording and menus.
+`hs -c 'uiGallery()'`, or "Preview the UI kit" in the 🧩 Plugins tile, shows
+every component on screen.
+
+The look itself is a design: one file in `designs/` that overrides only the
+tokens it changes. Five come with the repo (default, warm, light, compact and
+terminal). Switch with the Design submenu in the 🧩 Plugins tile, or with
+`hs -c 'return uiDesign("warm")'`, which reloads and shows the gallery.
+The default design follows the system's light and dark mode, and switches
+live when macOS does. `designs/default.lua` lists every key a design can set, and
+`tests/spec/design_spec.lua` fails on a design whose text doesn't read.
 
 ### Spoons
 

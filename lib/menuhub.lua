@@ -15,7 +15,8 @@ local M = { entries = {}, bar = nil, panel = nil, view = nil }
 -- view: nil = the tile grid, else { entry = <entry>, path = { item indexes } }
 
 M.BAR_TITLE = "🔨"
-M.PANEL_WIDTH = 360
+-- The design decides how wide the panel is, so a three-column grid has room.
+M.PANEL_WIDTH = require("lib.theme").panel.width
 M.PANEL_MAX_H = 640
 
 local HERE = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
@@ -185,6 +186,14 @@ function M.model(entries, view, encode)
   return { view = "home", tiles = tiles, depth = 0 }
 end
 
+-- Pure: the panel's HTML with lib/theme's colors and corners in place of its
+-- /*@theme*/ marker. A function replacement, because the CSS is full of the
+-- `%` that a replacement string would read as a capture.
+function M.themed(html)
+  local css = require("lib.theme").css()
+  return (html:gsub("/%*@theme%*/", function() return css end, 1))
+end
+
 local FOOTER = {
   { title = "Reload Hammerspoon", fn = function() hs.reload() end },
   { title = "Open console",       fn = function() hs.openConsole() end },
@@ -314,7 +323,7 @@ local function ensurePanel()
   local f = io.open(M.PANEL_HTML, "r")
   local html = f and f:read("*a") or "<p>missing menuhub_panel.html</p>"
   if f then f:close() end
-  M.panel:html(html)
+  M.panel:html(M.themed(html))
   return M.panel
 end
 

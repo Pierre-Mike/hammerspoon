@@ -11,7 +11,8 @@
 --
 -- So a plugin never calls the hs.* constructors directly. It calls ctx:timer(),
 -- ctx:task(), ctx:tile() and friends, which build the same object and remember
--- how to undo it.
+-- how to undo it. The same goes for what it draws: ctx:ui() hands out the
+-- shared components, so no plugin builds its own look.
 --
 -- Every constructor returns `handle, release`. The handle is the real hs object
 -- with its own methods, so calling code reads exactly as it did before. The
@@ -328,6 +329,15 @@ end
 function Context:tile(name)
   local tile = require("lib.menuhub").item(name)
   return tile, self:effect(function() tile:delete() end)
+end
+
+-- ── Components ─────────────────────────────────────────────────────────────
+-- What a plugin draws with: toasts, a HUD, a button bar, themed surfaces (see
+-- lib/ui.lua). Bound to this context, so everything it puts on screen is an
+-- effect like any other and leaves with the plugin. One kit per context.
+function Context:ui()
+  self._ui = self._ui or require("lib.ui").new(self)
+  return self._ui
 end
 
 return M
