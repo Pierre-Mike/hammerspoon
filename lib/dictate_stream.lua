@@ -147,15 +147,15 @@ end
 --   on          the user's setting
 --   engine      the selected model's engine; only parakeet carries timestamps
 --   dictate     what /health reported for this server
---   llmCleanup  LM Studio rewrites the finished transcript wholesale, and a
---               rewrite has no prefix to have committed against
+--   llmCleanup  the Claude clean-up rewrites the finished transcript wholesale,
+--               and a rewrite has no prefix to have committed against
 -- Returns ok, reason — the reason is for the log, and is nil when ok.
 function M.available(st)
   st = st or {}
   if not st.on then return false, "off" end
   if st.engine ~= "parakeet" then return false, "engine " .. tostring(st.engine) end
   if not st.dictate then return false, "server has no live dictation" end
-  if st.llmCleanup then return false, "LM Studio clean-up rewrites the transcript" end
+  if st.llmCleanup then return false, "the Claude clean-up rewrites the transcript" end
   return true, nil
 end
 

@@ -161,12 +161,12 @@ describe("dictate_stream.available", function()
     assert.is_false((dstream.available(st({ dictate = false }))))
   end)
 
-  -- LM Studio rewrites the finished transcript wholesale, and a rewrite has no
-  -- prefix to have committed against.
-  it("is off when the LM Studio clean-up is on", function()
+  -- The clean-up rewrites the finished transcript wholesale, and a rewrite has
+  -- no prefix to have committed against.
+  it("is off when the Claude clean-up is on", function()
     local ok, why = dstream.available(st({ llmCleanup = true }))
     assert.is_false(ok)
-    assert.is_truthy(why:find("LM Studio", 1, true))
+    assert.is_truthy(why:find("clean-up", 1, true))
   end)
 
   it("is off given nothing at all", function()

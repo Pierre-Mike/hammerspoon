@@ -322,55 +322,155 @@ describe("delivering a transcript", function()
   end)
 end)
 
-describe("LM Studio clean-up", function()
-  local MODELS = { data = { { id = "qwen", type = "llm", state = "loaded" } } }
-  local REPLY = { choices = { { message = { content = "Hello, world." } } } }
+-- apps/text_actions stands in as a fake in the registry: its own spec covers
+-- claude -p, the bar and the timeouts. What matters here is what dictation asks
+-- of it, and that a take still lands when it is switched off.
+local ta = { runs = {}, bars = {}, hidden = 0, reply = nil }
+function ta.run(text, id, done, opts)
+  ta.runs[#ta.runs + 1] = { text = text, id = id, opts = opts }
+  if ta.reply ~= "hang" then done(ta.reply, ta.reply == nil and "no reply" or nil) end
+  return function() end
+end
+function ta.showBar(text, opts) ta.bars[#ta.bars + 1] = { text = text, opts = opts } end
+function ta.hideBar() ta.hidden = ta.hidden + 1 end
 
-  it("is off unless switched on, and never calls LM Studio", function()
-    load()
+local function withActions(settings)
+  load(settings)
+  ta.runs, ta.bars, ta.hidden, ta.reply = {}, {}, 0, nil
+  plugins.loaded["text_actions"] = ta
+end
+
+-- Fn held, then a bare key: the chord tap is the second one built.
+local function chord(key)
+  local e = {
+    getProperty = function() return 0 end,
+    getFlags = function() return {} end,
+    getKeyCode = function() return hs.keycodes.map[key] end,
+  }
+  return taps[2].fn(e)
+end
+
+describe("Claude clean-up", function()
+  after_each(function() plugins.loaded["text_actions"] = nil end)
+
+  it("is off unless switched on, and never runs a rewrite", function()
+    withActions()
     take()
-    assert.equals(0, #gets)
+    assert.equals(0, #ta.runs)
     assert.equals("hello world", d.lastResult)
   end)
 
   it("types the cleaned text when switched on from the menu", function()
-    load()
-    menuItem("Clean up with LM Studio").fn()
+    withActions()
+    menuItem("Clean up with Claude").fn()
     assert.is_true(hs.settings._v["dictate.llmCleanup"])
-    JSON.models, JSON.reply = MODELS, REPLY
-    modelsBody, llmReply = "models", "reply"
+    ta.reply = "Hello, world."
     take()
-    assert.equals("qwen", JSON.sent.model)
-    assert.equals("hello world", JSON.sent.messages[2].content)
+    assert.equals("cleanup", ta.runs[1].id)
+    assert.equals("hello world", ta.runs[1].text)
+    assert.equals(require("lib.text_actions").CLEANUP_TIMEOUT, ta.runs[1].opts.timeout)
+    typeOut()
     assert.equals("Hello, world.", d.lastResult)
+    assert.equals("Hello, world.", typedText())
     assert.equals("Hello, world.", pb.text)
   end)
 
-  it("types the raw text when LM Studio is not running", function()
-    load({ ["dictate.llmCleanup"] = true })
+  it("types the raw text when the rewrite misses", function()
+    withActions({ ["dictate.llmCleanup"] = true })
     take()
     typeOut()
-    assert.equals("hello world", d.lastResult)
     assert.equals("hello world", typedText())
   end)
 
-  it("types the raw text on a timeout and ignores a late reply", function()
-    load({ ["dictate.llmCleanup"] = true })
-    JSON.models = MODELS
-    modelsBody, llmReply = "models", "hang"
+  it("waits for the clean-up before typing anything", function()
+    withActions({ ["dictate.llmCleanup"] = true })
+    ta.reply = "hang"
     take()
-    assert.equals(0, #hs.eventtap._sent, "delivered before the clean-up answered")
-    fire(4)
+    assert.equals(0, #hs.eventtap._sent)
+  end)
+
+  it("types the raw text when the text actions plugin is off", function()
+    load({ ["dictate.llmCleanup"] = true })
+    take()
     typeOut()
     assert.equals("hello world", typedText())
-    assert.equals("hello world", pb.text)
-    -- The reply lands after the timeout: nothing more is typed.
-    local sent = #hs.eventtap._sent
-    JSON.reply = REPLY
-    for _, p in ipairs(posts) do
-      if p.url:match("/chat/completions$") then p.cb(200, "reply", {}) end
-    end
-    assert.equals(sent, #hs.eventtap._sent)
+  end)
+end)
+
+describe("text actions bar", function()
+  after_each(function() plugins.loaded["text_actions"] = nil end)
+
+  it("opens after a take on the typed text, delivering to the clipboard", function()
+    withActions()
+    take()
+    assert.equals(1, #ta.bars)
+    assert.equals("hello world", ta.bars[1].text)
+    assert.equals("clipboard", ta.bars[1].opts.deliver)
+    ta.bars[1].opts.onResult("Hello there.", "improve")
+    assert.equals("Hello there.", d.lastResult)
+  end)
+
+  it("stays shut when switched off from the menu", function()
+    withActions()
+    menuItem("Show text actions after a take").fn()
+    assert.is_false(hs.settings._v["dictate.textActionsBar"])
+    take()
+    assert.equals(0, #ta.bars)
+  end)
+
+  it("stays shut for a take that heard nothing", function()
+    withActions()
+    d.engine = "mlxa"
+    finishBody = "Thanks for watching!"
+    take()
+    assert.equals(0, #ta.bars)
+  end)
+
+  it("is closed by the next take", function()
+    withActions()
+    take()
+    ta.hidden = 0
+    d.toggle()
+    assert.equals(1, ta.hidden)
+  end)
+end)
+
+describe("Fn+R holds a take for the bar", function()
+  after_each(function() plugins.loaded["text_actions"] = nil end)
+
+  it("types nothing and hands the transcript to the bar to type", function()
+    withActions()
+    d.fnDown = true
+    d.toggle()
+    write(d.paths.WAV, "RIFFaudio")
+    assert.is_true(chord("r"))
+    clock = clock + 3
+    d.toggle()
+    ffmpegExit()
+    assert.equals(0, #hs.eventtap._sent)
+    assert.equals(1, #ta.bars)
+    local opts = ta.bars[1].opts
+    assert.equals("type", opts.deliver)
+    assert.is_true(opts.fallback)
+    assert.equals("Type as is", opts.keep)
+  end)
+
+  it("only holds the take it was pressed in", function()
+    withActions()
+    d.fnDown = true
+    d.toggle(); write(d.paths.WAV, "RIFFaudio"); chord("r")
+    clock = clock + 3; d.toggle(); ffmpegExit()
+    take()
+    assert.equals("clipboard", ta.bars[2].opts.deliver)
+  end)
+
+  it("types the take as usual when the text actions plugin is off", function()
+    load()
+    d.fnDown = true
+    d.toggle(); write(d.paths.WAV, "RIFFaudio"); chord("r")
+    clock = clock + 3; d.toggle(); ffmpegExit()
+    typeOut()
+    assert.equals("hello world", typedText())
   end)
 end)
 

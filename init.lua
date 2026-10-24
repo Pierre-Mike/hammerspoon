@@ -21,6 +21,8 @@ plugins.loadAll({
   "dsh",
   "shokz_mute",
   "keystroke_typer",
+  -- Beside the typer: dictation calls both, and the bar types through it.
+  "text_actions",
   "ovis_ocr",
   -- Before voice_agent, which is the thing that leases the public address:
   -- the service reads better above its caller in the hub.

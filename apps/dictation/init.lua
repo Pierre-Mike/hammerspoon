@@ -7,8 +7,13 @@
 -- types that prefix while the take is still running, and reconciles whatever is
 -- left when Fn comes up. Measured on a ten-take corpus, 94% of the transcript
 -- is already in the document at release, and nothing typed live ever had to be
--- taken back. Any other model, or the LM Studio clean-up switched on, and the
+-- taken back. Any other model, or the Claude clean-up switched on, and the
 -- whole transcript still types on release the way it always did.
+--
+-- After each take apps/text_actions, when it is loaded, shows a bar of rewrites
+-- (simplify, improve, …) whose result goes to the clipboard. Fn+R during a take
+-- holds it back instead: nothing is typed until a rewrite, or "Type as is", is
+-- picked from the bar.
 --
 -- Everything this plugin builds belongs to its context, and two of those things
 -- are why it matters here more than anywhere else in apps/. The Fn tap sits in
@@ -25,7 +30,7 @@ local sttServer   = require("lib.stt_server")
 local configFile  = require("lib.config")
 local plugins     = require("lib.plugins")
 local tfilter     = require("lib.transcript_filter")
-local llm         = require("lib.llm_cleanup")
+local rewrite     = require("lib.text_actions")
 local takes       = require("lib.dictation_takes")
 local tapGuard    = require("lib.tap_guard")
 local dstream     = require("lib.dictate_stream")
@@ -70,8 +75,13 @@ local M = { recording = false, ffmpegTask = nil, fnDown = false, startedAt = 0, 
 M.paths = { WAV = WAV, RAW = RAW, TAKES = TAKES_DIR }
 -- "starting" from Fn-down until the first audio bytes land, then "listening".
 M.micState = "idle"
--- Optional LM Studio pass over each transcript before it is typed. Off by default.
+-- Optional Claude clean-up of each transcript before it is typed, through
+-- apps/text_actions. Off by default: it sends the take to Anthropic.
 M.llmCleanup = hs.settings.get("dictate.llmCleanup") == true
+-- The bar of text actions after each take. On by default; needs apps/text_actions.
+M.actionsBar = hs.settings.get("dictate.textActionsBar") ~= false
+-- Set by Fn+R during a take: hold the transcript for the bar instead of typing it.
+M.holdForAction = false
 -- Pins mlx-audio models to one language ("fr"); nil lets each model decide.
 M.language = hs.settings.get("dictate.language")
 -- Type the words as they settle, instead of the whole transcript on release.
@@ -418,30 +428,16 @@ M.modelSize   = _sel.sizeStr          -- resident-memory footprint (e.g. "2.3 GB
 M.serverModel = _sel                  -- what parakeet_server.py loads
 M.menu:setTooltip("Dictate · " .. M.modelName .. " · " .. (M.modelSize or "?") .. " · mic: " .. (M.micName or "?"))
 
--- Floating HUD at screen center
-local function showHUD(label, dotColor)
-  local f = hs.screen.mainScreen():frame()
-  local w, h = 260, 70
-  local x = f.x + (f.w - w) / 2
-  local y = f.y + (f.h - h) / 2
-  -- Named, so asking for it again takes the previous one down: three of these
-  -- are drawn per take and a stack of them would float over every space.
-  M.hud, M.hudRelease = ctx:canvas("hud", {x = x, y = y, w = w, h = h})
-  M.hud:behavior({"canJoinAllSpaces", "stationary"})
-  M.hud:level(hs.canvas.windowLevels.overlay)
-  M.hud:appendElements(
-    { type = "rectangle", action = "fill",
-      fillColor = { red = 0, green = 0, blue = 0, alpha = 0.82 },
-      roundedRectRadii = { xRadius = 14, yRadius = 14 } },
-    { type = "circle", action = "fill",
-      fillColor = dotColor,
-      center = { x = 32, y = 35 }, radius = 11 },
-    { type = "text", text = label,
-      textColor = { white = 1, alpha = 1 },
-      textSize = 20, textAlignment = "left",
-      frame = { x = 60, y = 22, w = 190, h = 30 } }
-  )
-  M.hud:show()
+-- What this plugin draws comes from lib/ui, so the HUD, the messages and the
+-- live preview look like every other plugin's.
+local UI    = require("lib.ui")
+local theme = UI.theme
+
+-- Floating HUD at screen center. The kit names it, so asking for it again takes
+-- the previous one down: three of these are drawn per take and a stack of them
+-- would float over every space.
+local function showHUD(label, tone)
+  M.hud, M.hudRelease = ctx:ui():hud(label, { tone = tone })
 end
 
 local function hideHUD()
@@ -449,51 +445,23 @@ local function hideHUD()
   M.hud, M.hudRelease = nil, nil
 end
 
--- Single centered notification that always replaces the previous one.
--- Avoids hs.alert.show's bottom-stacked behavior so the user sees one message at a time.
+-- One message on screen at a time, replacing the last: lib/ui's toast, which
+-- is what this plugin used hs.alert's bottom-stacked messages to avoid.
 local function notify(text, seconds)
-  if M.notifyTimer then M.notifyTimer(); M.notifyTimer = nil end
-  local f = hs.screen.mainScreen():frame()
-  local w, h = 420, 56
-  local x = f.x + (f.w - w) / 2
-  local y = f.y + (f.h - h) / 2
-  -- The name is what makes this replace rather than stack: one message on
-  -- screen at a time is the whole point of not using hs.alert here.
-  M.notify, M.notifyRelease = ctx:canvas("notify", {x = x, y = y, w = w, h = h})
-  M.notify:behavior({"canJoinAllSpaces", "stationary"})
-  M.notify:level(hs.canvas.windowLevels.overlay)
-  M.notify:appendElements(
-    { type = "rectangle", action = "fill",
-      fillColor = { red = 0, green = 0, blue = 0, alpha = 0.85 },
-      roundedRectRadii = { xRadius = 12, yRadius = 12 } },
-    { type = "text", text = text,
-      textColor = { white = 1, alpha = 1 },
-      textSize = 18, textAlignment = "center",
-      frame = { x = 12, y = 16, w = w - 24, h = h - 24 } }
-  )
-  M.notify:show()
-  -- Held as the context's release, so the cancel above stops the timer and
-  -- hands the effect back in one call.
-  local _, stop = ctx:after(seconds or 1.6, function()
-    if M.notifyRelease then M.notifyRelease() end
-    M.notify, M.notifyRelease, M.notifyTimer = nil, nil, nil
-  end)
-  M.notifyTimer = stop
+  M.notify, M.notifyRelease = ctx:ui():toast(text, { seconds = seconds })
 end
 
-local COLOR_REC  = { red = 1.0, green = 0.25, blue = 0.25, alpha = 1 }
-local COLOR_PROC = { red = 1.0, green = 0.75, blue = 0.20, alpha = 1 }
-local COLOR_SETTLED = { white = 0.92, alpha = 1 }            -- earlier words (settling)
-local COLOR_DRAFT   = { red = 1.0, green = 0.78, blue = 0.25, alpha = 1 }  -- volatile tail
+local COLOR_SETTLED = theme.color.text       -- earlier words (settling)
+local COLOR_DRAFT   = theme.tone("draft")    -- volatile tail
 
--- Live dictation preview. Amber means "not in your document yet".
+-- Live dictation preview. The draft color means "not in your document yet".
 --
 -- With live typing on, the split is where the committed text ends: everything
 -- dim is already at the cursor, everything amber is still only a hypothesis.
 -- With it off, nothing is in the document until release, and the useful thing
 -- to point at is the trailing word — the one most likely to still change.
-local PREVIEW_SIZE = 28        -- font point size for the live text
-local PREVIEW_PAD  = 24        -- inner horizontal/vertical padding
+local PREVIEW_SIZE = theme.text.hero   -- font point size for the live text
+local PREVIEW_PAD  = theme.space.xl    -- inner horizontal/vertical padding
 local PREVIEW_TOP  = 50        -- text top offset (leaves room for the rec dot)
 
 -- `committed` is a byte count into `text`, or nil when nothing is being typed.
@@ -513,7 +481,7 @@ local function showLivePreview(text, committed)
   local f = hs.screen.mainScreen():frame()
   local w = math.min(1000, math.floor(f.w * 0.72))
   local innerW = w - 2 * PREVIEW_PAD
-  local lineH = math.floor(PREVIEW_SIZE * 1.32)
+  local lineH = math.floor(PREVIEW_SIZE * theme.leading)
   local cpl = math.max(8, math.floor(innerW / (PREVIEW_SIZE * 0.52)))  -- ~chars/line
   local maxH = math.floor(f.h * 0.7)
   local maxLines = math.max(1, math.floor((maxH - PREVIEW_TOP - PREVIEW_PAD) / lineH))
@@ -544,29 +512,21 @@ local function showLivePreview(text, committed)
   end
   local h = math.min(maxH, PREVIEW_TOP + lines * lineH + PREVIEW_PAD)
   h = math.max(h, PREVIEW_TOP + lineH + PREVIEW_PAD)   -- at least one line
-  local x = f.x + (f.w - w) / 2
-  local y = f.y + f.h - h - 120                         -- bottom edge stays fixed
+  local frame = UI.place(f, w, h, "caption")             -- bottom edge stays fixed
 
   if not M.preview then
-    M.preview, M.previewRelease = ctx:canvas("preview", { x = x, y = y, w = w, h = h })
-    M.preview:behavior({ "canJoinAllSpaces", "stationary" })
-    M.preview:level(hs.canvas.windowLevels.overlay)
+    M.preview, M.previewRelease = ctx:ui():surface("preview", frame, { backdrop = false })
   else
-    M.preview:frame({ x = x, y = y, w = w, h = h })
+    M.preview:frame(frame)
   end
   M.preview:replaceElements(
-    { type = "rectangle", action = "fill",
-      fillColor = { red = 0, green = 0, blue = 0, alpha = 0.85 },
-      roundedRectRadii = { xRadius = 16, yRadius = 16 } },
-    -- Amber until the mic delivers audio, red once it is really recording.
-    { type = "circle", action = "fill",
-      fillColor = (M.micState == "starting") and COLOR_PROC or COLOR_REC,
-      center = { x = 30, y = 30 }, radius = 9 },
-    { type = "text",
-      text = shown and previewStyled(shown, committed)
+    UI.backdrop(w, h, { radius = "lg" }),
+    -- "working" until the mic delivers audio, "recording" once it really is.
+    UI.dot(30, 30, (M.micState == "starting") and "working" or "recording"),
+    UI.label(shown and previewStyled(shown, committed)
              or ((M.micState == "starting") and "Starting…" or "Listening…"),
-      textColor = COLOR_SETTLED, textSize = PREVIEW_SIZE,
-      frame = { x = PREVIEW_PAD, y = PREVIEW_TOP, w = innerW, h = h - PREVIEW_TOP - 8 } }
+             { x = PREVIEW_PAD, y = PREVIEW_TOP, w = innerW, h = h - PREVIEW_TOP - 8 },
+             { style = "hero" })
   )
   M.preview:show()
 end
@@ -809,42 +769,48 @@ local function unduckNoise()
   logf("[duck] restored %.1f", vol)
 end
 
--- Optional clean-up through LM Studio's OpenAI-compatible server. Calls
--- done(text) exactly once: with the cleaned text, or with the raw text on any
--- miss — LM Studio down, no model loaded, a bad reply, or no answer within
--- llm.TIMEOUT seconds. A reply that lands after the timeout is ignored.
+-- apps/text_actions, asked of the registry like the typer: a plain require
+-- would bring back a plugin the user switched off in the hub.
+local function textActions()
+  local t = plugins.loaded["text_actions"]
+  if type(t) == "table" and type(t.run) == "function" and type(t.showBar) == "function" then return t end
+  return nil
+end
+
+-- The bar after a take, when it is wanted and the service is there. `deliver`
+-- is "clipboard" for text that is already at the cursor.
+local function offerActions(text)
+  local ta = M.actionsBar and textActions()
+  if not ta then return end
+  ta.showBar(text, { deliver = "clipboard", onResult = function(r) M.lastResult = r end })
+end
+
+-- Optional clean-up through apps/text_actions' "cleanup" preset (claude -p).
+-- Calls done(text) exactly once: with the cleaned text, or with the raw text on
+-- any miss — the plugin switched off, claude missing or logged out, a bad
+-- reply, or no answer within rewrite.CLEANUP_TIMEOUT seconds.
 local function polish(text, done)
-  local finished = false
-  local function finish(result, why)
-    if finished then return end
-    finished = true
-    if M.polishTimer then M.polishTimer(); M.polishTimer = nil end
-    if why then logf("[llm] %s; typing the raw transcript", why) end
+  local ta = textActions()
+  if not ta then
+    logf("[llm] text actions plugin not loaded; typing the raw transcript")
+    return done(text)
+  end
+  showHUD("Cleaning up…", "working")
+  M.polishCancel = ta.run(text, "cleanup", function(result, why)
+    M.polishCancel = nil
+    if not result then logf("[llm] %s; typing the raw transcript", tostring(why)) end
     if not M.recording then hideHUD() end
     done(result or text)
-  end
-  showHUD("Cleaning up…", COLOR_PROC)
-  local _, stopPolish = ctx:after(llm.TIMEOUT, function()
-    M.polishTimer = nil
-    finish(nil, "no reply in " .. llm.TIMEOUT .. "s")
-  end)
-  M.polishTimer = stopPolish
-  hs.http.asyncGet(llm.BASE .. "/api/v0/models", nil, function(status, body, _)
-    if finished then return end
-    local ok, decoded = pcall(hs.json.decode, body or "")
-    local model = (status == 200 and ok) and llm.pickModel(decoded) or nil
-    if not model then return finish(nil, "no LM Studio model loaded (status " .. tostring(status) .. ")") end
-    hs.http.asyncPost(llm.BASE .. "/v1/chat/completions", hs.json.encode(llm.request(text, model)),
-      { ["Content-Type"] = "application/json" },
-      function(st, b, _)
-        if finished then return end
-        local ok2, dec = pcall(hs.json.decode, b or "")
-        local cleaned = (st == 200 and ok2) and llm.parse(dec, text) or nil
-        if not cleaned then return finish(nil, "unusable reply from " .. model .. " (status " .. tostring(st) .. ")") end
-        logf("[llm] %s: %d → %d chars", model, #text, #cleaned)
-        finish(cleaned)
-      end)
-  end)
+  end, { timeout = rewrite.CLEANUP_TIMEOUT })
+end
+
+-- Fn+R: the transcript waits in the bar and is typed once something is picked.
+-- Without the service there is no bar to wait in, so it types as usual.
+local function holdForBar(text)
+  local ta = textActions()
+  if not ta then logf("[hold] text actions plugin not loaded; typing the take"); return deliver(text) end
+  ta.showBar(text, { deliver = "type", keep = "Type as is", fallback = true,
+                     onResult = function(r) M.lastResult = r end })
 end
 
 -- Shared tail: reset UI, clean the transcript, then type it at the cursor.
@@ -869,15 +835,32 @@ local function finishTranscript(out)
     return
   end
   M.lastResult = text
+  local hold = M.holdForAction
+  M.holdForAction = false
+  -- Fn+R on a live take took back what had been typed when it was short. When
+  -- it was not, those words are in the document already: finish the take the
+  -- usual way and let the rewrite go to the clipboard.
+  if hold and live and M.live.typed ~= "" then
+    deliverLive(text)
+    notify("already typed · pick a rewrite for the clipboard", 2.2)
+    offerActions(text)
+    return
+  end
+  if hold then
+    if live then releaseLive() end
+    if not M.llmCleanup then return holdForBar(text) end
+    return polish(text, function(final) M.lastResult = final; holdForBar(final) end)
+  end
   -- The live path has its own delivery: most of this text is already on screen,
-  -- so it appends the rest instead of typing the whole thing again. LM Studio
+  -- so it appends the rest instead of typing the whole thing again. The Claude
   -- clean-up is off whenever live typing is on — a wholesale rewrite has no
   -- prefix to have committed against — so the two never meet.
-  if live then deliverLive(text); return end
-  if not M.llmCleanup then deliver(text); return end
+  if live then deliverLive(text); offerActions(text); return end
+  if not M.llmCleanup then deliver(text); offerActions(text); return end
   polish(text, function(final)
     M.lastResult = final
     deliver(final)
+    offerActions(final)
   end)
 end
 
@@ -907,7 +890,7 @@ end
 -- rather than cold-loading a second copy of itself.
 local function transcribe()
   setIcon("…")
-  showHUD("Transcribing…", COLOR_PROC)
+  showHUD("Transcribing…", "working")
   hs.http.asyncPost(STT_URL, M.paths.WAV, { ["Content-Type"] = "text/plain" },
     function(status, body, _)
       if status == 200 and body and body ~= "" and not body:match("^__ERROR__") then
@@ -1007,6 +990,11 @@ local function startRecording()
   setRecording(true)
   M.batchFinish = false
   M.keepTake = false
+  M.holdForAction = false
+  -- A new take means the user has moved on from the last one's bar. A held
+  -- take's text is left on the clipboard by the bar, not dropped.
+  local ta = textActions()
+  if ta and ta.hideBar then ta.hideBar("new take") end
   M.lastPartial = nil
   M.startedAt = hs.timer.secondsSinceEpoch()
   setIcon("●")
@@ -1105,7 +1093,7 @@ function stopRecording()
     if M.live.on then cancelLive() elseif M.stream then cancelStream() end
     return
   end
-  setIcon("…"); showHUD("Transcribing…", COLOR_PROC)
+  setIcon("…"); showHUD("Transcribing…", "working")
   if M.live.on then
     finishLive()
   elseif M.stream then
@@ -1280,6 +1268,12 @@ local function setLlmCleanup(on)
   logf("[llm] clean-up %s", M.llmCleanup and "on" or "off")
 end
 
+local function setActionsBar(on)
+  M.actionsBar = on and true or false
+  hs.settings.set("dictate.textActionsBar", M.actionsBar)
+  logf("[actions] bar after a take %s", M.actionsBar and "on" or "off")
+end
+
 local function setLiveTyping(on)
   M.liveTyping = on and true or false
   hs.settings.set("dictate.liveTyping", M.liveTyping)
@@ -1305,6 +1299,7 @@ local function retranscribe(name)
     local preview = text:sub(1, 60)
     if #text > 60 then preview = preview .. "…" end
     notify("copied: " .. preview, 2.0)
+    offerActions(text)
   end)
 end
 
@@ -1366,8 +1361,15 @@ local function buildMenu()
   items[#items + 1] = { title = "Type while you speak" .. (liveOk and "" or "  (" .. tostring(liveWhy) .. ")"),
     switch = true, checked = M.liveTyping, disabled = not liveOk,
     fn = function() setLiveTyping(not M.liveTyping) end }
-  items[#items + 1] = { title = "Clean up with LM Studio", switch = true, checked = M.llmCleanup,
+  local actionsOk = textActions() ~= nil
+  items[#items + 1] = { title = "Clean up with Claude (sends text to Anthropic)"
+                          .. (actionsOk and "" or "  (text actions plugin off)"),
+    switch = true, checked = M.llmCleanup,
     fn = function() setLlmCleanup(not M.llmCleanup) end }
+  items[#items + 1] = { title = "Show text actions after a take  (Fn+R holds a take for them)"
+                          .. (actionsOk and "" or "  (text actions plugin off)"),
+    switch = true, checked = M.actionsBar, disabled = not actionsOk,
+    fn = function() setActionsBar(not M.actionsBar) end }
   items[#items + 1] = { title = "Retranscribe recent take", menu = takesMenu() }
   items[#items + 1] = { title = "-" }
   items[#items + 1] = { title = "Restart server",
@@ -1401,6 +1403,7 @@ end)
 
 -- Chord detection while holding Fn:
 --   Fn+C  cancel current recording and recall last
+--   Fn+R  hold the take for the text actions bar instead of typing it
 --   Fn+S  speak the current selection through the TTS queue (no dictation)
 
 local HS_PID = (hs.processInfo and hs.processInfo.processID) or 0
@@ -1428,6 +1431,30 @@ M.keyWatcher = ctx:eventtap(hs.eventtap.event.types.keyDown, function(e)
   if kc == hs.keycodes.map["c"] then
     M.cancelled = true
     recallLast()
+    return true
+  end
+  if kc == hs.keycodes.map["r"] then
+    -- Hold this take for the text actions bar: nothing more is typed, and the
+    -- transcript waits in the bar until a rewrite or "Type as is" is picked.
+    if not M.recording or M.holdForAction then return true end
+    M.holdForAction = true
+    logf("[chord] Fn+R — hold the take for text actions")
+    -- The keystroke itself has already stopped committing ("the user typed").
+    if M.live.on then
+      M.stopCommitting("held for text actions")
+      -- What was already typed comes back out when it is a handful of
+      -- characters, the same rule as Fn+C. Longer, and it stays: a long blind
+      -- deletion lands wherever focus is now.
+      local typer = typerPlugin()
+      if typer and M.live.typed ~= "" then
+        local n = #typer.clusters(M.live.typed)
+        if n <= dstream.MAX_BACKSPACES then
+          typer.append("", { backspaces = n })
+          M.live.typed = ""
+          logf("[live] held — took back %d characters", n)
+        end
+      end
+    end
     return true
   end
   if kc == hs.keycodes.map["s"] then
@@ -1505,7 +1532,7 @@ end
 
 probeServer()
 
-notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+S speak selection", 2.0)
+notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+S speak · Fn+R rewrite", 2.0)
 logf("[dictate] init complete")
 
 -- Switch the plugin off: the Fn tap, the warm server and its model, any capture

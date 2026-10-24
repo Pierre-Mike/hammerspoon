@@ -29,6 +29,9 @@ apps/noseguard/overlay/overlay
 /tests/spec/voice_toggle_spec.lua
 /tests/spec/voice_agent_spec.lua
 
+# Personal rewrite presets for apps/text_actions (format: text_actions.example.json)
+/text_actions.json
+
 # Agent scratch: nested git worktrees, and a symlink into the ignored .claude/
 /.worktrees/
 /.agents/skills

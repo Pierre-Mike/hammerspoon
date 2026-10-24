@@ -1,0 +1,11 @@
+{
+  "model": "claude-haiku-5-5",
+  "presets": [
+    { "id": "improve", "model": "claude-sonnet-5-5" },
+    { "id": "formal", "enabled": false },
+    { "id": "commit", "label": "Commit msg", "maxGrowth": 1.5,
+      "prompt": "Turn the text into a git commit message: a short imperative subject line, a blank line, then a brief body only if the text needs one." },
+    { "id": "french", "label": "In French",
+      "prompt": "Translate the text into natural French, keeping the tone." }
+  ]
+}
