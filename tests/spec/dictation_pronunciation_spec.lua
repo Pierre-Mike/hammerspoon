@@ -22,7 +22,10 @@ hs.fs.dir = function(p)
   local names, i = ls(p), 0
   return function() i = i + 1; return names[i] end
 end
-hs.fs.attributes = function(p) return exists(p) and {} or nil end
+-- uv is the one tool the scorer needs on disk. It is there on this Mac and not
+-- on the Linux CI runner, so the spec says it is installed either way.
+local UV = "/opt/homebrew/bin/uv"
+hs.fs.attributes = function(p) return (p == UV or exists(p)) and {} or nil end
 
 -- JSON bodies are keys into this table; the state file is kept in memory.
 local JSON, saved, seq = {}, nil, 0
