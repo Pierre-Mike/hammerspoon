@@ -1,6 +1,7 @@
--- apps/text_actions driven through its public surface: run() spawns claude -p
--- with the text on stdin, the bar delivers what the user picks, a bar holding
--- text that is nowhere else never drops it, and dispose takes everything back.
+-- apps/dictation/rewrite.lua driven through its public surface: run() spawns
+-- claude -p with the text on stdin, the bar delivers what the user picks, a bar
+-- holding text that is nowhere else never drops it, and dictation's context
+-- takes everything back when it goes.
 
 _G.hs = require("hs")
 
@@ -99,21 +100,25 @@ hs.canvas.new = function(frame)
 end
 
 local plugins = require("lib.plugins")
+local context = require("lib.context")
 local typed
 local fakeTyper = { type = function(text) typed[#typed + 1] = text end,
                     pending = function() return 0 end, cancel = function() end }
 
-local ta
+-- Built on a context of its own here, the way dictation builds it on its own.
+local ta, ctx
+local function dispose() ta.stop(); ctx:dispose() end
 local function load()
   -- The last test's instance goes first, so a rewrite it left running does not
   -- leave its temp file behind.
-  if ta then ta.dispose() end
+  if ta then dispose() end
   after, tasks, keys, canvases, typed = {}, {}, {}, {}, {}
   hs.eventtap._sent = {}
   pb.text, pb.count = "user clipboard", 1
-  package.loaded["apps.text_actions.init"] = nil
+  package.loaded["apps.dictation.rewrite"] = nil
   plugins.loaded["keystroke_typer"] = fakeTyper
-  ta = require("apps.text_actions.init")
+  ctx = context.new("Dictation")
+  ta = require("apps.dictation.rewrite")({ ctx = ctx })
 end
 
 local function arg(t, flag)
@@ -241,8 +246,8 @@ describe("the bar", function()
   end)
 end)
 
--- Dictation's Fn+R take: the transcript has not been typed anywhere yet, so the
--- bar is the only thing holding it.
+-- A caller's take that has not been typed anywhere yet, so the bar is the only
+-- thing holding it.
 describe("a bar holding text that is nowhere else", function()
   before_each(load)
   local function hold(onResult)
@@ -291,11 +296,11 @@ end)
 describe("dispose", function()
   before_each(load)
 
-  it("takes back the bar, its keys, the hotkey and a running claude", function()
+  it("takes back the bar, its keys and a running claude", function()
     ta.showBar("words")
     press("alt", "1")
     local path = tasks[1].inputPath
-    ta.dispose()
+    dispose()
     assert.is_true(canvases[1].deleted)
     assert.is_true(tasks[1].terminated)
     assert.is_nil(io.open(path, "r"))

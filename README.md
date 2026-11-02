@@ -29,7 +29,7 @@ Plugins that ship with the repo:
 
 | Plugin | What it does |
 |---|---|
-| `dictation` | Hold Fn, speak, release. The transcript is typed at the cursor. |
+| `dictation` | Hold Fn, speak, release. Review the take, rewrite it with Claude if you like, then paste or type it at the cursor. It also learns the English words you mispronounce and drills them in short lessons. |
 | `brown_noise` | A noise machine with five colors and a volume slider. |
 | `tts` | A spoken-text queue any app can post to, using a local voice model. |
 | `karaoke` | Synced lyrics of the playing song in a notch-style island. |

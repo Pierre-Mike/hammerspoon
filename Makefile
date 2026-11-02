@@ -1,9 +1,9 @@
-.PHONY: test test-lua test-noseguard test-dictate install-deps plugin
+.PHONY: test test-lua test-noseguard test-dictate test-pronunciation install-deps plugin
 
 install-deps:
 	luarocks install busted
 
-test: test-lua test-noseguard test-dictate
+test: test-lua test-noseguard test-dictate test-pronunciation
 
 # Both suites run against the checkout this Makefile lives in, never
 # $HOME/.hammerspoon — otherwise `make test` from a git worktree would silently
@@ -25,6 +25,11 @@ test-noseguard:
 # own rather than borrowing parakeet-mlx's interpreter.
 test-dictate:
 	cd $(REPO) && uv run --no-project --with pytest --with numpy python -m pytest -q dictate/tests
+
+# The word scoring behind dictation's pronunciation lessons. align.py is pure,
+# so this needs neither the phoneme model nor espeak.
+test-pronunciation:
+	cd $(REPO) && uv run --no-project --with pytest python -m pytest -q -p no:cacheprovider apps/dictation/scorer/tests
 
 # A new plugin from templates/plugin: `make plugin NAME=my_app TITLE="My app"`.
 # NAME is the folder and the manifest id. TITLE is the tile's name and defaults

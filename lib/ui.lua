@@ -358,8 +358,8 @@ end
 -- ── Bar ────────────────────────────────────────────────────────────────────
 -- A row of buttons to act on something, drawn on a canvas rather than a
 -- webview because a click on it must never make Hammerspoon the frontmost
--- app: apps/text_actions pastes into whatever was focused, and a bar that took
--- focus would paste into itself.
+-- app: dictation's rewrite bar pastes into whatever was focused, and a bar
+-- that took focus would paste into itself.
 --
 --   local bar = ui:bar("bar", { pick = function(id) end, hover = function(inside) end })
 --   bar:show({ title = "Rewrite “…”", hint = "⌥ number · esc", buttons = { { id, label } } })

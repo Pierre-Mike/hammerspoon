@@ -3,7 +3,8 @@
 --   • the preview says "Starting…" until the mic delivers audio
 --   • a silence hallucination is never typed
 --   • the transcript is typed at the cursor and stays on the clipboard
---   • the optional LM Studio pass, and its fallbacks to the raw text
+--   • the review panel: nothing lands until ↩ pastes it or ⇧↩ types it
+--   • the optional Claude clean-up, and its fallbacks to the raw text
 --   • the last takes are kept on disk and can be retranscribed
 --   • a tap macOS switched off is re-armed, ending a take whose release was lost
 
@@ -55,6 +56,28 @@ hs.eventtap.new = function(types, fn)
 end
 local mods = {}
 hs.eventtap.checkKeyboardModifiers = function() return mods end
+
+-- Hotkeys by mods and key, so a spec can press one the way the user would.
+local keys = {}
+hs.hotkey.bind = function(m, key, pressed)
+  local h = { mods = table.concat(m or {}, "+"), key = key, fn = pressed }
+  function h:delete() self.deleted = true end
+  function h:enable() return self end
+  function h:disable() return self end
+  keys[#keys + 1] = h
+  return h
+end
+local function liveKey(m, key)
+  for i = #keys, 1, -1 do
+    local h = keys[i]
+    if not h.deleted and h.key == key and h.mods == m then return h end
+  end
+end
+local function press(m, key)
+  local h = liveKey(m, key)
+  if not h then error("no live hotkey " .. m .. "+" .. key) end
+  return h.fn()
+end
 
 local wake
 hs.caffeinate = { watcher = {
@@ -162,14 +185,20 @@ local function typeOut()
   error("the typing loop never finished")
 end
 
+-- Review is on by default. Most of this file is about a take that types on
+-- release, so it is off unless a spec asks for it.
 local d
 local function load(settings)
-  tasks, posts, gets, after, taps = {}, {}, {}, {}, {}
+  tasks, posts, gets, after, taps, keys = {}, {}, {}, {}, {}, {}
   hs.settings._v = settings or {}
+  if hs.settings._v["dictate.review"] == nil then hs.settings._v["dictate.review"] = false end
   package.loaded["apps.dictation.init"] = nil
   plugins.loaded["keystroke_typer"] = typer
   d = require("apps.dictation.init")
   d.paths = { WAV = TMP .. "/take.wav", RAW = TMP .. "/take.raw", TAKES = TMP .. "/cache/takes" }
+  -- Pronunciation hears every take; keep what it queues out of ~/.cache.
+  local pp = d.pronunciation.paths
+  pp.state, pp.inbox, pp.clips = TMP .. "/pron/state.json", TMP .. "/pron/inbox", TMP .. "/pron/clips"
 end
 
 local function ffmpegExit()
@@ -322,9 +351,9 @@ describe("delivering a transcript", function()
   end)
 end)
 
--- apps/text_actions stands in as a fake in the registry: its own spec covers
--- claude -p, the bar and the timeouts. What matters here is what dictation asks
--- of it, and that a take still lands when it is switched off.
+-- The rewrites stand in as fakes on d.rewrite: dictation_rewrite_spec covers
+-- claude -p, the bar and the timeouts. What matters here is what dictation and
+-- the review panel ask of them.
 local ta = { runs = {}, bars = {}, hidden = 0, reply = nil }
 function ta.run(text, id, done, opts)
   ta.runs[#ta.runs + 1] = { text = text, id = id, opts = opts }
@@ -337,7 +366,7 @@ function ta.hideBar() ta.hidden = ta.hidden + 1 end
 local function withActions(settings)
   load(settings)
   ta.runs, ta.bars, ta.hidden, ta.reply = {}, {}, 0, nil
-  plugins.loaded["text_actions"] = ta
+  d.rewrite.run, d.rewrite.showBar, d.rewrite.hideBar = ta.run, ta.showBar, ta.hideBar
 end
 
 -- Fn held, then a bare key: the chord tap is the second one built.
@@ -351,8 +380,6 @@ local function chord(key)
 end
 
 describe("Claude clean-up", function()
-  after_each(function() plugins.loaded["text_actions"] = nil end)
-
   it("is off unless switched on, and never runs a rewrite", function()
     withActions()
     take()
@@ -388,18 +415,9 @@ describe("Claude clean-up", function()
     take()
     assert.equals(0, #hs.eventtap._sent)
   end)
-
-  it("types the raw text when the text actions plugin is off", function()
-    load({ ["dictate.llmCleanup"] = true })
-    take()
-    typeOut()
-    assert.equals("hello world", typedText())
-  end)
 end)
 
-describe("text actions bar", function()
-  after_each(function() plugins.loaded["text_actions"] = nil end)
-
+describe("rewrites bar after a typed take", function()
   it("opens after a take on the typed text, delivering to the clipboard", function()
     withActions()
     take()
@@ -412,7 +430,7 @@ describe("text actions bar", function()
 
   it("stays shut when switched off from the menu", function()
     withActions()
-    menuItem("Show text actions after a take").fn()
+    menuItem("Show rewrites after a typed take").fn()
     assert.is_false(hs.settings._v["dictate.textActionsBar"])
     take()
     assert.equals(0, #ta.bars)
@@ -435,42 +453,209 @@ describe("text actions bar", function()
   end)
 end)
 
-describe("Fn+R holds a take for the bar", function()
-  after_each(function() plugins.loaded["text_actions"] = nil end)
-
-  it("types nothing and hands the transcript to the bar to type", function()
-    withActions()
+describe("Fn+R with review off", function()
+  local function heldTake()
     d.fnDown = true
-    d.toggle()
-    write(d.paths.WAV, "RIFFaudio")
+    d.toggle(); write(d.paths.WAV, "RIFFaudio")
     assert.is_true(chord("r"))
-    clock = clock + 3
-    d.toggle()
-    ffmpegExit()
+    clock = clock + 3; d.toggle(); ffmpegExit()
+    d.fnDown = false
+  end
+
+  it("types nothing and sends the take to the review panel", function()
+    withActions()
+    heldTake()
     assert.equals(0, #hs.eventtap._sent)
-    assert.equals(1, #ta.bars)
-    local opts = ta.bars[1].opts
-    assert.equals("type", opts.deliver)
-    assert.is_true(opts.fallback)
-    assert.equals("Type as is", opts.keep)
+    assert.equals(0, #ta.bars)
+    assert.is_true(d.reviewPanel.isOpen())
+    assert.equals("hello world", d.reviewPanel.current.draft)
   end)
 
   it("only holds the take it was pressed in", function()
     withActions()
-    d.fnDown = true
-    d.toggle(); write(d.paths.WAV, "RIFFaudio"); chord("r")
-    clock = clock + 3; d.toggle(); ffmpegExit()
+    heldTake()
     take()
-    assert.equals("clipboard", ta.bars[2].opts.deliver)
-  end)
-
-  it("types the take as usual when the text actions plugin is off", function()
-    load()
-    d.fnDown = true
-    d.toggle(); write(d.paths.WAV, "RIFFaudio"); chord("r")
-    clock = clock + 3; d.toggle(); ffmpegExit()
+    assert.is_false(d.reviewPanel.isOpen())
     typeOut()
     assert.equals("hello world", typedText())
+    assert.equals("clipboard", ta.bars[1].opts.deliver)
+  end)
+end)
+
+describe("the review panel", function()
+  local function reviewing(settings)
+    settings = settings or {}
+    settings["dictate.review"] = true
+    withActions(settings)
+  end
+
+  local function pasted()
+    for _, e in ipairs(hs.eventtap._sent) do
+      if e.key == "v" and e.mods and e.mods[1] == "cmd" then return true end
+    end
+    return false
+  end
+
+  it("is on by default", function()
+    load({ ["dictate.review"] = nil })
+    hs.settings._v["dictate.review"] = nil
+    package.loaded["apps.dictation.init"] = nil
+    d = require("apps.dictation.init")
+    assert.is_true(d.review)
+  end)
+
+  it("types nothing while you speak, and opens on release with the take on the clipboard", function()
+    reviewing()
+    d.serverDictate = true                  -- live typing would be possible
+    d.toggle()
+    assert.is_false(d.live.on)
+    write(d.paths.WAV, "RIFFaudio"); clock = clock + 3; d.toggle(); ffmpegExit()
+    assert.equals(0, #hs.eventtap._sent)
+    assert.equals(0, #ta.bars)
+    assert.is_true(d.reviewPanel.isOpen())
+    assert.equals("hello world", pb.text)
+  end)
+
+  it("pastes on ↩ and gives the key back", function()
+    reviewing()
+    take()
+    press("", "return")
+    assert.is_false(d.reviewPanel.isOpen())
+    fire(0.05)
+    assert.is_true(pasted())
+    assert.equals("hello world", pb.text)
+    assert.equals("hello world", d.lastResult)
+    assert.is_nil(liveKey("", "return"))
+    assert.is_nil(liveKey("", "escape"))
+  end)
+
+  it("types on ⇧↩, one keystroke at a time", function()
+    reviewing()
+    take()
+    press("shift", "return")
+    typeOut()
+    assert.equals("hello world", typedText())
+    assert.is_false(pasted())
+  end)
+
+  it("sends nothing on esc and leaves the take on the clipboard", function()
+    reviewing()
+    take()
+    press("", "escape")
+    fire(0.05)
+    assert.is_false(d.reviewPanel.isOpen())
+    assert.equals(0, #hs.eventtap._sent)
+    assert.equals("hello world", pb.text)
+  end)
+
+  it("rewrites the draft on ⌥1 and brings the words as heard back on ⌥0", function()
+    reviewing()
+    take()
+    ta.reply = "Hello, world."
+    press("alt", "1")
+    assert.equals("cleanup", ta.runs[1].id)
+    assert.equals("hello world", ta.runs[1].text)
+    assert.equals("Hello, world.", d.reviewPanel.current.draft)
+    assert.equals("Hello, world.", pb.text)
+    press("alt", "0")
+    assert.equals("hello world", d.reviewPanel.current.draft)
+    press("", "return")
+    fire(0.05)
+    assert.equals("hello world", pb.text)
+  end)
+
+  it("keeps the draft when a rewrite fails", function()
+    reviewing()
+    take()
+    press("alt", "2")
+    assert.equals("failed", d.reviewPanel.current.mode)
+    assert.equals("hello world", d.reviewPanel.current.draft)
+    press("", "return")
+    fire(0.05)
+    assert.is_true(pasted())
+  end)
+
+  it("runs the clean-up first when that is switched on", function()
+    reviewing({ ["dictate.llmCleanup"] = true })
+    ta.reply = "Hello, world."
+    take()
+    assert.equals(0, #hs.eventtap._sent)
+    assert.equals("cleanup", ta.runs[1].id)
+    assert.equals(require("lib.text_actions").CLEANUP_TIMEOUT, ta.runs[1].opts.timeout)
+    press("", "return")
+    fire(0.05)
+    assert.equals("Hello, world.", pb.text)
+    assert.equals("Hello, world.", d.lastResult)
+  end)
+
+  it("is closed by the next take, which leaves the last one on the clipboard", function()
+    reviewing()
+    take()
+    d.toggle()
+    assert.is_false(d.reviewPanel.isOpen())
+    assert.is_nil(liveKey("", "return"))
+    assert.equals("hello world", pb.text)
+  end)
+
+  it("opens on the selection with ⌘⌥⇧R", function()
+    reviewing()
+    d.rewrite.grabSelection = function(cb) cb("selected words") end
+    press("cmd+alt+shift", "r")
+    assert.equals("selected words", d.reviewPanel.current.draft)
+  end)
+
+  it("is switched off from the menu, and live typing comes back", function()
+    reviewing()
+    assert.is_true(menuItem("Type while you speak").disabled)
+    menuItem("Review each take").fn()
+    assert.is_false(hs.settings._v["dictate.review"])
+    take()
+    assert.is_false(d.reviewPanel.isOpen())
+    typeOut()
+    assert.equals("hello world", typedText())
+  end)
+
+  it("offers ⌥0 only once the draft is no longer the words as heard", function()
+    local rv = require("apps.dictation.review")
+    local presets = { { id = "cleanup", label = "Clean up" } }
+    local function ids(R)
+      local out = {}
+      for _, b in ipairs(rv.buttons(R, presets)) do out[#out + 1] = b.id end
+      return table.concat(out, " ")
+    end
+    assert.equals("paste type cleanup", ids({ original = "a", draft = "a" }))
+    assert.equals("paste type original cleanup", ids({ original = "a", draft = "A." }))
+  end)
+
+  it("never takes focus", function()
+    reviewing()
+    local made = {}
+    local real = hs.canvas.new
+    hs.canvas.new = function(f)
+      local c = real(f)
+      local orig = c.clickActivating
+      c.clickActivating = function(self, v) made[#made + 1] = v; if orig then return orig(self, v) end; return self end
+      return c
+    end
+    take()
+    hs.canvas.new = real
+    assert.is_false(made[#made])
+  end)
+end)
+
+describe("one tile", function()
+  it("carries the rewrites and the pronunciation rows", function()
+    load()
+    menuItem("Rewrite the selection")
+    menuItem("Learn pronunciation from my dictation")
+  end)
+
+  it("hands every take to pronunciation", function()
+    load()
+    local got
+    d.pronunciation.onTake = function(t) got = t end
+    take("audio")
+    assert.equals("hello world", got.text)
   end)
 end)
 
@@ -513,6 +698,58 @@ describe("recent takes", function()
     load()
     local sub = menuItem("Retranscribe recent take").menu
     assert.is_true(sub[1].disabled)
+  end)
+end)
+
+-- apps/dictation/pronunciation.lua, and any other app, hears each take through
+-- onTake: the words the model settled on and the kept WAV, together, once
+-- both exist.
+describe("take listeners", function()
+  it("hands over the transcript and the kept audio once per take", function()
+    load()
+    local got = {}
+    d.onTake("spec", function(t) got[#got + 1] = t end)
+    finishBody = "three kids"
+    take("audio")
+    assert.equals(1, #got)
+    assert.equals("three kids", got[1].text)
+    assert.equals(d.paths.TAKES .. "/" .. ls(d.paths.TAKES)[1], got[1].wav)
+  end)
+
+  it("waits for the audio when the transcript comes first, and the other way round", function()
+    load()
+    local got = {}
+    d.onTake("spec", function(t) got[#got + 1] = t end)
+    d.engine, d.stream = "mlxa", false     -- batch: the WAV is kept before it is transcribed
+    take("audio")
+    assert.equals(1, #got)
+    assert.equals("retranscribed words", got[1].text)
+  end)
+
+  it("says nothing for a take cancelled by chord", function()
+    load()
+    local got = 0
+    d.onTake("spec", function() got = got + 1 end)
+    d.toggle(); write(d.paths.WAV, "audio"); d.cancelled = true
+    clock = clock + 3; d.toggle(); ffmpegExit()
+    assert.equals(0, got)
+  end)
+
+  it("keeps the take going when a listener throws", function()
+    load()
+    d.onTake("bad", function() error("boom") end)
+    take("audio")
+    typeOut()
+    assert.equals("hello world", typedText())
+  end)
+
+  it("stops calling a listener taken off with offTake", function()
+    load()
+    local got = 0
+    d.onTake("spec", function() got = got + 1 end)
+    d.offTake("spec")
+    take("audio")
+    assert.equals(0, got)
   end)
 end)
 

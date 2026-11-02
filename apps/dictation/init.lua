@@ -10,10 +10,18 @@
 -- taken back. Any other model, or the Claude clean-up switched on, and the
 -- whole transcript still types on release the way it always did.
 --
--- After each take apps/text_actions, when it is loaded, shows a bar of rewrites
--- (simplify, improve, …) whose result goes to the clipboard. Fn+R during a take
--- holds it back instead: nothing is typed until a rewrite, or "Type as is", is
--- picked from the bar.
+-- With review on (the default) nothing is typed while you speak. The caption
+-- shows the words, and on release it becomes the review panel
+-- (apps/dictation/review.lua): ↩ pastes the take, ⇧↩ types it, ⌥1…⌥9 run a
+-- Claude rewrite on it first (apps/dictation/rewrite.lua), esc keeps it on the
+-- clipboard only. With review off a take types at the cursor as above, then a
+-- bar of rewrites whose result goes to the clipboard; Fn+R during such a take
+-- sends that one take to the review panel instead.
+--
+-- Every take also goes to apps/dictation/pronunciation.lua, which learns the
+-- English words you mispronounce from the audio and drills them in lessons.
+-- One plugin, one tile: the switches, the rewrites and the lessons all live in
+-- the Dictation tile.
 --
 -- Everything this plugin builds belongs to its context, and two of those things
 -- are why it matters here more than anywhere else in apps/. The Fn tap sits in
@@ -30,7 +38,7 @@ local sttServer   = require("lib.stt_server")
 local configFile  = require("lib.config")
 local plugins     = require("lib.plugins")
 local tfilter     = require("lib.transcript_filter")
-local rewrite     = require("lib.text_actions")
+local rewriteCore = require("lib.text_actions")
 local takes       = require("lib.dictation_takes")
 local tapGuard    = require("lib.tap_guard")
 local dstream     = require("lib.dictate_stream")
@@ -75,12 +83,14 @@ local M = { recording = false, ffmpegTask = nil, fnDown = false, startedAt = 0, 
 M.paths = { WAV = WAV, RAW = RAW, TAKES = TAKES_DIR }
 -- "starting" from Fn-down until the first audio bytes land, then "listening".
 M.micState = "idle"
--- Optional Claude clean-up of each transcript before it is typed, through
--- apps/text_actions. Off by default: it sends the take to Anthropic.
+-- Hold each take in the review panel until it is pasted or typed. On by default.
+M.review = hs.settings.get("dictate.review") ~= false
+-- Optional Claude clean-up of each transcript before it is sent, through the
+-- cleanup preset. Off by default: it sends the take to Anthropic.
 M.llmCleanup = hs.settings.get("dictate.llmCleanup") == true
--- The bar of text actions after each take. On by default; needs apps/text_actions.
+-- The bar of rewrites after a take that was typed (review off). On by default.
 M.actionsBar = hs.settings.get("dictate.textActionsBar") ~= false
--- Set by Fn+R during a take: hold the transcript for the bar instead of typing it.
+-- Set by Fn+R during a take: send this one to the review panel instead of typing it.
 M.holdForAction = false
 -- Pins mlx-audio models to one language ("fr"); nil lets each model decide.
 M.language = hs.settings.get("dictate.language")
@@ -146,6 +156,41 @@ function M.offState(name)
   M.listeners[name] = nil
   for i, n in ipairs(M.listenerOrder) do
     if n == name then table.remove(M.listenerOrder, i); break end
+  end
+end
+
+-- ── Take listeners ──────────────────────────────────────────────────────────
+-- apps/dictation/pronunciation.lua reads every finished take, and so can any
+-- other app: the transcript and the audio it came from. The two arrive in either order, the transcript first on a
+-- streaming model and the kept WAV first on a batch one, so each take collects
+-- both in M.take and listeners hear about it once, when the second lands.
+-- `text` is the transcript before any Claude clean-up: the words the speech
+-- model heard, not a rewrite of them.
+--
+-- Same shape as onState: registered by name, each call wrapped, so a listener
+-- that throws costs nothing but its own log line.
+M.takeListeners, M.takeOrder = {}, {}
+M.take = {}
+
+function M.onTake(name, fn)
+  if not M.takeListeners[name] then M.takeOrder[#M.takeOrder + 1] = name end
+  M.takeListeners[name] = fn
+end
+
+function M.offTake(name)
+  if not M.takeListeners[name] then return end
+  M.takeListeners[name] = nil
+  for i, n in ipairs(M.takeOrder) do
+    if n == name then table.remove(M.takeOrder, i); break end
+  end
+end
+
+local function takeReady(take)
+  if take.fired or not take.text or not take.wav then return end
+  take.fired = true
+  for _, name in ipairs(M.takeOrder) do
+    local ok, err = pcall(M.takeListeners[name], { text = take.text, wav = take.wav })
+    if not ok then logf("[take] listener %s failed: %s", name, tostring(err)) end
   end
 end
 
@@ -432,6 +477,7 @@ M.menu:setTooltip("Dictate · " .. M.modelName .. " · " .. (M.modelSize or "?")
 -- live preview look like every other plugin's.
 local UI    = require("lib.ui")
 local theme = UI.theme
+local menu  = UI.menu
 
 -- Floating HUD at screen center. The kit names it, so asking for it again takes
 -- the previous one down: three of these are drawn per take and a stack of them
@@ -769,48 +815,42 @@ local function unduckNoise()
   logf("[duck] restored %.1f", vol)
 end
 
--- apps/text_actions, asked of the registry like the typer: a plain require
--- would bring back a plugin the user switched off in the hub.
-local function textActions()
-  local t = plugins.loaded["text_actions"]
-  if type(t) == "table" and type(t.run) == "function" and type(t.showBar) == "function" then return t end
-  return nil
-end
+-- ── Rewrites and review ─────────────────────────────────────────────────────
+-- Both are part of this plugin and built on its context, so switching
+-- dictation off takes the panel, the bar, their keys and any claude process
+-- with it.
+M.rewrite = require("apps.dictation.rewrite")({ ctx = ctx })
+M.reviewPanel = require("apps.dictation.review")({
+  ctx = ctx, rewrite = M.rewrite, typer = function() return plugins.loaded["keystroke_typer"] end,
+  onSent = function(text) M.lastResult = text end,
+})
 
--- The bar after a take, when it is wanted and the service is there. `deliver`
--- is "clipboard" for text that is already at the cursor.
+-- The bar after a take that is already at the cursor: its rewrites go to the
+-- clipboard.
 local function offerActions(text)
-  local ta = M.actionsBar and textActions()
-  if not ta then return end
-  ta.showBar(text, { deliver = "clipboard", onResult = function(r) M.lastResult = r end })
+  if not M.actionsBar then return end
+  M.rewrite.showBar(text, { deliver = "clipboard", onResult = function(r) M.lastResult = r end })
 end
 
--- Optional clean-up through apps/text_actions' "cleanup" preset (claude -p).
--- Calls done(text) exactly once: with the cleaned text, or with the raw text on
--- any miss — the plugin switched off, claude missing or logged out, a bad
--- reply, or no answer within rewrite.CLEANUP_TIMEOUT seconds.
+-- Optional clean-up through the "cleanup" preset (claude -p), for a take that
+-- types without review. Calls done(text) exactly once: with the cleaned text,
+-- or with the raw text on any miss — claude missing or logged out, a bad
+-- reply, or no answer within rewriteCore.CLEANUP_TIMEOUT seconds.
 local function polish(text, done)
-  local ta = textActions()
-  if not ta then
-    logf("[llm] text actions plugin not loaded; typing the raw transcript")
-    return done(text)
-  end
   showHUD("Cleaning up…", "working")
-  M.polishCancel = ta.run(text, "cleanup", function(result, why)
+  M.polishCancel = M.rewrite.run(text, "cleanup", function(result, why)
     M.polishCancel = nil
     if not result then logf("[llm] %s; typing the raw transcript", tostring(why)) end
     if not M.recording then hideHUD() end
     done(result or text)
-  end, { timeout = rewrite.CLEANUP_TIMEOUT })
+  end, { timeout = rewriteCore.CLEANUP_TIMEOUT })
 end
 
--- Fn+R: the transcript waits in the bar and is typed once something is picked.
--- Without the service there is no bar to wait in, so it types as usual.
-local function holdForBar(text)
-  local ta = textActions()
-  if not ta then logf("[hold] text actions plugin not loaded; typing the take"); return deliver(text) end
-  ta.showBar(text, { deliver = "type", keep = "Type as is", fallback = true,
-                     onResult = function(r) M.lastResult = r end })
+-- The take waits in the review panel until it is pasted, typed or dismissed.
+-- With the clean-up switched on the panel runs it there, so the words as heard
+-- are on screen while Claude works and ⌥0 brings them back.
+local function review(text)
+  M.reviewPanel.open(text, { cleanup = M.llmCleanup })
 end
 
 -- Shared tail: reset UI, clean the transcript, then type it at the cursor.
@@ -835,6 +875,9 @@ local function finishTranscript(out)
     return
   end
   M.lastResult = text
+  -- Only a take that has ended: a transcript arriving after the next take
+  -- began belongs to neither, and is not handed on.
+  if M.take.stopped then M.take.text = text; takeReady(M.take) end
   local hold = M.holdForAction
   M.holdForAction = false
   -- Fn+R on a live take took back what had been typed when it was short. When
@@ -846,10 +889,9 @@ local function finishTranscript(out)
     offerActions(text)
     return
   end
-  if hold then
+  if hold or M.review then
     if live then releaseLive() end
-    if not M.llmCleanup then return holdForBar(text) end
-    return polish(text, function(final) M.lastResult = final; holdForBar(final) end)
+    return review(text)
   end
   -- The live path has its own delivery: most of this text is already on screen,
   -- so it appends the rest instead of typing the whole thing again. The Claude
@@ -938,7 +980,7 @@ local function takeNames()
   return names
 end
 
-local function saveTake()
+local function saveTake(take)
   local data = readFile(M.paths.WAV)
   if not data or data == "" then logf("[takes] no WAV to keep"); return end
   if hs.fs.mkdir then
@@ -952,6 +994,7 @@ local function saveTake()
   local _, remove = takes.prune(takeNames(), takes.KEEP)
   for _, old in ipairs(remove) do os.remove(M.paths.TAKES .. "/" .. old) end
   logf("[takes] kept %s (%d bytes), rotated out %d", name, #data, #remove)
+  if take then take.wav = M.paths.TAKES .. "/" .. name; takeReady(take) end
 end
 
 -- ── Mic-ready indicator ─────────────────────────────────────────────────────
@@ -991,12 +1034,16 @@ local function startRecording()
   M.batchFinish = false
   M.keepTake = false
   M.holdForAction = false
-  -- A new take means the user has moved on from the last one's bar. A held
-  -- take's text is left on the clipboard by the bar, not dropped.
-  local ta = textActions()
-  if ta and ta.hideBar then ta.hideBar("new take") end
+  -- A new take means the user has moved on from the last one's bar or panel.
+  -- Either leaves its text on the clipboard rather than dropping it.
+  M.rewrite.hideBar("new take")
+  M.reviewPanel.close("new take")
   M.lastPartial = nil
   M.startedAt = hs.timer.secondsSinceEpoch()
+  M.take = {}
+  -- Held by the ffmpeg callback below, so the WAV it keeps joins this take
+  -- even if the next one has started by the time it lands.
+  local take = M.take
   setIcon("●")
   hideLivePreview()
   startReadyPoll()
@@ -1012,7 +1059,7 @@ local function startRecording()
     logf("[dictate] ffmpeg exit=%d", code)
     if code ~= 0 and err and err ~= "" then logf("[dictate] ffmpeg stderr: %s", err) end
     -- The WAV is finalized now: keep a copy before anything reads or replaces it.
-    if M.keepTake then M.keepTake = false; saveTake() end
+    if M.keepTake then M.keepTake = false; saveTake(take) end
     -- Non-streaming engine: WAV is finalized now, so kick off the batch transcribe.
     if M.batchFinish then M.batchFinish = false; transcribe() end
   end,
@@ -1034,15 +1081,16 @@ local function startRecording()
   end)
   M.watchdog = stopWatchdog
   -- Three ways a take can go, decided here and not revisited: type as the words
-  -- settle, show a preview and type on release, or neither.
+  -- settle, show a preview and type (or review) on release, or neither. Review
+  -- types nothing until the take is approved, so it always takes the preview.
   local liveOk, why = dstream.available({
-    on = M.liveTyping, engine = M.engine,
+    on = M.liveTyping and not M.review, engine = M.engine,
     dictate = M.serverDictate, llmCleanup = M.llmCleanup,
   })
   if liveOk then
     startLive()
   elseif M.stream then
-    if M.liveTyping then logf("[live] not this take: %s", tostring(why)) end
+    if M.liveTyping and not M.review then logf("[live] not this take: %s", tostring(why)) end
     -- Begin streaming this recording into the warm model as it's captured.
     hs.http.asyncPost(STT_BASE .. "/start", M.paths.RAW, {}, function(status, _, _)
       if status ~= 200 then logf("[dictate] /start status=%s (will batch-fallback)", tostring(status)) end
@@ -1073,6 +1121,7 @@ function stopRecording()
   -- callback (which fires once the WAV is finalized) runs transcribe().
   M.batchFinish = (not M.stream) and (not M.cancelled) and (dur >= MIN_DURATION)
   M.keepTake = (not M.cancelled) and (dur >= MIN_DURATION)
+  M.take.stopped = M.keepTake
   stopReadyPoll()
   M.micState = "idle"
   -- Through the release: it terminates ffmpeg AND stops the context holding a
@@ -1268,6 +1317,13 @@ local function setLlmCleanup(on)
   logf("[llm] clean-up %s", M.llmCleanup and "on" or "off")
 end
 
+local function setReview(on)
+  M.review = on and true or false
+  hs.settings.set("dictate.review", M.review)
+  if not M.review then M.reviewPanel.close("switched off") end
+  logf("[review] review before sending %s", M.review and "on" or "off")
+end
+
 local function setActionsBar(on)
   M.actionsBar = on and true or false
   hs.settings.set("dictate.textActionsBar", M.actionsBar)
@@ -1296,6 +1352,7 @@ local function retranscribe(name)
     if text == "" then notify("nothing heard in that take", 1.6); return end
     M.lastResult = text
     hs.pasteboard.setContents(text)
+    if M.review then return review(text) end
     local preview = text:sub(1, 60)
     if #text > 60 then preview = preview .. "…" end
     notify("copied: " .. preview, 2.0)
@@ -1317,7 +1374,28 @@ local function buildMenu()
   MICS = discoverMics()   -- refresh so the picker reflects currently-connected inputs
   local maxKB = 0
   for _, m in ipairs(MODELS) do if m.sizeKB and m.sizeKB > maxKB then maxKB = m.sizeKB end end
-  local items = { { title = "Speech model · English WER · RAM footprint", disabled = true } }
+  -- How a take reaches the app, first: the switch that matters most.
+  -- Only parakeet carries the token timestamps the commit rule needs, and only
+  -- a server with dictate/ loaded can apply it. The row says which of those is
+  -- missing rather than going quiet.
+  local liveOk, liveWhy = dstream.available({
+    on = true, engine = M.engine, dictate = M.serverDictate, llmCleanup = M.llmCleanup,
+  })
+  if M.review then liveOk, liveWhy = false, "review is on" end
+  local items = {
+    menu.switch("Review each take before it's sent  (↩ paste · ⇧↩ type)", M.review,
+                function() setReview(not M.review) end),
+    menu.switch("Clean up with Claude (sends text to Anthropic)", M.llmCleanup,
+                function() setLlmCleanup(not M.llmCleanup) end),
+    { title = "Type while you speak" .. (liveOk and "" or "  (" .. tostring(liveWhy) .. ")"),
+      switch = true, checked = M.liveTyping, disabled = not liveOk,
+      fn = function() setLiveTyping(not M.liveTyping) end },
+    { title = "Show rewrites after a typed take  (Fn+R reviews one)" .. (M.review and "  (review is on)" or ""),
+      switch = true, checked = M.actionsBar, disabled = M.review,
+      fn = function() setActionsBar(not M.actionsBar) end },
+    menu.separator(),
+    menu.text("Speech model · English WER · RAM footprint"),
+  }
   for _, m in ipairs(MODELS) do
     local icon = m.stream and "🟢" or "🟡"
     local wer  = m.wer and string.format("%.2f", m.wer) or "  — "
@@ -1352,28 +1430,15 @@ local function buildMenu()
       fn = function() setLanguage(l.code) end }
   end
   items[#items + 1] = { title = "Language (batch models): " .. (M.language or "auto"), menu = langItems }
-  -- Only parakeet carries the token timestamps the commit rule needs, and only
-  -- a server with dictate/ loaded can apply it. The row says which
-  -- of those is missing rather than going quiet.
-  local liveOk, liveWhy = dstream.available({
-    on = true, engine = M.engine, dictate = M.serverDictate, llmCleanup = M.llmCleanup,
-  })
-  items[#items + 1] = { title = "Type while you speak" .. (liveOk and "" or "  (" .. tostring(liveWhy) .. ")"),
-    switch = true, checked = M.liveTyping, disabled = not liveOk,
-    fn = function() setLiveTyping(not M.liveTyping) end }
-  local actionsOk = textActions() ~= nil
-  items[#items + 1] = { title = "Clean up with Claude (sends text to Anthropic)"
-                          .. (actionsOk and "" or "  (text actions plugin off)"),
-    switch = true, checked = M.llmCleanup,
-    fn = function() setLlmCleanup(not M.llmCleanup) end }
-  items[#items + 1] = { title = "Show text actions after a take  (Fn+R holds a take for them)"
-                          .. (actionsOk and "" or "  (text actions plugin off)"),
-    switch = true, checked = M.actionsBar, disabled = not actionsOk,
-    fn = function() setActionsBar(not M.actionsBar) end }
   items[#items + 1] = { title = "Retranscribe recent take", menu = takesMenu() }
-  items[#items + 1] = { title = "-" }
   items[#items + 1] = { title = "Restart server",
     fn = function() notify("Restarting STT server…", 1.6); restartServer() end }
+  items[#items + 1] = menu.separator()
+  for _, row in ipairs(M.rewrite.menuRows(M.reviewSelection)) do items[#items + 1] = row end
+  if M.pronunciation then
+    items[#items + 1] = menu.separator()
+    for _, row in ipairs(M.pronunciation.menuRows()) do items[#items + 1] = row end
+  end
   return items
 end
 M.menu:setMenu(buildMenu)
@@ -1403,7 +1468,7 @@ end)
 
 -- Chord detection while holding Fn:
 --   Fn+C  cancel current recording and recall last
---   Fn+R  hold the take for the text actions bar instead of typing it
+--   Fn+R  send this take to the review panel instead of typing it
 --   Fn+S  speak the current selection through the TTS queue (no dictation)
 
 local HS_PID = (hs.processInfo and hs.processInfo.processID) or 0
@@ -1434,14 +1499,15 @@ M.keyWatcher = ctx:eventtap(hs.eventtap.event.types.keyDown, function(e)
     return true
   end
   if kc == hs.keycodes.map["r"] then
-    -- Hold this take for the text actions bar: nothing more is typed, and the
-    -- transcript waits in the bar until a rewrite or "Type as is" is picked.
+    -- Send this take to the review panel: nothing more is typed, and the
+    -- transcript waits there until it is pasted, typed or dismissed. With
+    -- review already on, every take goes there and this changes nothing.
     if not M.recording or M.holdForAction then return true end
     M.holdForAction = true
-    logf("[chord] Fn+R — hold the take for text actions")
+    logf("[chord] Fn+R — review this take")
     -- The keystroke itself has already stopped committing ("the user typed").
     if M.live.on then
-      M.stopCommitting("held for text actions")
+      M.stopCommitting("held for review")
       -- What was already typed comes back out when it is a handful of
       -- characters, the same rule as Fn+C. Longer, and it stays: a long blind
       -- deletion lands wherever focus is now.
@@ -1530,9 +1596,32 @@ M.toggle = function()
   if M.recording then stopRecording() else startRecording() end
 end
 
+-- ⌘⌥⇧R: the review panel on the selection, so ↩ pastes the rewrite over it
+-- (the panel never takes focus, so the selection is still selected). With
+-- nothing selected it opens on the clipboard instead.
+function M.reviewSelection()
+  M.rewrite.grabSelection(function(sel)
+    local text = sel or hs.pasteboard.getContents()
+    if type(text) ~= "string" or not text:match("%S") then
+      return notify("Nothing selected and no text on the clipboard", 1.4)
+    end
+    M.reviewPanel.open(text)
+  end)
+end
+ctx:hotkey({ "cmd", "alt", "shift" }, "r", function() M.reviewSelection() end)
+
+-- Pronunciation learns from every take that reaches a transcript: the words
+-- as heard, never a rewrite of them, with the audio they came from.
+M.pronunciation = require("apps.dictation.pronunciation")({
+  ctx = ctx,
+  isRecording = function() return M.recording end,
+  micName = function() return M.micName end,
+})
+M.onTake("pronunciation", function(t) M.pronunciation.onTake(t) end)
+
 probeServer()
 
-notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+S speak · Fn+R rewrite", 2.0)
+notify("Dictate ready · hold Fn or MFB · Fn+C recall · Fn+S speak · Fn+R review", 2.0)
 logf("[dictate] init complete")
 
 -- Switch the plugin off: the Fn tap, the warm server and its model, any capture
@@ -1544,8 +1633,12 @@ function M.dispose()
   if M.recording then M.cancelled = true; stopRecording() end
   releaseLive()
   unduckNoise()
+  M.reviewPanel.close("disposed")
+  M.rewrite.stop()
+  M.pronunciation.stop()
   ctx:dispose()
   M.listeners, M.listenerOrder = {}, {}
+  M.takeListeners, M.takeOrder = {}, {}
   _earconCache = {}
 end
 
