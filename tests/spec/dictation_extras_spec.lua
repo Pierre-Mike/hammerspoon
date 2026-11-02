@@ -355,10 +355,14 @@ end)
 -- claude -p, the bar and the timeouts. What matters here is what dictation and
 -- the review panel ask of them.
 local ta = { runs = {}, bars = {}, hidden = 0, reply = nil }
+-- A "hang" reply keeps the rewrite running: ta.finish(result) answers it later,
+-- and ta.cancelled counts the calls that were called off.
 function ta.run(text, id, done, opts)
   ta.runs[#ta.runs + 1] = { text = text, id = id, opts = opts }
-  if ta.reply ~= "hang" then done(ta.reply, ta.reply == nil and "no reply" or nil) end
-  return function() end
+  if ta.reply ~= "hang" then done(ta.reply, ta.reply == nil and "no reply" or nil); return function() end end
+  local live = true
+  ta.finish = function(result) if live then live = false; done(result, result == nil and "no reply" or nil) end end
+  return function() if live then live = false; ta.cancelled = (ta.cancelled or 0) + 1 end end
 end
 function ta.showBar(text, opts) ta.bars[#ta.bars + 1] = { text = text, opts = opts } end
 function ta.hideBar() ta.hidden = ta.hidden + 1 end
@@ -573,6 +577,60 @@ describe("the review panel", function()
     press("", "return")
     fire(0.05)
     assert.is_true(pasted())
+  end)
+
+  it("sends nothing while a rewrite runs, then sends the rewrite", function()
+    reviewing()
+    take()
+    ta.reply = "hang"
+    press("alt", "1")
+    press("", "return")
+    press("shift", "return")
+    press("alt", "2")
+    fire(0.05)
+    assert.is_true(d.reviewPanel.isOpen())
+    assert.equals(0, #hs.eventtap._sent)
+    assert.equals(1, #ta.runs, "a second preset started while the first ran")
+    ta.finish("Hello, world.")
+    press("", "return")
+    fire(0.05)
+    assert.is_true(pasted())
+    assert.equals("Hello, world.", pb.text)
+  end)
+
+  it("waits for the clean-up that runs on its own, too", function()
+    reviewing({ ["dictate.llmCleanup"] = true })
+    ta.reply = "hang"
+    take()
+    press("", "return")
+    fire(0.05)
+    assert.is_true(d.reviewPanel.isOpen())
+    assert.is_false(pasted())
+  end)
+
+  it("greys out paste, type and the presets while a rewrite runs", function()
+    local rv = require("apps.dictation.review")
+    local presets = { { id = "cleanup", label = "Clean up" } }
+    local off = {}
+    for _, b in ipairs(rv.buttons({ original = "a", draft = "a", mode = "working" }, presets)) do
+      off[b.id] = b.disabled == true
+    end
+    assert.same({ paste = true, type = true, original = false, cleanup = true }, off)
+  end)
+
+  it("cancels a rewrite still running on ⌥0, and esc still closes it", function()
+    reviewing()
+    take()
+    ta.reply = "hang"
+    press("alt", "1")
+    press("alt", "0")
+    assert.equals(1, ta.cancelled)
+    assert.equals("review", d.reviewPanel.current.mode)
+    assert.equals("hello world", d.reviewPanel.current.draft)
+    press("alt", "1")
+    press("", "escape")
+    assert.is_false(d.reviewPanel.isOpen())
+    assert.equals(2, ta.cancelled)
   end)
 
   it("runs the clean-up first when that is switched on", function()

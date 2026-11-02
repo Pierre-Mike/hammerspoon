@@ -129,6 +129,13 @@ describe("ui element builders", function()
     assert.equals(theme.color.control, cold.fillColor)
   end)
 
+  it("greys out a disabled button and stops it reporting clicks, even when hot", function()
+    local plate, text = ui.button("go", "Go", { x = 0, y = 0, w = 60, h = 30 }, true, true)
+    assert.equals(theme.color.control, plate.fillColor)
+    assert.is_false(plate.trackMouseDown)
+    assert.equals(theme.color.textTertiary, text.textColor)
+  end)
+
   it("counts characters, not bytes, when it has to estimate", function()
     assert.equals(ui.estimateWidth("abc", 14), ui.estimateWidth("“b”", 14))
   end)

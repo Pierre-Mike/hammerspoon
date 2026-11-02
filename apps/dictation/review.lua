@@ -14,8 +14,12 @@
 --   ⇧↩       type it, one keystroke at a time, for a terminal or a remote
 --            desktop that refuses a paste
 --   ⌥1…⌥9    run a rewrite preset on the draft; the result becomes the draft
---   ⌥0       back to the words as heard
+--   ⌥0       back to the words as heard, or cancel a rewrite still running
 --   esc      close it without sending
+--
+-- While a rewrite runs, ↩, ⇧↩ and the other presets wait for it: their
+-- buttons are greyed out and the keys do nothing, so what is sent is always
+-- what the panel shows once Claude is done.
 --
 -- The clipboard always holds the draft, so a panel closed by esc or by the next
 -- take has not lost anything: ⌘V still has it.
@@ -32,17 +36,26 @@ local theme = UI.theme
 
 local unpack = table.unpack or unpack
 
-local HINT = "↩ paste · ⇧↩ type · ⌥ number rewrite · esc close"
+local HINT    = "↩ paste · ⇧↩ type · ⌥ number rewrite · esc close"
+local WAITING = "wait for the rewrite · ⌥0 cancel · esc close"
 
 local function lh(style) return math.ceil(theme.text[style] * theme.leading) end
 
 -- ── Pure ───────────────────────────────────────────────────────────────────
--- The buttons for state R, in the order drawn. `key` is the ⌥ digit.
+-- The buttons for state R, in the order drawn. `key` is the ⌥ digit. While a
+-- rewrite runs, everything but ⌥0, which cancels it, is disabled.
 local function buttons(R, presets)
-  local out = { { id = "paste", label = "Paste ↩" }, { id = "type", label = "Type ⇧↩" } }
-  if R.draft ~= R.original then out[#out + 1] = { id = "original", label = "0 Original", key = 0 } end
+  local busy = R.mode == "working"
+  local out = { { id = "paste", label = "Paste ↩", disabled = busy },
+                { id = "type", label = "Type ⇧↩", disabled = busy } }
+  if busy then
+    out[#out + 1] = { id = "original", label = "0 Cancel", key = 0 }
+  elseif R.draft ~= R.original then
+    out[#out + 1] = { id = "original", label = "0 Original", key = 0 }
+  end
   for _, it in ipairs(core.barItems(presets)) do
-    out[#out + 1] = { id = it.id, label = string.format("%d %s", it.key, it.label), key = it.key }
+    out[#out + 1] = { id = it.id, label = string.format("%d %s", it.key, it.label), key = it.key,
+                      disabled = busy }
   end
   return out
 end
@@ -80,8 +93,13 @@ local function layout(R, presets, screen, hover)
   end
   local buttonsH = (row + 1) * bh + row * gap
 
+  -- Characters per line from the draft's own measured width, so a wide font
+  -- (the terminal design is monospace) gets the lines it needs. The 0.92
+  -- leaves room for words that wrap early rather than split.
   local size, lineH = theme.text.title, lh("title")
-  local cpl = math.max(8, math.floor(inner / (size * 0.52)))
+  local chars = math.max(1, select(2, R.draft:gsub("[^\128-\191]", "")))
+  local avg = math.max(1, UI.measure(R.draft, size)) / chars
+  local cpl = math.max(8, math.floor(inner / avg * 0.92))
   local headH = lh("footnote")
   local fixed = pad + headH + theme.space.md + theme.space.lg + buttonsH + pad
   local maxLines = math.max(1, math.floor((math.floor(screen.h * 0.7) - fixed) / lineH))
@@ -93,12 +111,13 @@ local function layout(R, presets, screen, hover)
   local line, tone = status(R)
   local r = theme.size.dot - 2
   local dotW = 2 * r + theme.space.sm
-  local hintW = UI.measure(HINT, theme.text.caption) + 4
+  local hint = R.mode == "working" and WAITING or HINT
+  local hintW = UI.measure(hint, theme.text.caption) + 4
   local els = { UI.backdrop(w, h, { radius = "lg" }) }
   els[#els + 1] = UI.dot(pad + r, pad + headH / 2, tone, r)
   els[#els + 1] = UI.label(line, { x = pad + dotW, y = pad, w = inner - dotW - hintW - gap, h = headH },
                            { style = "footnote", color = "textSecondary", truncate = true })
-  els[#els + 1] = UI.label(HINT, { x = w - pad - hintW, y = pad + 1, w = hintW, h = lh("caption") },
+  els[#els + 1] = UI.label(hint, { x = w - pad - hintW, y = pad + 1, w = hintW, h = lh("caption") },
                            { style = "caption", color = "textTertiary", align = "right" })
   local textY = pad + headH + theme.space.md
   els[#els + 1] = UI.label(text, { x = pad, y = textY, w = inner, h = lines * lineH + 4 }, { style = "title" })
@@ -106,7 +125,7 @@ local function layout(R, presets, screen, hover)
   for _, p in ipairs(placed) do
     local plate, label = UI.button(p.b.id, p.b.label,
       { x = p.x, y = top + p.row * (bh + gap), w = p.w, h = bh },
-      hover == "btn:" .. p.b.id or (hover == nil and p.b.id == "paste"))
+      hover == "btn:" .. p.b.id or (hover == nil and p.b.id == "paste"), p.b.disabled)
     els[#els + 1] = plate
     els[#els + 1] = label
   end
@@ -171,7 +190,7 @@ local function new(host)
   -- later, once the panel's own key is up; "type" hands it to the typer.
   function P.send(how)
     local R = P.current
-    if not R then return end
+    if not R or R.mode == "working" then return end
     local text = R.draft
     P.close("sent")
     hs.pasteboard.setContents(text)
@@ -187,7 +206,7 @@ local function new(host)
 
   function P.rewrite(id, opts)
     local R = P.current
-    if not R then return end
+    if not R or R.mode == "working" then return end
     local preset = core.find(presets(), id)
     if not preset then return end
     stopRewrite(R)
@@ -206,9 +225,11 @@ local function new(host)
     end, { timeout = (opts and opts.timeout) or core.ACTION_TIMEOUT })
   end
 
+  -- Also the way out of a rewrite still running: it stops, and the panel is
+  -- back on the words as heard.
   function P.original()
     local R = P.current
-    if not R or R.draft == R.original then return end
+    if not R or (R.draft == R.original and R.mode ~= "working") then return end
     stopRewrite(R)
     R.mode = "review"
     setDraft(R, R.original, nil)

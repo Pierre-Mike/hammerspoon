@@ -131,17 +131,19 @@ function M.dot(cx, cy, tone, radius)
 end
 
 -- A button: its plate and its label, two elements. `id` comes back in mouse
--- events as "btn:<id>". `hot` is the hovered or default one.
-function M.button(id, label, frame, hot)
+-- events as "btn:<id>". `hot` is the hovered or default one. A `disabled`
+-- button is greyed out, never hot, and reports no clicks.
+function M.button(id, label, frame, hot, disabled)
   local size = theme.text.body
   local top = math.floor((frame.h - lineHeight(size)) / 2) + 1
+  hot = hot and not disabled
   return {
     type = "rectangle", action = "fill", id = "btn:" .. id,
     fillColor = hot and theme.color.accent or theme.color.control,
     roundedRectRadii = { xRadius = theme.radius.sm, yRadius = theme.radius.sm },
-    frame = frame, trackMouseDown = true, trackMouseEnterExit = true,
+    frame = frame, trackMouseDown = not disabled, trackMouseEnterExit = not disabled,
   }, M.label(label, { x = frame.x, y = frame.y + top, w = frame.w, h = frame.h - top },
-             { align = "center", color = hot and "onAccent" or "text" })
+             { align = "center", color = disabled and "textTertiary" or (hot and "onAccent" or "text") })
 end
 
 function M.buttonWidth(label)
