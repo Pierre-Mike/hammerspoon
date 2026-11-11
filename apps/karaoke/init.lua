@@ -19,8 +19,16 @@
 --
 -- The tile has the switch, the screen, and the timing nudge for a song whose
 -- lyrics run early or late. Cmd+Alt+Shift+K shows or hides the island.
+--
+-- The pitch meter, off until switched on in the tile, adds a row under the
+-- lyrics: the note you are singing and a dot that sits in the middle of a bar
+-- when you are on it, and slides left when flat or right when sharp. The
+-- microphone is a second ffmpeg on dictation's input, like the wake word's,
+-- and it is open only while the island is up: a song paused for a few seconds
+-- closes it. When you stop singing, the note clears. The rules are lib/pitch.
 
 local K     = require("lib.karaoke")
+local P     = require("lib.pitch")
 local utils = require("lib.utils")
 local UI    = require("lib.ui")
 local theme = UI.theme
@@ -33,6 +41,8 @@ local HOTKEY        = { mods = { "cmd", "alt", "shift" }, key = "k" }
 local USER_AGENT    = "hammerspoon-karaoke (https://github.com/Pierre-Mike/hammerspoon)"
 local ENABLED_KEY   = "karaoke.enabled"
 local SCREEN_KEY    = "karaoke.screen"   -- "main" or "builtin"
+local PITCH_KEY     = "karaoke.pitch"    -- the meter; off unless switched on
+local FFMPEG        = "/opt/homebrew/bin/ffmpeg"
 
 local FRAME_SECS  = 1 / 12   -- the sweep redraw, only while the island is up
 local POLL_SECS   = 1        -- the AppleScript fallback
@@ -66,12 +76,19 @@ local M = {
   since    = {},      -- when the current pause / "none" began
   restarts = 0,
   disposed = false,
+  capture  = nil,     -- the pitch meter's ffmpeg, while the mic is open
+  heard    = nil,     -- lib/pitch.meter for the open capture
+  paths    = { raw = P.RAW },   -- a spec points this at a scratch file
 }
 
 local function logf(fmt, ...) utils.logf(LOG, fmt, ...) end
 
 local function enabled()
   return hs.settings.get(ENABLED_KEY) ~= false
+end
+
+local function meterOn()
+  return hs.settings.get(PITCH_KEY) == true
 end
 
 local function decode(s)
@@ -90,8 +107,14 @@ local function targetScreen()
   return hs.screen.primaryScreen()
 end
 
--- Element indices, so a frame touches only what moved.
-local E = { bg = 1, base = 2, clip = 3, lit = 4, reset = 5, nextLine = 6 }
+-- Element indices, so a frame touches only what moved. The last four are the
+-- pitch meter's row and exist only while it is on.
+local E = { bg = 1, base = 2, clip = 3, lit = 4, reset = 5, nextLine = 6,
+            track = 7, mid = 8, dot = 9, note = 10 }
+
+local METER_ROW = 26    -- the meter's height under the next line
+local NOTE_W    = 56    -- the note name, right-aligned against the bar
+local BAR_W     = 180   -- ±50 cents across
 
 -- Built once per track, because its width follows that track's longest line.
 local function build()
@@ -100,7 +123,8 @@ local function build()
   local notch = K.hasNotch(screen:name(), full, frame)
   -- Under the notch nothing shows, so the text starts below the menu bar there.
   local top = notch and (frame.y - full.y) or 6
-  local h = top + 64
+  local metered = meterOn()
+  local h = top + 64 + (metered and METER_ROW or 0)
 
   local widths = {}
   local probe = hs.canvas.new({ x = 0, y = 0, w = 10, h = 10 })
@@ -128,8 +152,24 @@ local function build()
   c[E.nextLine] = { type = "text", text = "", textSize = NEXT_SIZE, textColor = SOFT,
                     textAlignment = "center", textLineBreak = "truncateTail",
                     frame = { x = pad, y = top + 36, w = w - 2 * pad, h = 22 } }
+  M.bar = nil
+  if metered then
+    -- The note name, then the bar with a tick at its middle and the dot on it.
+    local y = top + 62
+    local left = math.floor((w - NOTE_W - theme.space.md - BAR_W) / 2)
+    local barX = left + NOTE_W + theme.space.md
+    M.bar = { mid = barX + BAR_W / 2, y = y + METER_ROW / 2 - 2 }
+    c[E.track] = { type = "rectangle", action = "fill", fillColor = DIM,
+                   frame = { x = barX, y = M.bar.y - 1, w = BAR_W, h = 2 } }
+    c[E.mid] = { type = "rectangle", action = "fill", fillColor = SOFT,
+                 frame = { x = M.bar.mid - 1, y = M.bar.y - 7, w = 2, h = 14 } }
+    c[E.dot] = UI.dot(M.bar.mid, M.bar.y, "success", theme.size.dot * 0.7)
+    c[E.dot].action = "skip"
+    c[E.note] = UI.label("", { x = left, y = M.bar.y - 11, w = NOTE_W, h = 22 },
+                         { style = "body", bold = true, align = "right" })
+  end
   M.canvas, M.release, M.lineFrame, M.shown = c, release, lineFrame, false
-  M.drawn, M.drawnNext, M.swept = nil, nil, nil
+  M.drawn, M.drawnNext, M.swept, M.drawnPitch = nil, nil, nil, nil
 end
 
 local function hide()
@@ -175,6 +215,96 @@ local function paint(d)
   end
 end
 
+-- The meter's row: `reading` is lib/pitch.note, or nil when nobody is
+-- singing. Written only when the note, the dot's point or its tone moved.
+local function paintPitch(reading)
+  local c = M.canvas
+  if not (c and M.bar) then return end
+  local key = "silent"
+  local x, tone
+  if reading then
+    x = math.floor(M.bar.mid + P.offset(reading.cents, BAR_W / 2))
+    tone = P.tone(reading.cents)
+    key = reading.label .. "\n" .. x .. "\n" .. tone
+  end
+  if M.drawnPitch == key then return end
+  M.drawnPitch = key
+  c[E.note].text = reading and reading.label or ""
+  if reading then
+    c[E.dot].center = { x = x, y = M.bar.y }
+    c[E.dot].fillColor = theme.tone(tone)
+    c[E.dot].action = "fill"
+  else
+    c[E.dot].action = "skip"
+  end
+end
+
+-- ── The microphone ─────────────────────────────────────────────────────────
+-- Whichever microphone dictation is set to, as the wake word does, so the
+-- Dictate menu stays the one place a microphone is chosen.
+local function mic()
+  local dict = package.loaded["apps.dictation"]
+  if type(dict) == "table" and type(dict.micName) == "string" and dict.micName ~= "" then
+    return dict.micName
+  end
+  local ok, name = pcall(function() return hs.audiodevice.defaultInputDevice():name() end)
+  if ok and type(name) == "string" and name ~= "" then return name end
+  return "0"
+end
+
+local function deafen()
+  if M.stopCapture then
+    M.stopCapture()
+    logf("pitch meter closed the microphone")
+  end
+  M.capture, M.stopCapture, M.heard = nil, nil, nil
+end
+
+local function listen()
+  if M.capture or not hs.fs.attributes(FFMPEG) then return end
+  if M.retryAt and hs.timer.secondsSinceEpoch() < M.retryAt then return end
+  os.remove(M.paths.raw)
+  local device = mic()
+  local capture, done
+  capture, done = ctx:task(FFMPEG, function(code, _, err)
+    done()
+    if M.capture ~= capture then return end   -- closed on purpose
+    M.capture, M.stopCapture, M.heard = nil, nil, nil
+    -- Not opened again on the next frame: a mic that refuses would be asked
+    -- twelve times a second.
+    M.retryAt = hs.timer.secondsSinceEpoch() + 5
+    logf("pitch capture exited code=%s%s", tostring(code), err and err ~= "" and (": " .. err:sub(1, 160)) or "")
+  end, P.captureArgs(device, M.paths.raw))
+  M.capture, M.stopCapture, M.heard, M.heardSize = capture, done, P.meter(), nil
+  capture:start()
+  logf("pitch meter listening on %q", device)
+end
+
+-- The last frame of the capture into the meter, and what the meter says now.
+-- A file that has not grown since the last frame is a capture that stalled,
+-- which reads as silence rather than as the last note held forever.
+local function hear(t)
+  if not M.heard then return nil end
+  local f = io.open(M.paths.raw, "rb")
+  if not f then return nil end
+  local size = f:seek("end")
+  local offset, length = P.tail(size)
+  local pcm
+  if offset and size ~= M.heardSize then
+    f:seek("set", offset)
+    pcm = f:read(length)
+  end
+  f:close()
+  M.heardSize = size
+  if size >= P.ROTATE then
+    deafen()
+    listen()
+    return nil
+  end
+  M.heard:push(pcm and P.detect(P.decode(pcm)) or nil, t)
+  return M.heard:reading(t)
+end
+
 -- ── Frames ─────────────────────────────────────────────────────────────────
 local function now() return hs.timer.secondsSinceEpoch() end
 
@@ -191,12 +321,19 @@ local function tick()
   local t = now()
   if not wanted(t) then
     hide()
+    deafen()
     if ticker then ticker:stop() end
     return
   end
   show()
   local pos = K.position(M.np, t) + (M.offsets[M.np.key] or 0)
   paint(K.display(M.np, M.lyrics, pos))
+  if meterOn() then
+    listen()
+    paintPitch(hear(t))
+  else
+    deafen()
+  end
 end
 
 local function wake()
@@ -362,6 +499,16 @@ end
 
 function M.toggle() setEnabled(not enabled()) end
 
+-- The meter's row changes the island's height, so it is drawn again; the
+-- next frame opens or closes the microphone to match.
+function M.setMeter(on)
+  hs.settings.set(PITCH_KEY, on and true or false)
+  logf("pitch meter switched %s", on and "on" or "off")
+  if not on then deafen() end
+  rebuild()
+  wake()
+end
+
 -- Positive moves the lyrics sooner; nil puts them back where LRCLIB had them.
 function M.nudge(by)
   if not M.np then return end
@@ -397,6 +544,20 @@ local function buildMenu()
                           rebuild(); lookup(M.np); wake()
                         end }
   items[#items + 1] = { title = "-" }
+  items[#items + 1] = { title = "Pitch meter", switch = true, checked = meterOn(),
+                        fn = function() M.setMeter(not meterOn()) end }
+  local hint
+  if not hs.fs.attributes(FFMPEG) then
+    hint = "brew install ffmpeg to use the microphone"
+  elseif M.capture then
+    hint = "Listening on " .. mic() .. " · headphones keep the song out"
+  elseif meterOn() then
+    hint = "The microphone opens while a song plays"
+  else
+    hint = "Shows the note you sing and how close you are"
+  end
+  items[#items + 1] = { title = hint, disabled = true }
+  items[#items + 1] = { title = "-" }
   local onBuiltin = hs.settings.get(SCREEN_KEY) == "builtin"
   items[#items + 1] = { title = "On the main screen", checked = not onBuiltin,
                         fn = function() hs.settings.set(SCREEN_KEY, "main"); rebuild() end }
@@ -423,6 +584,9 @@ if hs.fs.attributes(MEDIA_CONTROL) then startStream() else startFallback() end
 
 function M.dispose()
   M.disposed = true
+  -- Before ctx:dispose, which would also kill the capture: this clears the
+  -- handles too, so a re-enabled plugin does not find a dead task in M.
+  deafen()
   ctx:dispose()
   M.canvas, M.release, M.stream, M.shown = nil, nil, nil, false
 end

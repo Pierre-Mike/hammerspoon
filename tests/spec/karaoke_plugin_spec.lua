@@ -42,9 +42,11 @@ hs.timer.doAfter = function(_, fn)
   return t
 end
 
--- The stream task: feed(text) is what media-control would print.
+-- The stream task: feed(text) is what media-control would print. hs.task.new
+-- takes (path, cb, args) as well as (path, cb, stream, args).
 local tasks
 hs.task.new = function(path, cb, stream, args)
+  if type(stream) == "table" then stream, args = nil, stream end
   local t = { path = path, cb = cb, stream = stream, args = args, terminated = false }
   function t:start() self.started = true; return self end
   function t:terminate() self.terminated = true; return self end
@@ -52,7 +54,11 @@ hs.task.new = function(path, cb, stream, args)
   tasks[#tasks + 1] = t
   return t
 end
-local function feed(text) tasks[#tasks].feed(text) end
+local function feed(text)
+  for i = #tasks, 1, -1 do
+    if tasks[i].path == MEDIA_CONTROL then return tasks[i].feed(text) end
+  end
+end
 
 -- JSON bodies are keys into this table, as in the other plugin specs.
 local JSON = {}
@@ -133,6 +139,9 @@ JSON.found  = { { id = 3, duration = 257, syncedLyrics = "[00:01.00] Found by se
 JSON.nohits = {}
 
 local karaoke
+
+-- The pitch meter's note name; its dot is the element before it.
+local E_NOTE = 10
 
 local function load()
   package.loaded["apps.karaoke"] = nil
@@ -361,6 +370,101 @@ describe("apps/karaoke", function()
     assert.equals("Hello", karaoke.np.title)
     assert.equals("https://lrclib.net/api/get?artist_name=Adele&track_name=Hello&duration=295", lastUrl())
     hs.spotify = nil
+  end)
+
+  describe("the pitch meter", function()
+    local P = require("lib.pitch")
+    local FFMPEG = "/opt/homebrew/bin/ffmpeg"
+    local RAW = os.tmpname()
+
+    -- What ffmpeg would append for 0.1 s of someone singing `hz`.
+    local function sing(hz)
+      local out = {}
+      for i = 0, P.RATE // 10 - 1 do
+        local t = i / P.RATE
+        out[#out + 1] = string.pack("<i2", math.floor(3000 * (math.sin(2 * math.pi * hz * t)
+                                                       + 0.6 * math.sin(4 * math.pi * hz * t))))
+      end
+      local f = assert(io.open(RAW, "ab"))
+      f:write(table.concat(out))
+      f:close()
+    end
+
+    local function capture()
+      for _, t in ipairs(tasks) do if t.path == FFMPEG then return t end end
+    end
+
+    local function start()
+      hs.fs._files[FFMPEG] = { mode = "file" }
+      load()
+      karaoke.paths.raw = RAW
+      feed("play\n")
+      requests[1].answer(200, "lyrics")
+      clock = 1015
+      tick()
+    end
+
+    after_each(function() os.remove(RAW) end)
+
+    it("keeps the microphone closed until it is switched on", function()
+      start()
+      assert.is_nil(capture())
+      assert.is_nil(island()[E_NOTE])
+    end)
+
+    it("opens dictation's microphone while a song plays and names the note you sing", function()
+      hs.settings._v["karaoke.pitch"] = true
+      start()
+      local ff = capture()
+      assert.is_true(ff.started)
+      assert.same(P.captureArgs("0", RAW), ff.args)
+      for _ = 1, 3 do
+        sing(220)
+        clock = clock + 0.08
+        tick()
+      end
+      local c = island()
+      assert.equals("A3", c[E_NOTE].text)
+      assert.equals("fill", c[E_NOTE - 1].action)
+    end)
+
+    it("clears the note when you stop singing", function()
+      hs.settings._v["karaoke.pitch"] = true
+      start()
+      for _ = 1, 3 do sing(220); clock = clock + 0.08; tick() end
+      clock = clock + 1
+      tick()
+      assert.equals("", island()[E_NOTE].text)
+      assert.equals("skip", island()[E_NOTE - 1].action)
+    end)
+
+    it("makes the island taller for its row", function()
+      start()
+      local short = island().frame0.h
+      karaoke.setMeter(true)
+      assert.equals(short + 26, island().frame0.h)
+    end)
+
+    it("closes the microphone when the song pauses", function()
+      hs.settings._v["karaoke.pitch"] = true
+      start()
+      local ff = capture()
+      clock = 1020
+      feed("pause\n")
+      clock = 1024
+      tick()
+      assert.is_true(ff.terminated)
+    end)
+
+    it("closes the microphone when switched off", function()
+      hs.settings._v["karaoke.pitch"] = true
+      start()
+      local ff = capture()
+      karaoke.setMeter(false)
+      assert.is_true(ff.terminated)
+      assert.is_false(hs.settings._v["karaoke.pitch"])
+      assert.is_nil(island()[E_NOTE])
+    end)
   end)
 
   it("takes everything back on dispose", function()
