@@ -1,0 +1,95 @@
+local C = require("lib.claude_chat")
+
+describe("claude_chat.args", function()
+  it("keeps one read-only session open on stream-json", function()
+    local a = table.concat(C.args(nil, nil), " ")
+    assert.truthy(a:find("-p --input-format stream-json --output-format stream-json --verbose", 1, true))
+    assert.truthy(a:find("--tools " .. C.TOOLS, 1, true))
+    assert.is_nil(a:find("Bash", 1, true))
+    assert.is_nil(a:find("--model", 1, true))
+  end)
+
+  it("names a model and resumes a session when asked", function()
+    local a = C.args("haiku", "abc")
+    assert.same({ "--model", "haiku", "--resume", "abc" }, { a[#a - 3], a[#a - 2], a[#a - 1], a[#a] })
+    assert.is_nil(table.concat(C.args("default"), " "):find("--model", 1, true))
+  end)
+end)
+
+describe("claude_chat.message", function()
+  it("is one JSON line with the text escaped", function()
+    local m = C.message('say "hi"\nthen\\stop\1')
+    assert.equals('{"type":"user","message":{"role":"user","content":[{"type":"text","text":'
+      .. '"say \\"hi\\"\\nthen\\\\stop\\u0001"}]}}\n', m)
+  end)
+
+  it("leaves non-ASCII text as it is", function()
+    assert.equals('"café ✓"', C.quote("café ✓"))
+  end)
+end)
+
+describe("claude_chat.split", function()
+  it("hands back whole lines and keeps the rest for the next chunk", function()
+    local s = C.new()
+    assert.same({ "one" }, C.split(s, 'one\ntw'))
+    assert.same({ "two" }, C.split(s, 'o\n\n'))
+    assert.equals("", s.buffer)
+  end)
+end)
+
+describe("claude_chat.apply", function()
+  local function delta(text)
+    return { type = "stream_event", event = { type = "content_block_delta", delta = { type = "text_delta", text = text } } }
+  end
+  local start = { type = "stream_event", event = { type = "content_block_start", content_block = { type = "text" } } }
+  local stop = { type = "stream_event", event = { type = "content_block_stop" } }
+
+  it("streams a reply into one line and ends the turn on the result", function()
+    local s = C.new()
+    C.apply(s, { type = "system", subtype = "init", session_id = "sid", model = "claude-haiku-5-5" })
+    C.ask(s, "ping?")
+    assert.is_true(s.busy)
+    C.apply(s, start)
+    assert.is_true(C.apply(s, delta("\npo")))
+    C.apply(s, delta("ng\n"))
+    C.apply(s, stop)
+    assert.is_true(C.apply(s, { type = "result", session_id = "sid", total_cost_usd = 0.01 }))
+    assert.same({ { who = "you", text = "ping?" }, { who = "reply", text = "pong" } }, s.lines)
+    assert.same({ false, "sid", "claude-haiku-5-5" }, { s.busy, s.session, s.model })
+    assert.equals("Ready", C.status(s, true))
+  end)
+
+  it("notes a tool call and drops the empty reply it interrupted", function()
+    local s = C.new()
+    C.ask(s, "weather?")
+    C.apply(s, start)
+    C.apply(s, { type = "stream_event", event = { type = "content_block_start",
+                                                  content_block = { type = "tool_use", name = "WebSearch" } } })
+    C.apply(s, start); C.apply(s, delta("Sunny")); C.apply(s, stop)
+    C.apply(s, { type = "result" })
+    assert.same({ "you", "note", "reply" }, { s.lines[1].who, s.lines[2].who, s.lines[3].who })
+    assert.equals("Using WebSearch…", s.lines[2].text)
+    assert.equals(3, #s.lines)
+  end)
+
+  it("says when a turn failed", function()
+    local s = C.new()
+    C.ask(s, "x")
+    C.apply(s, { type = "result", is_error = true, result = "rate limited" })
+    assert.equals("Couldn't answer: rate limited", s.lines[2].text)
+  end)
+
+  it("keeps the transcript to its limit", function()
+    local s = C.new()
+    for i = 1, C.MAX_LINES + 5 do C.note(s, tostring(i)) end
+    assert.equals(C.MAX_LINES, #s.lines)
+    assert.equals("6", s.lines[1].text)
+  end)
+
+  it("shows whether the process is up and busy", function()
+    local s = C.new()
+    assert.equals("Starting…", C.status(s, false))
+    C.ask(s, "q")
+    assert.equals("Thinking…", C.status(s, true))
+  end)
+end)

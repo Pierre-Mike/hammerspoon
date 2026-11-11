@@ -50,15 +50,21 @@ Apps load themselves: anything under `apps/` with an `init.lua`, and any single
 | `apps/ovis_ocr` | Local OCR. A warm server (`apps/ovis_ocr/server.py`, port 8797) runs [OvisOCR2](https://huggingface.co/ATH-MaaS/OvisOCR2) through mlx-vlm and turns an image or a PDF into Markdown. LLM tools reach it through an MCP bridge (`apps/ovis_ocr/mcp.py`), scripts through `POST /ocr`, and a browser through a drop page at `http://127.0.0.1:8797/`. The tile reads a file into `<name>.ocr.md`, or reads the clipboard image. See [OCR](#ocr). |
 | `apps/wake_word` | Say "Codec" with no call open and the voice agent starts one. A second ffmpeg tails dictation's microphone, and every 1.5 s the last four seconds go to dictation's warm server on :8765 when they are loud enough to be speech. A transcript with the word in it (or "Kodak", which is what Parakeet often hears) posts `/start` to the voice agent's daemon, then hands it the sentence the word ended with on `/heard`. It stays quiet during a call, while dictation has the mic, for a few seconds after a call closes, and whenever `apps/voice_agent` is not loaded. On by default; the tile has the switch. Log: `/tmp/hs-voice-wake.log`. |
 | `apps/karaoke` | Shows the lyrics of whatever is playing, one line at a time, in a black island that hangs from the top of the screen like the MacBook notch. `media-control` (`brew install media-control`) reads the macOS Now Playing center, so Spotify, Music and a YouTube tab in Safari or Chrome all work. Without it, the plugin asks Spotify and Music over AppleScript once a second and cannot see a browser. Synced lyrics come from [LRCLIB](https://lrclib.net), which is free and needs no key. The plugin splits and cleans a YouTube title such as "Artist - Song (Official Video)" before the lookup. The line being sung turns from grey to white as it goes, and the next line shows underneath. On a notched screen the text sits below the notch. The tile has the switch, a choice between the main and the built-in screen, and a timing nudge for lyrics that run early or late. The tile's "Pitch meter" switch, off by default, adds a row under the lyrics with the note you're singing and a dot that sits in the middle of a bar when you're on the note, left when flat and right when sharp. It listens on dictation's microphone through ffmpeg, only while the island is up, and finds the note with YIN in `lib/pitch.lua`. Wear headphones, or it hears the song too. Cmd+Alt+Shift+K shows or hides the island. Log: `/tmp/hs-karaoke.log`. |
+| `apps/world_clock` | The time in other cities, in a widget on the hub panel. Seattle, New York and Paris by default; the tile switches cities on and off from a list of 13. Each city shows its time, the hours from here, and the weekday when it is a different day. An entry written as `Label=Area/Zone` in the `cities` setting adds a city the list lacks. |
+| `apps/claude_chat` | A Claude Code session that keeps running, as a small terminal in the hub panel. One `claude -p` process stays up with stream-json on stdin and stdout (`lib/claude_chat.lua`), so a question pays no start-up and the conversation carries on. Open the panel, press Tab, type, press Return; the answer streams in, and a toast says so if the panel was closed by then. It can read files and search the web, nothing that edits or runs commands. The session and the last 60 lines survive a reload. The tile has New chat and the model (Sonnet by default). Log: `/tmp/hs-claude-chat.log`. |
+| `apps/mac_status` | Battery, memory used and free disk, in a widget on the hub panel, redrawn every 10 seconds while it is open. |
 
-### One menu-bar button
+### One panel in the notch
 
-All apps share a single 🔨 menu-bar item (`lib/menuhub.lua`). Clicking it opens a
-Control Center-style panel (`lib/menuhub_panel.html`): one tile per app with its live
-icon and status, in light and dark mode. A tile opens that app's menu in the same
-design: grouped lists, ✓ pickers, switches, sliders, drill-in submenus, and actions
-that run in place.
-Option-click 🔨 for the plain dropdown. A new app gets a tile, not a new icon:
+All apps share one panel (`lib/menuhub.lua`), and nothing goes in the menu bar.
+Click the notch, or press Cmd+`, and a Control Center-style panel
+(`lib/menuhub_panel.html`) grows out of it, black like the karaoke island: one tile
+per app with its live icon and status. On a screen without a notch, the middle of
+the menu bar takes the click. A tile opens that app's menu in the same design:
+grouped lists, ✓ pickers, switches, sliders, drill-in submenus, and actions that run
+in place. Typing filters the tiles and Return opens the first. Escape clears the
+filter, goes back, then closes.
+Option-click the notch for the plain dropdown. A new app gets a tile, not a new icon:
 
 ```lua
 local ctx = require("lib.context").new("My app")
@@ -66,6 +72,33 @@ local ctx = require("lib.context").new("My app")
 M.menu = ctx:tile("My app")                       -- instead of hs.menubar.new()
 M.menu:setTitle("✅")                             -- same setTitle/setIcon/setMenu/
 M.menu:setMenu(function() return { ... } end)     -- setTooltip/setClickCallback API
+```
+
+The panel has a sidebar with two pages. It opens on Widgets: things a plugin wants
+seen without opening its tile. Plugins holds the tiles. Typing switches to Plugins
+and filters them.
+`ctx:widget(name, render, opts)` adds one, and it leaves with the plugin. `render`
+returns a list of items, each `{ label, value, detail }`, or `{ label, clock = "Asia/Tokyo" }`
+for a time the panel keeps current. `opts.every` redraws it every few seconds while the
+panel is open, and `opts.click` runs when it is clicked. `apps/world_clock` and
+`apps/mac_status` are examples.
+
+A widget with `opts.submit` is a console: `render` returns
+`{ lines = { { who = "you" | "reply" | "note", text } }, prompt, status, busy }`, the panel
+draws the lines over a prompt, and `submit(text)` gets what the user typed. Tab or a
+click puts the keys in the prompt, Return sends, Escape gives them back to the tile
+filter. `apps/claude_chat` is the example.
+
+The panel takes a third of the screen's width, with as many tile columns as fit.
+A sidebar on the left switches between Widgets and Plugins, with Reload and Console
+under them. Small widgets share a row; a console takes a row of its own. Opening a tile shows
+its name at once and its menu a moment later, so a slow menu does not hold up the
+click.
+
+```lua
+ctx:widget("Queue", function()
+  return { { label = "Printing", value = #jobs, detail = "next in 2 min" } }
+end, { every = 5 })
 ```
 
 ## Plugins

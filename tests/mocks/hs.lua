@@ -185,14 +185,24 @@ hs.menubar = {
   end,
 }
 
+-- Built tasks are pushed onto hs.task._made. A streaming task is
+-- new(path, exitCb, streamCb, args); what it was handed on stdin collects in
+-- _input, so a spec reads back what a module wrote to a long-lived process.
 hs.task = {
-  new = function(_, cb, args)
-    return {
-      start = function() end,
-      terminate = function() end,
-      setEnvironment = function() end,
-      _cb = cb, _args = args,
+  _made = {},
+  new = function(path, cb, stream, args)
+    if type(stream) == "table" then stream, args = nil, stream end
+    local t = {
+      _path = path, _cb = cb, _stream = stream, _args = args, _input = {},
+      running = false,
     }
+    t.start = function(self) self.running = true; return self end
+    t.terminate = function(self) self.running = false; return self end
+    t.setEnvironment = function(self, env) self._env = env; return self end
+    t.setWorkingDirectory = function(self, dir) self._dir = dir; return self end
+    t.setInput = function(self, s) self._input[#self._input + 1] = s; return self end
+    hs.task._made[#hs.task._made + 1] = t
+    return t
   end,
 }
 

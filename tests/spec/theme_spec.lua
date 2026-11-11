@@ -72,3 +72,23 @@ describe("theme.css", function()
     assert.equals(css, theme.css())
   end)
 end)
+
+-- The hub panel as an island: one appearance, the overlays', and black like
+-- the notch when that is dark.
+describe("theme.islandCss", function()
+  it("is solid black with no edge on dark overlays", function()
+    local css = theme.islandCss(theme.build({ overlay = "dark" }))
+    assert.truthy(css:find("--card: rgba(0, 0, 0, 1);", 1, true))
+    assert.truthy(css:find("--edge: transparent;", 1, true))
+    assert.is_nil(css:find("prefers-color-scheme", 1, true))
+  end)
+
+  it("keeps the panel's own card on light overlays", function()
+    local t = theme.build({ overlay = "light" })
+    assert.truthy(theme.islandCss(t):find("--card: " .. t.hub.light.card, 1, true))
+  end)
+
+  it("carries the island corner", function()
+    assert.truthy(theme.islandCss():find("--radius-island: " .. theme.radius.island .. "px", 1, true))
+  end)
+end)

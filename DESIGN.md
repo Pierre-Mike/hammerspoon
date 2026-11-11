@@ -7,7 +7,7 @@ Every plugin in this config draws with the same components and the same tokens, 
 - `designs/<name>.lua` is a design: the colors, fonts, sizes, corners and hub layout that differ from the defaults. One design is active at a time, and you can switch whenever you like.
 - `lib/theme.lua` holds the defaults and merges the active design over them. No plugin names a color or a size.
 - `lib/ui.lua` holds the components. A plugin reaches them through its context with `local ui = ctx:ui()`.
-- `lib/menuhub_panel.html` is the hub panel. Its colors, corners, fonts, sizes and column count come from `theme.css()`, which menuhub puts in place of the `/*@theme*/` marker, so a design changes the panel and the overlays together.
+- `lib/menuhub_panel.html` is the hub panel. It hangs from the notch like the karaoke island. Its colors, corners, fonts, sizes and column count come from `theme.islandCss()`, which menuhub puts in place of the `/*@theme*/` marker, so a design changes the panel and the overlays together.
 - `tests/spec/design_spec.lua` builds every design and fails when its text doesn't read on its panel.
 - `tests/spec/design_rules_spec.lua` fails the build when a plugin writes a color table, a corner radius, a raw point size, `hs.alert`, `hs.notify.new` or `ctx:canvas(` itself. The failure message names the component to use instead.
 
@@ -22,6 +22,8 @@ Run `hs -c 'uiGallery()'`, or pick "Preview the UI kit" in the Plugins tile, to 
 | Offer a few actions on something without stealing focus | `ui:bar(name, { pick, hover })`, then `bar:show(state)` |
 | Tell the user something they may read later | `ui:notify(text, { title, subtitle, onClick })` |
 | Build a tile's menu | `ui.menu.switch`, `choice`, `action`, `slider`, `submenu`, `text`, `separator` |
+| Keep something in view without opening a tile (the time in other cities, a count) | `ctx:widget(name, render, opts)`, drawn on the hub panel's Widgets page |
+| Take a typed line and show what comes back (a chat, a small terminal) | `ctx:widget(name, render, { submit = fn })`, a console widget |
 | Draw something no component covers (a lyric sweep, a growing transcript) | `ui:surface(name, frame, opts)` with `ui.backdrop`, `ui.label`, `ui.dot`, `ui.button` |
 
 A toast replaces whatever toast is up, from any plugin, so messages never stack. A HUD and a surface are named, so drawing one again replaces the last. Everything goes through the plugin's context and leaves when the plugin is switched off.

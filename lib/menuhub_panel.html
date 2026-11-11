@@ -15,15 +15,34 @@
     -webkit-user-select: none;
     cursor: default;
   }
+  /* An island: flush with the top of the screen, square where it meets the
+     notch, rounded only at the bottom. --top is how far down the notch
+     reaches, set by island(); the content starts under it. */
+  :root { --top: 0px; }
   .card {
-    margin: 1px;
-    max-height: calc(100vh - 2px);
-    display: flex; flex-direction: column;
-    padding: var(--pad);
-    border-radius: calc(var(--radius-lg) + 2px);
+    margin: 0 1px 1px;
+    max-height: calc(100vh - 1px);
+    display: flex; flex-direction: column; position: relative;
+    padding: calc(var(--top) + var(--pad)) var(--pad) var(--pad);
+    border-radius: 0 0 var(--radius-island) var(--radius-island);
     background: var(--card);
     border: 0.5px solid var(--edge);
+    border-top: 0;
   }
+  /* Grows out of the notch: starts as a notch-sized strip and opens down and
+     out. 100px is half of lib/notch's WIDTH. */
+  .card.drop { animation: drop calc(var(--motion) * 1.8) cubic-bezier(.2, .8, .2, 1); }
+  @keyframes drop {
+    from {
+      -webkit-clip-path: inset(0 calc(50% - 100px) calc(100% - var(--top) - 6px) round 0 0 12px 12px);
+      clip-path: inset(0 calc(50% - 100px) calc(100% - var(--top) - 6px) round 0 0 12px 12px);
+    }
+    to {
+      -webkit-clip-path: inset(0 0 0 round 0 0 var(--radius-island) var(--radius-island));
+      clip-path: inset(0 0 0 round 0 0 var(--radius-island) var(--radius-island));
+    }
+  }
+  .lip { position: absolute; top: 0; left: 0; right: 0; height: var(--top); }
   .scroll { overflow-y: auto; overflow-x: hidden; min-height: 0; flex: 1; margin: 0 -4px; padding: 0 4px; }
   .scroll::-webkit-scrollbar { width: 0; height: 0; }
 
@@ -49,7 +68,64 @@
     transition: background .12s, transform .08s;
     min-width: 0;
   }
-  .tile:hover { background: var(--tile-hover); }
+  .tile:hover, .tile.hot { background: var(--tile-hover); }
+  .tile.hot { box-shadow: inset 0 0 0 1.5px var(--accent); }
+  header .query { flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header .query::after { content: ""; display: inline-block; width: 1.5px; height: 1em; margin-left: 1px;
+                         vertical-align: -2px; background: var(--accent); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .empty { padding: var(--pad) 4px; color: var(--muted); text-align: center; }
+
+  /* Widgets: something a plugin wants seen at a glance, above the tiles. */
+  /* Small widgets share a row when the panel is wide; a console takes a row. */
+  .widgets { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); grid-auto-flow: dense;
+             gap: var(--gap); margin-bottom: var(--gap); }
+  .widget.console { grid-column: 1 / -1; }
+  .widget { background: var(--tile); border-radius: var(--radius-md); padding: 10px 12px 11px; }
+  .widget.click:hover { background: var(--tile-hover); }
+  .widget .caption { margin: 0 0 6px; }
+  .glance { display: grid; grid-template-columns: repeat(auto-fit, minmax(64px, 1fr)); gap: 8px 10px; }
+  .glance .item { min-width: 0; }
+  .glance .value small { font-size: var(--font-small); font-weight: 500; color: var(--muted); letter-spacing: 0; }
+  .glance .label, .glance .detail {
+    font-size: var(--font-small); color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .glance .value {
+    font-size: calc(var(--font-large) * 1.35); font-weight: 600; letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin: 1px 0;
+  }
+  .glance .night .value { color: var(--muted); }
+
+  /* A console widget: a short transcript over a prompt line. The prompt is
+     drawn, not an <input>, because keys arrive from Lua's tap (see key()). */
+  .widget.console { padding-bottom: 8px; }
+  .widget.console .caption { display: flex; gap: 8px; }
+  .widget.console .caption .state { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 500; }
+  .widget.console .caption .state.busy { color: var(--accent); }
+  .log {
+    max-height: 34vh; overflow-y: auto; margin: 0 -4px; padding: 0 4px;
+    font: var(--font-small)/1.45 ui-monospace, "SF Mono", Menlo, monospace;
+    white-space: pre-wrap; word-break: break-word; -webkit-user-select: text; cursor: text;
+  }
+  .log::-webkit-scrollbar { width: 0; }
+  .log .you { color: var(--accent); margin-top: 6px; }
+  .log .you:first-child { margin-top: 0; }
+  .log .you::before { content: "› "; }
+  .log .note { color: var(--muted); }
+  .prompt {
+    display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 6px 10px;
+    min-height: var(--control-height); border-radius: var(--radius-sm); background: var(--pill);
+    font: var(--font-small)/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .prompt::before { content: "›"; color: var(--accent); }
+  .prompt .hint { color: var(--muted); }
+  .prompt.on { box-shadow: inset 0 0 0 1.5px var(--accent); }
+  .prompt.on .text::after { content: ""; display: inline-block; width: 1.5px; height: 1em; margin-left: 1px;
+                            vertical-align: -2px; background: var(--accent); animation: blink 1s steps(1) infinite; }
+  .loading { color: var(--muted); padding: var(--pad) 4px; }
   .tile:active { transform: scale(0.97); }
   .tile.off { opacity: .45; pointer-events: none; }
   .disc {
@@ -117,13 +193,24 @@
   }
   .row .tick { flex: none; width: 16px; font-size: var(--font-size); color: var(--accent); font-weight: 600; text-align: center; }
 
-  footer { display: flex; gap: var(--gap); padding-top: var(--pad); }
-  footer button {
-    flex: 1; height: var(--control-height); border: 0; border-radius: var(--radius-sm);
-    font: 500 var(--font-small) var(--font); color: var(--text);
-    background: var(--pill);
+  /* The sidebar: Widgets (where the panel opens) and Plugins, then Reload and
+     Console at the bottom. --nav must match NAV in lib/menuhub, which takes
+     it out of the width before counting tile columns. */
+  :root { --nav: 132px; }
+  .main { display: flex; gap: var(--pad); flex: 1; min-height: 0; }
+  .main .scroll { min-width: 0; }
+  nav { flex: none; width: var(--nav); display: flex; flex-direction: column; gap: 2px; min-height: 180px; }
+  nav button {
+    display: flex; align-items: center; gap: 8px; height: var(--row-height); padding: 0 10px;
+    border: 0; border-radius: var(--radius-sm); background: none; text-align: left;
+    font: 500 var(--font-size) var(--font); color: var(--text);
   }
-  footer button:hover { background: var(--pill-hover); }
+  nav button:hover { background: var(--tile); }
+  nav button.on { background: var(--tile-hover); color: var(--accent); }
+  nav .count { margin-left: auto; font-size: var(--font-small); color: var(--muted); font-variant-numeric: tabular-nums; }
+  nav .spacer { flex: 1; }
+  nav button.small { height: var(--control-height); font-size: var(--font-small); color: var(--muted); }
+  nav button.small:hover { color: var(--text); }
 
   .view { animation: in var(--motion) ease-out; }
   .view.back-in { animation-name: back; }
@@ -132,13 +219,19 @@
 </style>
 </head>
 <body>
-<div class="card" id="card">
+<div class="card drop" id="card">
+  <div class="lip" id="lip"></div>
   <header id="header"></header>
-  <div class="scroll" id="scroll"></div>
-  <footer>
-    <button data-cmd="reload">Reload</button>
-    <button data-cmd="console">Console</button>
-  </footer>
+  <div class="main">
+    <nav id="nav">
+      <button data-section="widgets"><span>Widgets</span><span class="count"></span></button>
+      <button data-section="plugins"><span>Plugins</span><span class="count"></span></button>
+      <div class="spacer"></div>
+      <button class="small" data-cmd="reload">Reload</button>
+      <button class="small" data-cmd="console">Console</button>
+    </nav>
+    <div class="scroll" id="scroll"></div>
+  </div>
 </div>
 <script>
   const send = (m) => window.webkit.messageHandlers.hub.postMessage(m);
@@ -168,19 +261,171 @@
     return l;
   }
 
+  // ── Widgets ──────────────────────────────────────────────────────────────
+  // A clock item names a time zone; the time, the gap from here and the day
+  // are worked out on this side and kept current every second, with no trip
+  // to Lua.
+  function clockAt(tz, now) {
+    // "8:04" and "AM" apart, so the AM can be small and four cities fit a row.
+    let time = "", suffix = "";
+    for (const x of new Intl.DateTimeFormat([], { timeZone: tz, hour: "numeric", minute: "2-digit" }).formatToParts(now)) {
+      if (x.type === "dayPeriod") suffix = x.value; else time += x.value;
+    }
+    time = time.trim();
+    const p = {};
+    for (const x of new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, year: "numeric", month: "numeric", day: "numeric",
+      hour: "numeric", minute: "numeric", hourCycle: "h23",
+    }).formatToParts(now)) p[x.type] = +x.value;
+    const there = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute);
+    const here = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes());
+    const hours = Math.round((there - here) / 18e5) / 2;   // to the half hour, for India
+    const days = Math.round((Date.UTC(p.year, p.month - 1, p.day)
+      - Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())) / 864e5);
+    // The weekday only when it is not today here, and short, to fit a column.
+    const day = days ? " · " + new Intl.DateTimeFormat([], { timeZone: tz, weekday: "short" }).format(now) : "";
+    const gap = hours === 0 ? "same time" : (hours > 0 ? "+" : "−") + Math.abs(hours) + "h";
+    return { value: time, suffix, detail: gap + day, night: p.hour < 7 || p.hour >= 21 };
+  }
+
+  function fill(node, it) {
+    let value = it.value, suffix = "", detail = it.detail, night = false;
+    if (it.clock) {
+      try { ({ value, suffix, detail, night } = clockAt(it.clock, new Date())); }
+      catch (e) { value = "?"; detail = "No time zone " + it.clock; }
+    }
+    node.className = "item" + (night ? " night" : "");
+    node.replaceChildren();
+    if (it.label) node.appendChild(el("div", "label", it.label));
+    if (value != null) {
+      const v = el("div", "value", value);
+      if (suffix) v.appendChild(el("small", null, " " + suffix));
+      node.appendChild(v);
+    }
+    if (detail) node.appendChild(el("div", "detail", detail));
+  }
+
+  // A console's draft lives here, by widget index, so a redraw while Claude
+  // streams does not eat what the user is typing. `typing` is the console
+  // the keys go to, or null for the tile filter.
+  const drafts = {};
+  let typing = null;
+
+  function consoleCard(w) {
+    const card = el("div", "widget console");
+    const cap = el("div", "caption", w.title);
+    if (w.status) cap.appendChild(el("span", "state" + (w.busy ? " busy" : ""), w.status));
+    card.appendChild(cap);
+    if (w.lines.length) {
+      const log = el("div", "log");
+      for (const l of w.lines) log.appendChild(el("div", l.who, l.text));
+      card.appendChild(log);
+      requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
+    }
+    const on = typing === w.index;
+    const prompt = el("div", "prompt" + (on ? " on" : ""));
+    const draft = drafts[w.index] || "";
+    if (draft || on) prompt.appendChild(el("span", "text", draft));
+    else prompt.appendChild(el("span", "hint", w.prompt || "Type here"));
+    prompt.addEventListener("click", () => { typing = w.index; glance(widgetData); });
+    card.appendChild(prompt);
+    return card;
+  }
+
+  let widgetData = [];
+  function widgets(list) {
+    const box = el("div", "widgets");
+    box.id = "widgets";
+    for (const w of list) {
+      if (w.kind === "console") { box.appendChild(consoleCard(w)); continue; }
+      const card = el("div", "widget" + (w.click ? " click" : ""));
+      card.appendChild(el("div", "caption", w.title));
+      const row = el("div", "glance");
+      for (const it of w.items) {
+        const node = el("div", "item");
+        fill(node, it);
+        if (it.clock) node.dataset.clock = JSON.stringify(it);
+        row.appendChild(node);
+      }
+      card.appendChild(row);
+      if (w.click) card.addEventListener("click", () => send({ cmd: "widget", index: w.index }));
+      box.appendChild(card);
+    }
+    return box;
+  }
+
+  // Lua's redraw for a widget that asked for one: only the widgets change.
+  function glance(list) {
+    widgetData = list;
+    const old = document.getElementById("widgets");
+    if (!old || query) return;
+    old.replaceWith(widgets(list));
+    fit();
+  }
+
+  setInterval(() => {
+    for (const node of document.querySelectorAll("[data-clock]")) fill(node, JSON.parse(node.dataset.clock));
+  }, 1000);
+
+  // ── Home ─────────────────────────────────────────────────────────────────
+  // Typing filters the tiles by name and status; Return opens the first.
+  let query = "", lastModel = null;
+  const matches = (t) => !query || (t.name + " " + (t.status || "")).toLowerCase().includes(query.toLowerCase());
+
+  // Which part of the sidebar is showing. Every open starts on the widgets;
+  // an app's menu belongs to Plugins.
+  let section = "widgets";
+  const counts = { widgets: 0, plugins: 0 };
+  const atHome = () => lastKey !== null && lastKey.startsWith("home");
+
+  function showNav(m) {
+    if (m.view === "home") {
+      counts.widgets = (m.widgets || []).length;
+      counts.plugins = m.tiles.length;
+    }
+    const current = m.view === "home" ? section : "plugins";
+    for (const b of document.querySelectorAll("nav [data-section]")) {
+      b.classList.toggle("on", b.dataset.section === current);
+      b.querySelector(".count").textContent = counts[b.dataset.section] || "";
+    }
+  }
+
+  function showSection(s) {
+    if (s === section && atHome()) return;
+    section = s; query = ""; typing = null;
+    if (atHome()) render(lastModel);
+    else send({ cmd: "home" });   // from an app's menu: Lua draws the grid again
+  }
+
   function home(m, header, body) {
-    header.appendChild(el("h1", null, "Hammerspoon"));
-    header.appendChild(el("span", "meta", m.tiles.length + (m.tiles.length === 1 ? " app" : " apps")));
+    widgetData = m.widgets || [];
+    if (section === "widgets") {
+      header.appendChild(el("h1", null, "Widgets"));
+      const tab = widgetData.some((w) => w.kind === "console") ? "Tab to ask · " : "";
+      header.appendChild(el("span", "meta", tab + "type to find a plugin"));
+      if (widgetData.length) body.appendChild(widgets(widgetData));
+      else body.appendChild(el("div", "empty", "No widgets yet · a plugin adds one with ctx:widget"));
+      return;
+    }
+    const shown = m.tiles.filter((t) => t.kind !== "none" || !query).filter(matches);
+    if (query) {
+      header.appendChild(el("span", "query", query));
+      header.appendChild(el("span", "meta", shown.length ? "↩ opens " + shown[0].name : "no match"));
+    } else {
+      header.appendChild(el("h1", null, "Plugins"));
+      header.appendChild(el("span", "meta", m.tiles.length + (m.tiles.length === 1 ? " app" : " apps") + " · type to find"));
+    }
+    if (!shown.length) { body.appendChild(el("div", "empty", "Nothing called “" + query + "”")); return; }
     const grid = el("div", "grid");
-    for (const t of m.tiles) {
-      const tile = el("div", "tile" + (t.kind === "none" ? " off" : ""));
+    shown.forEach((t, n) => {
+      const tile = el("div", "tile" + (t.kind === "none" ? " off" : "") + (query && n === 0 ? " hot" : ""));
       if (t.tooltip) tile.title = t.tooltip;
       tile.appendChild(disc(t));
       tile.appendChild(label(t));
       if (t.kind === "menu") tile.appendChild(el("div", "chev", "›"));
       tile.addEventListener("click", () => send({ cmd: "open", index: t.index }));
       grid.appendChild(tile);
-    }
+    });
     body.appendChild(grid);
   }
 
@@ -199,6 +444,7 @@
     } else {
       body.appendChild(el("div", "caption", m.title));
     }
+    if (m.loading) { body.appendChild(el("div", "loading", "Loading…")); return; }
 
     let group = null;
     const flush = () => { group = null; };
@@ -239,9 +485,11 @@
   function render(m) {
     const header = document.getElementById("header");
     const scroll = document.getElementById("scroll");
-    const key = m.view === "home" ? "home" : m.app.name + "/" + m.depth + "/" + (m.title || "");
+    const key = m.view === "home" ? "home/" + section : m.app.name + "/" + m.depth + "/" + (m.title || "");
+    showNav(m);
     const moved = key !== lastKey;
     const top = scroll.scrollTop;
+    lastModel = m;
 
     header.replaceChildren();
     const body = el("div", "view" + (moved && lastKey && m.depth < lastDepth ? " back-in" : ""));
@@ -250,8 +498,11 @@
     scroll.replaceChildren(body);
     scroll.scrollTop = moved ? 0 : top;
     lastKey = key; lastDepth = m.depth;
+    fit();
+  }
 
-    // Report the natural height so the window fits; the card scrolls past the cap.
+  // Report the natural height so the window fits; the card scrolls past the cap.
+  function fit() {
     const card = document.getElementById("card");
     card.style.maxHeight = "none";
     const h = Math.ceil(card.getBoundingClientRect().height) + 2;
@@ -259,10 +510,85 @@
     send({ cmd: "size", h });
   }
 
-  document.querySelectorAll("footer button").forEach((b) =>
+  // How far down the notch reaches on this screen, 0 where there is none, and
+  // how many tile columns fit the panel's third of it.
+  function island(top, columns) {
+    const root = document.documentElement.style;
+    root.setProperty("--top", top + "px");
+    if (columns) root.setProperty("--columns", columns);
+    fit();
+  }
+
+  // Every open starts on a clean grid and plays the drop again.
+  function opened() {
+    query = ""; typing = null; section = "widgets";
+    const card = document.getElementById("card");
+    card.classList.remove("drop");
+    void card.offsetWidth;
+    card.classList.add("drop");
+  }
+
+  function refilter() { if (lastModel && atHome()) render(lastModel); }
+
+  document.querySelectorAll("nav [data-cmd]").forEach((b) =>
     b.addEventListener("click", () => send({ cmd: b.dataset.cmd })));
+  document.querySelectorAll("nav [data-section]").forEach((b) =>
+    b.addEventListener("click", () => showSection(b.dataset.section)));
+  // A click on the notch itself, the strip above the content, closes.
+  document.getElementById("lip").addEventListener("click", () => send({ cmd: "close" }));
+  // One key, by its DOM name. Lua sends them from its event tap (see
+  // lib/menuhub), because the page does not always have the keyboard; the
+  // listener below covers the times it does. True when the key was used.
+  function key(k, text) {
+    if (typing !== null && atHome()) return typeInto(k, text);
+    if (k === "Tab" && atHome()) {
+      const c = widgetData.find((w) => w.kind === "console");
+      if (c) { section = "widgets"; typing = c.index; query = ""; refilter(); }
+      return true;
+    }
+    const pasted = k === "Paste";
+    if (pasted) k = (text || "").replace(/\s+/g, " ").trim();
+    if (!k) return false;
+    if (k === "Escape") {
+      if (query) { query = ""; refilter(); return true; }
+      send({ cmd: atHome() ? "close" : "back" });
+      return true;
+    }
+    if (!atHome()) return false;
+    if (k === "Enter") {
+      const first = document.querySelector(".tile.hot");
+      if (first) first.click();
+    } else if (k === "Backspace") {
+      if (query) { query = query.slice(0, -1); refilter(); }
+    } else if ((pasted || [...k].length === 1) && (query || k !== " ")) {
+      // Typing on the widgets means looking for a plugin.
+      section = "plugins";
+      query += k; refilter();
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  // Keys while a console's prompt has them: Return sends, Escape or Tab hands
+  // the keys back to the tile filter, Cmd+V pastes.
+  function typeInto(k, text) {
+    const i = typing, draft = drafts[i] || "";
+    if (k === "Escape" || k === "Tab") typing = null;
+    else if (k === "Enter") {
+      if (draft.trim()) { send({ cmd: "submit", index: i, text: draft.trim() }); drafts[i] = ""; }
+    }
+    else if (k === "Backspace") drafts[i] = [...draft].slice(0, -1).join("");
+    else if (k === "Paste") drafts[i] = draft + (text || "");
+    else if ([...k].length === 1) drafts[i] = draft + k;
+    else return false;
+    glance(widgetData);
+    return true;
+  }
+
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") send({ cmd: lastKey === "home" ? "close" : "back" });
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (key(e.key)) e.preventDefault();
   });
   send({ cmd: "ready" });
 </script>

@@ -290,7 +290,7 @@ local function block(vars, t)
   for _, k in ipairs(keys) do out[#out + 1] = string.format("--%s: %s;", k, vars[k]) end
   -- Corners and sizes too, so a tile in the panel rounds like a surface on
   -- screen and a compact design is compact in both places.
-  for _, k in ipairs({ "sm", "md", "lg" }) do
+  for _, k in ipairs({ "sm", "md", "lg", "island" }) do
     out[#out + 1] = string.format("--radius-%s: %s;", k, px(t.radius[k]))
   end
   local p = t.panel
@@ -313,6 +313,26 @@ function M.css(t)
   t = t or M
   return ":root { " .. block(t.hub.light, t) .. " }\n"
       .. "@media (prefers-color-scheme: dark) { :root { " .. block(t.hub.dark, t) .. " } }"
+end
+
+-- An hs.canvas color as CSS.
+function M.cssColor(c)
+  local r, g, b = channels(c)
+  local function byte(x) return math.floor(x * 255 + 0.5) end
+  return string.format("rgba(%d, %d, %d, %g)", byte(r), byte(g), byte(b), c.alpha or 1)
+end
+
+-- The hub panel when it hangs from the notch. It follows the overlays rather
+-- than the system, the way the karaoke island does, so the two never disagree
+-- on a design pinned to dark. Dark overlays make it surfaceSolid, black like
+-- the notch it grows out of; light ones keep the panel's own card.
+function M.islandCss(t)
+  t = t or M
+  local vars = t.hub[t.overlay]
+  if t.overlay == "dark" then
+    vars = merge(vars, { card = M.cssColor(t.color.surfaceSolid), edge = "transparent" })
+  end
+  return ":root { " .. block(vars, t) .. " }"
 end
 
 -- ── The active design ──────────────────────────────────────────────────────

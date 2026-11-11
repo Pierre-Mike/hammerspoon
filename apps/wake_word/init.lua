@@ -7,7 +7,7 @@
 --   • starts a call with POST /start on the voice agent's daemon when the
 --     transcript has the word in it
 --   • hands the agent whatever was said in front of the word, with POST /heard
---   • shows whether it is listening, and the switch, in the shared 🔨 hub
+--   • shows whether it is listening, and the switch, in the shared hub
 --
 -- The rules — what counts as the word, which slice of audio to look at, when
 -- to stay quiet — are all in lib/wake_word; this is the microphone, the timer

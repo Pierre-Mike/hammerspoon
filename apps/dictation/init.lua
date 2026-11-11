@@ -444,6 +444,18 @@ end
 
 local MICS = discoverMics()
 
+-- Listing the inputs runs ffmpeg, about a third of a second, and the hub
+-- builds this menu on every open and after every click in it. A few seconds
+-- of cache keeps those cheap; a mic plugged in meanwhile shows up on the next
+-- open, and "Rescan microphones" never waits.
+local MIC_TTL = 5
+local micsAt = os.time()
+
+local function freshMics()
+  if os.time() - micsAt >= MIC_TTL then MICS, micsAt = discoverMics(), os.time() end
+  return MICS
+end
+
 -- Persisted mic (by name). If it's not currently connected we keep the name
 -- anyway, so it just works again once the device reappears.
 local function initMic()
@@ -1457,7 +1469,7 @@ local function takesMenu()
 end
 
 local function buildMenu()
-  MICS = discoverMics()   -- refresh so the picker reflects currently-connected inputs
+  freshMics()   -- so the picker reflects currently-connected inputs
   local maxKB = 0
   for _, m in ipairs(MODELS) do if m.sizeKB and m.sizeKB > maxKB then maxKB = m.sizeKB end end
   -- How a take reaches the app, first: the switch that matters most.

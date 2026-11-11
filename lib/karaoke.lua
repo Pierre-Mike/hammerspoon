@@ -341,11 +341,9 @@ function M.status(np, lyrics)
 end
 
 -- ── Geometry ───────────────────────────────────────────────────────────────
--- A notched MacBook's menu bar is about 37 pt tall, against 24 to 30 on every
--- other screen, and that is the one thing Hammerspoon can see of the notch.
-function M.hasNotch(name, full, frame)
-  return tostring(name or ""):find("Built%-in") ~= nil and (frame.y - full.y) >= 32
-end
+-- lib/notch knows where the notch is; the hub panel hangs from it too.
+local notch = require("lib.notch")
+M.hasNotch = notch.hasNotch
 
 M.MIN_WIDTH = 420
 M.MAX_WIDTH = 1200
@@ -360,8 +358,6 @@ function M.notchWidth(widths, screenW)
   return math.max(M.MIN_WIDTH, math.min(widest + M.PADDING, cap))
 end
 
-function M.notchFrame(full, w, h)
-  return { x = full.x + math.floor((full.w - w) / 2), y = full.y, w = w, h = h }
-end
+M.notchFrame = notch.frame
 
 return M

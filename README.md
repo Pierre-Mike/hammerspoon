@@ -1,7 +1,7 @@
 # Hammerspoon plugins
 
 A [Hammerspoon](https://www.hammerspoon.org/) config built from small plugins. Each
-plugin adds one tool to a shared menu-bar hub: dictation, ambient noise, local
+plugin adds one tool to a shared hub that opens from the notch: dictation, ambient noise, local
 speech and OCR servers, live lyrics, a face-touch deterrent and more. Drop a
 folder in, reload, and it has a tile. Take it out and it leaves nothing behind.
 
@@ -11,8 +11,9 @@ look, and a registry that keeps a broken plugin from breaking the rest.
 
 ## What you get
 
-- **One menu-bar button.** A 🔨 panel with a tile per plugin, in light and dark
-  mode. A tile opens a menu with switches, pickers, sliders and actions.
+- **One panel in the notch.** Click the notch or press Cmd+` and a panel grows out
+  of it, opening on widgets such as a world clock, with every plugin's tile one click away in the sidebar. A
+  tile opens a menu with switches, pickers, sliders and actions. Type to filter.
 - **Plugins that load themselves.** Anything in `apps/` or `plugins/` with an
   `init.lua` is found at startup. A plugin that throws fails alone and says why
   on its row.
@@ -38,6 +39,9 @@ Plugins that ship with the repo:
 | `noseguard` | Uses the camera to interrupt you when a finger rests on your nose. |
 | `quit_guard` | Cmd+Q and Cmd+W need a double press in the apps you pick. |
 | `tailscale_funnel` | One public address for this Mac, leased by whichever plugin needs it. |
+| `world_clock` | The time in other cities, in a widget on the hub panel. |
+| `claude_chat` | A Claude Code session kept running for quick questions, as a small terminal in the hub panel. |
+| `mac_status` | Battery, memory and free disk at a glance in the hub panel. |
 
 The rest, and the details of each, are in [docs/apps.md](docs/apps.md).
 
@@ -57,7 +61,7 @@ git clone https://github.com/Pierre-Mike/hammerspoon.git ~/Github/hammerspoon
 ln -s ~/Github/hammerspoon ~/.hammerspoon
 ```
 
-Open Hammerspoon and choose Reload Config. The 🔨 button appears in the menu bar.
+Open Hammerspoon and choose Reload Config. Click the notch, or press Cmd+`, to open the panel.
 
 Some plugins need more: `ffmpeg` for dictation, a Python environment for the speech
 servers, and camera, microphone and accessibility permission for the plugins that
@@ -137,7 +141,7 @@ return function(plugin)
 end
 ```
 
-Reload, open the 🔨 panel, click the Hello tile and choose Say hello. From a shell,
+Reload, open the panel with Cmd+`, click the Hello tile and choose Say hello. From a shell,
 `hs -c 'plugins = require("lib.plugins"); plugins.run("hello.greet")'` does the same.
 
 When the plugin is switched off, `stop` runs (if you wrote one), then everything made
@@ -206,6 +210,7 @@ A stored value that no longer fits the schema is ignored and the default is used
 | `plugin.ctx` | The context. `ctx:timer`, `ctx:after`, `ctx:hotkey`, `ctx:task`, `ctx:url`, `ctx:watcher`, `ctx:eventtap`, `ctx:httpserver`, `ctx:atExit` and `ctx:effect(fn)` for anything else. Everything is undone on switch-off. See `lib/context.lua`. |
 | `plugin.ui` | Shared components: `toast`, `hud`, `bar`, `notify`, `surface`. Pass a tone such as `success`, `working` or `danger`, never a color. See [DESIGN.md](DESIGN.md). |
 | `plugin.tile(title)` | Adds a hub tile. It has `setTitle`, `setTooltip`, `setMenu` and `setClickCallback`. Build menu rows with `require("lib.ui").menu`. |
+| `plugin.widget(render, opts)` | Adds a widget to the hub panel's Widgets page. `render` returns items such as `{ label, value, detail }` or `{ label, clock = "Asia/Tokyo" }`. `opts.title`, `opts.every` (seconds between redraws while open), `opts.click`, and `opts.submit` for a console with a prompt. Returns a handle with `update()`. |
 | `plugin.action(name, fn)` | Registers `<id>.<name>`. Anyone can run it with `plugins.run("<id>.<name>", ...)`. |
 | `plugin.settings.get(key)` | The stored value, or the default. `nil` for a key not in the schema. |
 | `plugin.settings.set(key, value)` | Returns `true`, or `false` and why. Fires the `settings` event. |

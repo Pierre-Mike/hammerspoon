@@ -259,6 +259,7 @@ end
 --   plugin.on(event, fn)            "start", "stop", "settings", or "plugin:loaded" /
 --                                   "plugin:unloaded" for the others; returns an off() fn
 --   plugin.tile(title)              the hub tile
+--   plugin.widget(render, opts)     something to glance at on the panel's Widgets page (lib/menuhub.glance)
 --   plugin.action(name, fn)         a named thing other code can run: plugins.run("id.name")
 function M.settingKey(id, key) return "plugin." .. id .. "." .. key end
 
@@ -311,6 +312,11 @@ function M.newObject(name, manifest)
   }
 
   function p.tile(title) return ctx:tile(title or (manifest and manifest.name) or name) end
+  -- opts.title names it; the plugin's name otherwise.
+  function p.widget(render, opts)
+    opts = opts or {}
+    return ctx:widget(opts.title or (manifest and manifest.name) or name, render, opts)
+  end
   function p.action(action, fn)
     local full = id .. "." .. action
     M.actions[full] = fn
@@ -516,6 +522,11 @@ end
 function M.install()
   if M.ctx then return M.ctx end
   M.ctx = context.new("Plugins")
+  -- The panel itself: the target over the notch and Cmd+`. Guarded, so a
+  -- missing hs.webview or a screen that will not answer costs the panel and
+  -- not the Plugins tile.
+  local ok, err = pcall(require("lib.menuhub").install, M.ctx)
+  if not ok then M.warn("[plugins] the hub panel did not install: " .. tostring(err)) end
   local tile = M.ctx:tile("Plugins")
   tile:setTitle("🧩")
   tile:setTooltip(string.format("%d plugins", #M.order))

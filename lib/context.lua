@@ -331,6 +331,16 @@ function Context:tile(name)
   return tile, self:effect(function() tile:delete() end)
 end
 
+-- Something to see at a glance on the hub panel's Widgets page: the time in other
+-- cities, a count, a status. render() returns the items to draw (see
+-- lib/menuhub.glance) and is asked each time the panel draws.
+--   opts.every  seconds between redraws while the panel is open
+--   opts.click  run when the widget is clicked
+function Context:widget(name, render, opts)
+  local w = require("lib.menuhub").widget(name, render, opts)
+  return w, self:effect(function() w:delete() end)
+end
+
 -- ── Components ─────────────────────────────────────────────────────────────
 -- What a plugin draws with: toasts, a HUD, a button bar, themed surfaces (see
 -- lib/ui.lua). Bound to this context, so everything it puts on screen is an
