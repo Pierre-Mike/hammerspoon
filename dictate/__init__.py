@@ -11,6 +11,11 @@ This file is the CONTRACT; the bodies live in submodules re-exported here:
   stream.py  StreamingTranscriber (growing audio -> stable text), Snapshot,
              pcm_to_float32()
 
+and one module imported on its own, for the review panel rather than live
+typing:
+  alternatives.py  each word's score and what else the model nearly wrote
+                   there (POST /words) — pure, stdlib only
+
 The model is injected, so nothing here imports mlx: parakeet_server.py runs
 under parakeet-mlx's interpreter and passes in a `transcribe(samples) -> tokens`
 adapter, while the specs pass in a scripted one.

@@ -136,6 +136,17 @@ describe("ui element builders", function()
     assert.equals(theme.color.textTertiary, text.textColor)
   end)
 
+  it("marks a word with a plate when pointed at and an underline in its tone", function()
+    local f = { x = 100, y = 40, w = 50, h = 24 }
+    assert.same({}, ui.wordMarks(f))
+    local plate, line = table.unpack(ui.wordMarks(f, { hot = true, tone = "draft" }))
+    assert.equals(theme.color.control, plate.fillColor)
+    assert.is_true(plate.frame.x < f.x and plate.frame.w > f.w)
+    assert.equals(theme.tone("draft"), line.fillColor)
+    assert.same({ x = 100, y = 62, w = 50, h = 2 }, line.frame)
+    assert.is_nil(plate.trackMouseDown)
+  end)
+
   it("counts characters, not bytes, when it has to estimate", function()
     assert.equals(ui.estimateWidth("abc", 14), ui.estimateWidth("“b”", 14))
   end)

@@ -559,6 +559,9 @@ local function showLivePreview(text, committed)
   local h = math.min(maxH, PREVIEW_TOP + lines * lineH + PREVIEW_PAD)
   h = math.max(h, PREVIEW_TOP + lineH + PREVIEW_PAD)   -- at least one line
   local frame = UI.place(f, w, h, "caption")             -- bottom edge stays fixed
+  -- The model's name, small, on the dot's row: which one is listening matters
+  -- when English and French are each a menubar click away.
+  local tagH = math.floor(theme.text.caption * theme.leading)
 
   if not M.preview then
     M.preview, M.previewRelease = ctx:ui():surface("preview", frame, { backdrop = false })
@@ -569,6 +572,8 @@ local function showLivePreview(text, committed)
     UI.backdrop(w, h, { radius = "lg" }),
     -- "working" until the mic delivers audio, "recording" once it really is.
     UI.dot(30, 30, (M.micState == "starting") and "working" or "recording"),
+    UI.label(M.modelName or "", { x = PREVIEW_PAD, y = 30 - tagH / 2, w = innerW, h = tagH },
+             { style = "caption", color = "textTertiary", align = "right", truncate = true }),
     UI.label(shown and previewStyled(shown, committed)
              or ((M.micState == "starting") and "Starting…" or "Listening…"),
              { x = PREVIEW_PAD, y = PREVIEW_TOP, w = innerW, h = h - PREVIEW_TOP - 8 },
@@ -815,6 +820,52 @@ local function unduckNoise()
   logf("[duck] restored %.1f", vol)
 end
 
+-- Pause whatever is playing while the mic is open, and play it again after.
+-- media-control (brew install media-control) talks to macOS's Now Playing, so
+-- it reaches a YouTube tab as well as Music or Spotify. It asks before it
+-- pauses: the media key only toggles, and pressed with nothing playing it
+-- would start the last video in the middle of the sentence. `play` is safe to
+-- send twice, which the toggle would not be.
+local MEDIA_CONTROL = "/opt/homebrew/bin/media-control"
+M.pauseMedia = hs.settings.get("dictate.pauseMedia") == true
+M.mediaPaused = false
+
+local function mediaControlInstalled() return hs.fs.attributes(MEDIA_CONTROL) ~= nil end
+
+local function pauseMedia()
+  if not M.pauseMedia or M.mediaPaused or not mediaControlInstalled() then return end
+  local take = M.take
+  local get, release
+  get, release = ctx:task(MEDIA_CONTROL, function(code, out, _)
+    release()
+    -- The answer can land after a short tap has already ended, and a pause
+    -- then would have no take left to undo it.
+    if not (M.recording and M.take == take) then return end
+    local ok, now = pcall(hs.json.decode, out or "")
+    if code ~= 0 or not ok or type(now) ~= "table" or now.playing ~= true then return end
+    M.mediaPaused = true
+    local pause, releasePause
+    pause, releasePause = ctx:task(MEDIA_CONTROL, function() releasePause() end, { "pause" })
+    pause:start()
+    logf("[media] paused %s", tostring(now.title))
+  end, { "get", "--no-artwork" })
+  get:start()
+end
+
+-- Every exit from a take routes here, the way it does to unduckNoise. A plain
+-- hs.task rather than ctx:task: dispose() calls this and then stops every
+-- process the context holds, which would kill `play` before it ran.
+local function resumeMedia()
+  if not M.mediaPaused then return end
+  M.mediaPaused = false
+  hs.task.new(MEDIA_CONTROL, nil, { "play" }):start()
+  logf("[media] resumed")
+end
+
+-- What a take does to the user's audio, and the one call that undoes it.
+local function quietAudio() duckNoise(); pauseMedia() end
+local function restoreAudio() unduckNoise(); resumeMedia() end
+
 -- ── Rewrites and review ─────────────────────────────────────────────────────
 -- Both are part of this plugin and built on its context, so switching
 -- dictation off takes the panel, the bar, their keys and any claude process
@@ -824,6 +875,32 @@ M.reviewPanel = require("apps.dictation.review")({
   ctx = ctx, rewrite = M.rewrite, typer = function() return plugins.loaded["keystroke_typer"] end,
   onSent = function(text) M.lastResult = text end,
 })
+
+-- Once a take under review is saved, the server decodes the kept recording
+-- again in one pass (POST /words, parakeet only): the panel takes those words,
+-- underlines the ones the model was unsure of and offers what else it heard.
+-- A miss leaves the panel as it opened. The take can be ready a moment before
+-- the panel opens on it, so this asks whenever the take is headed there.
+M.onTake("review-words", function(take)
+  if M.engine ~= "parakeet" then return end
+  if not (M.review or M.holdForAction or M.reviewPanel.isOpen()) then return end
+  hs.http.asyncPost(STT_BASE .. "/words", take.wav, { ["Content-Type"] = "text/plain" },
+    function(status, body, _)
+      local ok, res = false, nil
+      if status == 200 and body and body ~= "" then ok, res = pcall(hs.json.decode, body) end
+      if not ok or type(res) ~= "table" then
+        logf("[review] /words miss (status=%s): %s", tostring(status), tostring(body))
+        return
+      end
+      local n = 0
+      for _, w in ipairs(type(res.words) == "table" and res.words or {}) do
+        if w.unsure then n = n + 1 end
+      end
+      local took = M.reviewPanel.heard(take.text, res)
+      logf("[review] /words %s: %d words, %d unsure · %s", took and "taken" or "not for this panel",
+           type(res.words) == "table" and #res.words or 0, n, tostring(res.text))
+    end)
+end)
 
 -- The bar after a take that is already at the cursor: its rewrites go to the
 -- clipboard.
@@ -856,7 +933,7 @@ end
 -- Shared tail: reset UI, clean the transcript, then type it at the cursor.
 local function finishTranscript(out)
   setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false)
-  unduckNoise()
+  restoreAudio()
   logf("[dictate] result: %s", tostring(out))
   local live = M.live.on
   if not out or out == "" then
@@ -1000,7 +1077,10 @@ end
 -- ── Mic-ready indicator ─────────────────────────────────────────────────────
 -- avfoundation takes ~300ms to open the mic, and words spoken before that are
 -- lost. The preview says "Starting…" (amber dot) from Fn-down and turns to
--- "Listening…" (red dot) only once ffmpeg has written audio bytes.
+-- "Listening…" (red dot) only once ffmpeg has written audio bytes. The start
+-- sound waits for the same moment: the log has takes where audio took 2-10 s
+-- to arrive, mostly after the machine sat idle, and a sound on the key press
+-- told you to talk while those words were being lost.
 local MIC_POLL = 0.05
 
 local function stopReadyPoll()
@@ -1016,6 +1096,7 @@ local function startReadyPoll()
     if fileSize(M.paths.RAW) > 0 then
       stopReadyPoll()
       M.micState = "listening"
+      playEarcon("start")
       logf("[dictate] mic live after %.2fs", hs.timer.secondsSinceEpoch() - M.startedAt)
       showLivePreview(M.lastPartial)
     end
@@ -1026,9 +1107,8 @@ end
 local stopRecording
 
 local function startRecording()
-  -- Fire the "listening" cue FIRST so it lands before ffmpeg spins up. hs.sound
-  -- is non-blocking, so this adds no measurable latency to mic capture.
-  playEarcon("start")
+  -- No sound yet: the "listening" cue plays from startReadyPoll once audio
+  -- actually arrives.
   os.remove(M.paths.WAV); os.remove(M.paths.RAW)
   setRecording(true)
   M.batchFinish = false
@@ -1048,7 +1128,7 @@ local function startRecording()
   hideLivePreview()
   startReadyPoll()
   showLivePreview(nil)   -- "Starting…" until audio arrives, then "Listening…"
-  duckNoise()
+  quietAudio()
   logf("[dictate] recording start (mic=%q, engine=%s)", M.micName, M.engine)
   -- Two outputs from one capture: WAV for batch transcription (server /transcribe),
   -- plus a headerless s16le PCM file the server tails live (parakeet models).
@@ -1132,13 +1212,13 @@ function stopRecording()
   M.previewTimer, M.previewPoll = nil, nil
   if M.cancelled then
     logf("[dictate] cancelled by chord")
-    M.cancelled = false; setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false); unduckNoise()
+    M.cancelled = false; setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false); restoreAudio()
     if M.live.on then cancelLive() elseif M.stream then cancelStream() end
     return
   end
   if dur < MIN_DURATION then
     logf("[dictate] tap too short (%.2fs), ignored", dur)
-    setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false); unduckNoise()
+    setIcon("○"); hideHUD(); hideLivePreview(); setRecording(false); restoreAudio()
     if M.live.on then cancelLive() elseif M.stream then cancelStream() end
     return
   end
@@ -1336,6 +1416,12 @@ local function setLiveTyping(on)
   logf("[live] typing while you speak %s", M.liveTyping and "on" or "off")
 end
 
+local function setPauseMedia(on)
+  M.pauseMedia = on and true or false
+  hs.settings.set("dictate.pauseMedia", M.pauseMedia)
+  logf("[media] pause while you speak %s", M.pauseMedia and "on" or "off")
+end
+
 -- Run a kept take through whatever model is loaded now, and put the result on
 -- the clipboard rather than typing it: the cursor has moved on since.
 local function retranscribe(name)
@@ -1393,6 +1479,10 @@ local function buildMenu()
     { title = "Show rewrites after a typed take  (Fn+R reviews one)" .. (M.review and "  (review is on)" or ""),
       switch = true, checked = M.actionsBar, disabled = M.review,
       fn = function() setActionsBar(not M.actionsBar) end },
+    { title = "Pause videos and music while you speak"
+              .. (mediaControlInstalled() and "" or "  (brew install media-control)"),
+      switch = true, checked = M.pauseMedia, disabled = not mediaControlInstalled(),
+      fn = function() setPauseMedia(not M.pauseMedia) end },
     menu.separator(),
     menu.text("Speech model · English WER · RAM footprint"),
   }
@@ -1628,11 +1718,11 @@ logf("[dictate] init complete")
 -- in flight, the overlays, the mic watcher, the debug globals and the tile.
 -- Hammerspoon's own volume is put back first, because a plugin disposed mid-take
 -- would otherwise leave the user's output ducked at 30 with nothing left that
--- knows what it was.
+-- knows what it was. Media it paused plays again for the same reason.
 function M.dispose()
   if M.recording then M.cancelled = true; stopRecording() end
   releaseLive()
-  unduckNoise()
+  restoreAudio()
   M.reviewPanel.close("disposed")
   M.rewrite.stop()
   M.pronunciation.stop()

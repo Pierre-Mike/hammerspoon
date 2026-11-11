@@ -150,6 +150,29 @@ function M.buttonWidth(label)
   return M.measure(label, theme.text.body) + 2 * theme.space.md
 end
 
+-- What goes under one word of running text that can be pointed at, as a list
+-- of elements to draw before the word's label: the hover plate when `hot`, and
+-- an underline in `tone`. Dictation's review panel underlines a word the model
+-- was unsure of in "draft".
+function M.wordMarks(frame, opts)
+  opts = opts or {}
+  local out, pad = {}, theme.space.xs
+  if opts.hot then
+    out[#out + 1] = {
+      type = "rectangle", action = "fill", fillColor = theme.color.control,
+      roundedRectRadii = { xRadius = theme.radius.sm, yRadius = theme.radius.sm },
+      frame = { x = frame.x - pad, y = frame.y, w = frame.w + 2 * pad, h = frame.h },
+    }
+  end
+  if opts.tone then
+    out[#out + 1] = {
+      type = "rectangle", action = "fill", fillColor = theme.tone(opts.tone),
+      frame = { x = frame.x, y = frame.y + frame.h - 2, w = frame.w, h = 2 },
+    }
+  end
+  return out
+end
+
 -- ── Layouts ────────────────────────────────────────────────────────────────
 -- Pure: a one-line message with an optional status dot, as { w, h, elements }.
 -- The toast and the bar's result line are both this.

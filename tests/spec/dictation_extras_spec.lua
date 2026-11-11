@@ -114,11 +114,12 @@ hs.json = {
 local clock = 1000
 hs.timer.secondsSinceEpoch = function() return clock end
 
-local finishBody, posts, gets, llmReply, modelsBody
+local finishBody, wordsBody, posts, gets, llmReply, modelsBody
 hs.http.asyncPost = function(url, body, _, cb)
   posts[#posts + 1] = { url = url, body = body, cb = cb }
   if not cb then return end
   if url:match("/finish$") then cb(200, finishBody, {})
+  elseif url:match("/words$") then cb(wordsBody and 200 or 501, wordsBody or "__ERROR__ no", {})
   elseif url:match("/transcribe$") then cb(200, "retranscribed words", {})
   elseif url:match("/chat/completions$") then
     if llmReply ~= "hang" then cb(200, llmReply, {}) end
@@ -229,7 +230,7 @@ end
 before_each(function()
   typer.cancel()
   hs.timer._every = {}
-  finishBody, llmReply, modelsBody = "hello world", nil, nil
+  finishBody, wordsBody, llmReply, modelsBody = "hello world", nil, nil, nil
   pb.text, pb.count = "user clipboard", 1
   mods = {}
   os.execute("rm -rf '" .. TMP .. "'/*")
@@ -247,6 +248,46 @@ describe("mic-ready indicator", function()
     d.readyTimer.fn()
     assert.equals("listening", d.micState)
     assert.is_nil(d.readyTimer)
+  end)
+
+  -- Switching models is a menubar click away, so the take itself says which
+  -- one is listening: French spoken into the English-only model is the mistake
+  -- this catches.
+  it("names the model that is listening", function()
+    local drawn, real = {}, hs.canvas.new
+    hs.canvas.new = function(f)
+      local c = real(f)
+      c.replaceElements = function(self, ...) drawn = { ... }; return self end
+      return c
+    end
+    load()
+    d.toggle()
+    hs.canvas.new = real
+    local texts = {}
+    for _, el in ipairs(drawn) do
+      if el.type == "text" then texts[#texts + 1] = tostring(el.text) end
+    end
+    assert.is_string(d.modelName)
+    assert.is_truthy(table.concat(texts, "\n"):find(d.modelName, 1, true))
+  end)
+
+  -- A Bluetooth headset can take seconds to hand over audio. A cue on the key
+  -- press would say "talk now" while the first words are still being lost.
+  it("plays the start sound when audio arrives, not on the key press", function()
+    local played, byName = {}, hs.sound.getByName
+    hs.sound.getByName = function(name)
+      local s = byName(name)
+      s.play = function(self) played[#played + 1] = name; return self end
+      return s
+    end
+    load()
+    d.toggle()
+    d.readyTimer.fn()
+    assert.same({}, played)
+    write(d.paths.RAW, "\0\0\1\0")
+    d.readyTimer.fn()
+    hs.sound.getByName = byName
+    assert.same({ "Tink" }, played)
   end)
 
   it("a quick tap before audio arrives is still dropped as too short", function()
@@ -698,6 +739,194 @@ describe("the review panel", function()
     take()
     hs.canvas.new = real
     assert.is_false(made[#made])
+  end)
+end)
+
+-- The server's second look at a reviewed take (POST /words) and what the panel
+-- does with it: underline what the model was unsure of, offer what else it
+-- heard, and change any word without leaving the panel.
+describe("fixing words in the review panel", function()
+  local rv = require("apps.dictation.review")
+  local theme = require("lib.theme")
+  local SCREEN = { x = 0, y = 0, w = 1440, h = 900 }
+  local HEARD = {
+    text = "Hello, world.",
+    words = {
+      { text = "Hello,", p = 0.99, unsure = false, alts = {} },
+      { text = "world.", p = 0.52, unsure = true, alts = { "word.", "whirled." } },
+    },
+  }
+
+  local prompts, focused
+  local saved = {}
+  before_each(function()
+    saved.window, saved.dialog, saved.focus = hs.window, hs.dialog, hs.focus
+    prompts, focused = {}, 0
+    hs.focus = function() end
+    hs.window = { frontmostWindow = function() return { focus = function() focused = focused + 1 end } end }
+    -- The box records what it was asked and whether ↩ still belonged to the
+    -- panel while it was up.
+    hs.dialog = { textPrompt = function(title, info, text)
+      prompts[#prompts + 1] = { title = title, info = info, text = text, enter = liveKey("", "return") }
+      if prompts.answer then return "Change", prompts.answer end
+      return "Cancel", text
+    end }
+  end)
+  after_each(function()
+    hs.window, hs.dialog, hs.focus = saved.window, saved.dialog, saved.focus
+  end)
+
+  local function reviewing(settings)
+    settings = settings or {}
+    settings["dictate.review"] = true
+    withActions(settings)
+    JSON["words"] = HEARD
+    wordsBody = "words"
+  end
+
+  local function ids()
+    local out = {}
+    for _, b in ipairs(rv.buttons(d.reviewPanel.current, {})) do out[#out + 1] = b.id end
+    return table.concat(out, " ")
+  end
+
+  local function draft() return d.reviewPanel.current.draft end
+
+  it("asks the server about the kept recording and takes the words it heard", function()
+    reviewing()
+    take()
+    local asked
+    for _, p in ipairs(posts) do if p.url:match("/words$") then asked = p end end
+    assert.truthy(asked)
+    assert.truthy(asked.body:find(d.paths.TAKES, 1, true))
+    assert.equals("Hello, world.", draft())
+    assert.equals("Hello, world.", pb.text)
+  end)
+
+  it("underlines the word the model was unsure of and says what else it could be", function()
+    reviewing()
+    take()
+    local R = d.reviewPanel.current
+    assert.equals("Review · as heard · 1 word to check", (rv.status(R)))
+    assert.equals("Could be word. · whirled. · click to pick", (rv.status(R, "word:2")))
+    local underlined, clickable = 0, {}
+    for _, el in ipairs(rv.layout(R, {}, SCREEN).elements) do
+      if el.type == "rectangle" and el.fillColor == theme.tone("draft") then underlined = underlined + 1 end
+      if el.id and el.id:match("^word:") and el.trackMouseDown then clickable[#clickable + 1] = el.text end
+    end
+    assert.equals(1, underlined)
+    assert.same({ "Hello,", "world." }, clickable)
+  end)
+
+  it("turns the buttons into a clicked word's choices, and esc goes back", function()
+    reviewing()
+    take()
+    d.reviewPanel.pickWord(2)
+    assert.equals("alt:1 alt:2 edit delete back", ids())
+    assert.equals("“world.” · pick what you said, or edit it", (rv.status(d.reviewPanel.current)))
+    press("", "escape")
+    assert.is_true(d.reviewPanel.isOpen())
+    assert.equals("paste type", ids())
+    assert.is_nil(d.reviewPanel.current.picking)
+  end)
+
+  it("swaps in what else the model heard, and ⌥0 brings the words as heard back", function()
+    reviewing()
+    take()
+    d.reviewPanel.pickWord(2)
+    d.reviewPanel.pick("alt:2")
+    assert.equals("Hello, whirled.", draft())
+    assert.equals("Hello, whirled.", pb.text)
+    assert.is_nil(d.reviewPanel.current.picking)
+    assert.equals("Review · as heard · edited", (rv.status(d.reviewPanel.current)))
+    press("alt", "0")
+    assert.equals("Hello, world.", draft())
+    assert.equals("Review · as heard · 1 word to check", (rv.status(d.reviewPanel.current)))
+  end)
+
+  it("takes the first choice on ↩ and sends nothing", function()
+    reviewing()
+    take()
+    d.reviewPanel.pickWord(2)
+    press("", "return")
+    fire(0.05)
+    assert.equals("Hello, word.", draft())
+    assert.is_true(d.reviewPanel.isOpen())
+    for _, e in ipairs(hs.eventtap._sent) do assert.are_not.equal("v", e.key) end
+  end)
+
+  it("edits a word in a box that has the keyboard, then hands it back and pastes", function()
+    reviewing()
+    take()
+    prompts.answer = "planet."
+    d.reviewPanel.pickWord(2)
+    d.reviewPanel.pick("edit")
+    assert.equals("world.", prompts[1].text)
+    assert.equals("Could also be word. · whirled.", prompts[1].info)
+    assert.is_nil(prompts[1].enter, "↩ pasted instead of confirming the box")
+    assert.equals(1, focused)
+    assert.equals("Hello, planet.", draft())
+    press("", "return")
+    fire(0.05)
+    assert.equals("Hello, planet.", pb.text)
+    assert.equals("Hello, planet.", d.lastResult)
+  end)
+
+  it("keeps the word when the box is cancelled", function()
+    reviewing()
+    take()
+    d.reviewPanel.editWord(2)
+    assert.equals("Hello, world.", draft())
+    assert.truthy(liveKey("", "return"))
+  end)
+
+  it("deletes a word, and splits one typed as two", function()
+    reviewing()
+    take()
+    d.reviewPanel.pickWord(1)
+    d.reviewPanel.pick("delete")
+    assert.equals("world.", draft())
+    d.reviewPanel.setWord(1, "small world.")
+    assert.equals("small world.", draft())
+    assert.equals(2, #rv.words(d.reviewPanel.current))
+  end)
+
+  it("lets the words of a rewrite be fixed too", function()
+    reviewing()
+    take()
+    ta.reply = "Hello there, world."
+    press("alt", "1")
+    d.reviewPanel.setWord(2, "here,")
+    assert.equals("Hello here, world.", draft())
+  end)
+
+  it("keeps a clean-up that is already on screen; ⌥0 brings the server's words", function()
+    reviewing({ ["dictate.llmCleanup"] = true })
+    ta.reply = "Hello there."
+    take()
+    assert.equals("Hello there.", draft())
+    press("alt", "0")
+    assert.equals("Hello, world.", draft())
+  end)
+
+  it("leaves the panel as it opened when the server has no words", function()
+    reviewing()
+    wordsBody = nil
+    take()
+    assert.equals("hello world", draft())
+    assert.equals("Review · as heard", (rv.status(d.reviewPanel.current)))
+  end)
+
+  it("ignores words for a take it is not showing", function()
+    reviewing()
+    take()
+    assert.is_false(d.reviewPanel.heard("another take", HEARD))
+  end)
+
+  it("asks nothing for a take that is typed rather than reviewed", function()
+    withActions()
+    take()
+    for _, p in ipairs(posts) do assert.is_nil(p.url:match("/words$")) end
   end)
 end)
 

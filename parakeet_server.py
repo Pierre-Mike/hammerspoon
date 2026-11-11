@@ -20,6 +20,9 @@
 # an old launcher keeps getting a parakeet server.
 #
 #   POST /transcribe      body=<wav path>  -> batch transcription (text back)
+#   POST /words           body=<wav path>  -> JSON: text, and each word with its
+#                                             score and the alternatives the model
+#                                             nearly wrote (parakeet only)
 #   POST /start           body=<raw path>  -> stream a growing headerless
 #                                             s16le/16k mono PCM file as it records
 #   POST /finish                            -> drain remaining audio, return text
@@ -95,6 +98,7 @@ if ENGINE == "parakeet":
             Token,
             pcm_to_float32,
         )
+        from dictate import alternatives  # noqa: E402
         DICTATE = True
     except Exception as e:  # noqa: BLE001
         _dictate_why = f"{type(e).__name__}: {e}"
@@ -142,7 +146,7 @@ def _mlx():
 
 class Session:
     def __init__(self, kind, path):
-        self.kind = kind          # 'stream' | 'batch' | 'dictate'
+        self.kind = kind          # 'stream' | 'batch' | 'words' | 'dictate'
         self.path = path
         self.abort = threading.Event()
         self.finish = threading.Event()
@@ -184,7 +188,7 @@ def _next_batch():
     """Pop the oldest queued batch job, leaving any stream sessions in place."""
     with _lock:
         for s in _queue:
-            if s.kind == "batch":
+            if s.kind in ("batch", "words"):
                 _queue.remove(s)
                 return s
     return None
@@ -192,7 +196,10 @@ def _next_batch():
 
 def _run_batch(backend, s):
     try:
-        s.text = backend.transcribe(s.path)
+        if s.kind == "words":
+            s.text = json.dumps(backend.words(s.path))
+        else:
+            s.text = backend.transcribe(s.path)
     except Exception as e:  # noqa: BLE001
         log(f"batch error: {e}")
         s.text = f"__ERROR__ {e}"
@@ -354,6 +361,35 @@ class ParakeetBackend:
     def transcribe(self, wav):
         return (self.model.transcribe(wav).text or "").strip()
 
+    def words(self, wav):
+        """The whole take decoded once, with what else the model heard at each
+        word it was unsure of (dictate/alternatives.py), as the /words JSON."""
+        import mlx.core as mx
+        from parakeet_mlx import tokenizer
+        from parakeet_mlx.audio import get_logmel, load_audio
+        model = self.model
+        if not hasattr(model, "durations"):
+            raise RuntimeError("word alternatives need a TDT model")
+        mel = get_logmel(load_audio(wav, model.preprocessor_config.sample_rate),
+                         model.preprocessor_config)
+        features, lengths = model.encoder(mel if mel.ndim == 3 else mx.expand_dims(mel, 0))
+        mx.eval(features, lengths)
+        vocab = len(model.vocabulary)
+
+        def step(frame, last, state):
+            dec, (h, c) = model.decoder(mx.array([[last]]) if last is not None else None, state)
+            joint = model.joint(features[:, frame:frame + 1], dec.astype(features.dtype))
+            probs = mx.softmax(joint[0, 0, 0, :vocab + 1], -1)
+            best = mx.argsort(-probs)[:6]
+            top = list(zip(best.tolist(), probs[best].tolist()))
+            advance = model.durations[int(mx.argmax(joint[0, 0, 0, vocab + 1:]))]
+            return top, advance, (h.astype(features.dtype), c.astype(features.dtype))
+
+        return alternatives.transcribe(alternatives.Model(
+            step=step, frames=int(lengths[0]), blank=vocab,
+            text=lambda t: tokenizer.decode([t], model.vocabulary),
+            max_symbols=model.max_symbols))
+
 
 def decode_kwargs(defaults, params, language=""):
     """generate() kwargs for one mlx-audio model.
@@ -487,7 +523,7 @@ def worker():
             if s.abort.is_set():
                 s.done.set(); continue
             try:
-                if s.kind == "batch":
+                if s.kind in ("batch", "words"):
                     _run_batch(backend, s)
                 elif s.kind == "dictate":
                     _run_dictate(backend, s)
@@ -584,8 +620,10 @@ class Handler(BaseHTTPRequestHandler):
             if s is not None:
                 s.abort.set()
             self._reply(200, "cancelled")
-        elif self.path == "/transcribe":
-            s = _new_session("batch", body)
+        elif self.path == "/words" and not DICTATE:
+            self._reply(501, f"__ERROR__ no word alternatives on {MODEL_ID} ({_dictate_why})")
+        elif self.path in ("/transcribe", "/words"):
+            s = _new_session("batch" if self.path == "/transcribe" else "words", body)
             if s.done.wait(timeout=60):
                 t = s.text or ""
                 self._reply(200 if not t.startswith("__ERROR__") else 500, t)
